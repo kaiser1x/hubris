@@ -1,0 +1,17 @@
+{
+  "name": "hubris",
+  "version": "0.1.0",
+  "private": true,
+  "description": "AI software engineering platform for understanding, testing, and verifying software changes",
+  "packageManager": "pnpm@10.34.5",
+  "scripts": {
+    "dev": "turbo dev",
+    "build": "turbo build",
+    "lint": "turbo lint",
+    "typecheck": "turbo typecheck",
+    "test": "turbo test"
+  },
+  "devDependencies": {
+    "turbo": "^2.11.3"
+  }
+}
