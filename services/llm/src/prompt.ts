@@ -9,14 +9,26 @@ export interface TwinSummary {
   };
   functionNames: string[];
   endpoints: string[];
+  // Preformatted "name — file:line" lines. Grounds the model in real paths
+  // so it does not invent conventional layouts.
+  functionDetails?: string[];
+  // Preformatted "METHOD path → handler" lines from route registrations.
+  routes?: string[];
 }
 
 export function buildInvestigatePrompt(summary: TwinSummary, question?: string): string {
+  const functions =
+    summary.functionDetails && summary.functionDetails.length > 0
+      ? summary.functionDetails.slice(0, 25).join("\n")
+      : summary.functionNames.slice(0, 15).join(", ") || "(none)";
   const lines = [
     `Repository: ${summary.repoName}`,
     `Functions: ${summary.stats.functions}, Classes: ${summary.stats.classes}, Endpoints: ${summary.stats.endpoints}, Tests: ${summary.stats.tests}, Relationships: ${summary.stats.relationships}`,
-    `Top functions: ${summary.functionNames.slice(0, 15).join(", ") || "(none)"}`,
+    `Routes:\n${summary.routes && summary.routes.length > 0 ? summary.routes.slice(0, 15).join("\n") : "(none listed)"}`,
+    `Functions:\n${functions}`,
     `Endpoints: ${summary.endpoints.slice(0, 15).join(", ") || "(none)"}`,
+    "",
+    "Only cite files, functions, and routes listed above. Do not invent paths.",
     "",
     question?.trim() ||
       "What is the most likely location and cause of a bug in this codebase? Answer in under 150 words with file-level pointers.",

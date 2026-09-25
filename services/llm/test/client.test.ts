@@ -65,6 +65,20 @@ describe("buildInvestigatePrompt", () => {
     expect(prompt).toContain("(none)");
     expect(prompt.length).toBeGreaterThan(50);
   });
+
+  it("grounds the model in real paths and route bindings", () => {
+    const prompt = buildInvestigatePrompt({
+      repoName: "acme/api",
+      stats: { functions: 2, classes: 0, endpoints: 1, tests: 0, relationships: 3 },
+      functionNames: ["getUser"],
+      functionDetails: ["getUser — src/users.ts:12"],
+      routes: ["GET /users/:id → users.getUser"],
+      endpoints: ["GET /users/:id"],
+    });
+    expect(prompt).toContain("getUser — src/users.ts:12");
+    expect(prompt).toContain("GET /users/:id → users.getUser");
+    expect(prompt).toContain("Do not invent paths");
+  });
 });
 
 describe("buildForgePrompt", () => {

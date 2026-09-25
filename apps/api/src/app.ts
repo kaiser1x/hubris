@@ -18,6 +18,7 @@ import {
   chatComplete,
   llmConfigFromEnv,
 } from "@hubris/llm";
+import { runCommand, sandboxConfigFromEnv } from "@hubris/sandbox";
 
 const execFileAsync = promisify(execFile);
 
@@ -52,6 +53,12 @@ const ForgeBody = z.object({
   jobId: z.string().min(1, "jobId is required"),
   focus: z.string().max(200).optional(),
   instruction: z.string().max(2000).optional(),
+});
+
+const ReproduceBody = z.object({
+  jobId: z.string().min(1, "jobId is required"),
+  script: z.string().min(1).max(4000),
+  image: z.string().max(200).optional(),
 });
 
 function shortPath(p: string): string {
@@ -310,8 +317,9 @@ app.post("/api/investigate", async (c: Context) => {
     stats?: { functions: number; classes: number; endpoints: number; tests: number; relationships: number };
     sample?: { functions?: Array<{ name?: string }>; endpoints?: Array<{ method?: string; path?: string }> };
     full?: {
-      functions?: Array<{ name?: string }>;
-      endpoints?: Array<{ method?: string; path?: string }>;
+      functions?: Array<{ name?: string; path?: string; line?: number }>;
+      endpoints?: Array<{ method?: string; path?: string; file?: string }>;
+      relationships?: Array<{ from?: string; to?: string; type?: string; caller?: string }>;
     };
   } | null;
   if (job.status !== "complete" || !result?.stats) {
@@ -323,13 +331,28 @@ app.post("/api/investigate", async (c: Context) => {
     return c.json({ error: "Model not configured", status: 503 }, 503);
   }
 
-  const functions = result.full?.functions ?? result.sample?.functions ?? [];
+  const functions: Array<{ name?: string; path?: string; line?: number }> = (
+    result.full?.functions ?? result.sample?.functions ?? []
+  ).map((f) => f);
   const endpoints = result.full?.endpoints ?? result.sample?.endpoints ?? [];
+  const relationships = result.full?.relationships ?? [];
+  const handlers = new Map<string, string>();
+  for (const r of relationships) {
+    if (r.caller?.startsWith("endpoint:") && r.to) handlers.set(r.caller, r.to);
+  }
   const prompt = buildInvestigatePrompt(
     {
       repoName: result.repository?.name ?? job.repoUrl,
       stats: result.stats,
       functionNames: functions.map((f) => f.name ?? "").filter(Boolean),
+      functionDetails: functions.map((f) =>
+        `${f.name ?? "(anonymous)"} — ${f.path ?? "(unknown)"}${f.line ? `:${f.line}` : ""}`
+      ),
+      routes: endpoints.map((e) => {
+        const label = `${e.method ?? ""} ${e.path ?? ""}`.trim();
+        const handler = handlers.get(`endpoint:${label}`);
+        return handler ? `${label} → ${handler}` : label;
+      }).filter(Boolean),
       endpoints: endpoints.map((e) => `${e.method ?? ""} ${e.path ?? ""}`.trim()).filter(Boolean),
     },
     parsed.data.question
@@ -434,6 +457,71 @@ app.post("/api/forge", async (c: Context) => {
   } catch (error: any) {
     console.error("Forge error:", error?.message);
     return c.json({ error: "Model request failed", status: 502 }, 502);
+  }
+});
+
+// POST /api/reproduce - Run a repro script in a disposable sandbox and
+// store the evidence (exit code, stdout, stderr) on the job.
+// Body: { jobId, script, image? }. Script is capped at 4000 chars;
+// stored streams are truncated to protect the row.
+app.post("/api/reproduce", async (c: Context) => {
+  let rawBody: unknown;
+  try {
+    rawBody = await c.req.json();
+  } catch {
+    return c.json({ error: "Invalid JSON body", status: 400 }, 400);
+  }
+
+  const parsed = ReproduceBody.safeParse(rawBody);
+  if (!parsed.success) {
+    return c.json({ error: "jobId and script are required", status: 400 }, 400);
+  }
+
+  const db = getDb();
+  if (!db) {
+    return c.json({ error: "Job store unavailable", status: 503 }, 503);
+  }
+
+  const rows = await db.select().from(schema.jobs).where(eq(schema.jobs.id, parsed.data.jobId));
+  const job = rows[0];
+  if (!job) {
+    return c.json({ error: "Job not found", status: 404 }, 404);
+  }
+
+  const sandbox = sandboxConfigFromEnv();
+  if (!sandbox) {
+    return c.json({ error: "Sandbox not configured", status: 503 }, 503);
+  }
+
+  try {
+    const result = await runCommand(sandbox, {
+      command: parsed.data.script,
+      image: parsed.data.image ?? "tag:busybox:latest",
+      shell: true,
+      disposable: true,
+      timeout: 120,
+      waitMs: 150000,
+    });
+    const evidence = {
+      script: parsed.data.script,
+      exitCode: result.exitCode,
+      stdout: result.stdout.slice(0, 4000),
+      stderr: result.stderr.slice(0, 4000),
+      timedOut: result.timedOut,
+      at: new Date().toISOString(),
+    };
+    const prior = (job.result as { reproductions?: unknown[] } | null)?.reproductions ?? [];
+    await db
+      .update(schema.jobs)
+      .set({
+        result: { ...(job.result as object), reproductions: [...prior, evidence] },
+        updatedAt: new Date(),
+      })
+      .where(eq(schema.jobs.id, job.id));
+    return c.json({ jobId: job.id, evidence });
+  } catch (error: any) {
+    console.error("Reproduce error:", error?.message);
+    return c.json({ error: "Sandbox run failed", status: 502 }, 502);
   }
 });
 
