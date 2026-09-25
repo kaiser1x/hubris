@@ -35,6 +35,7 @@ export interface Relationship {
   from: string;
   to: string;
   type: "IMPORTS" | "CALLS" | "DEFINES" | "TESTS" | "DEPENDS_ON";
+  caller?: string;
 }
 
 export interface ParsedRepository {
@@ -116,8 +117,142 @@ function extractImports(filePath: string): Relationship[] {
   return relations;
 }
 
+const ROUTE_METHODS = ["get", "post", "put", "delete", "patch"];
+
+function scopeNameFor(node: ts.Node): string | null {
+  if (
+    (ts.isFunctionDeclaration(node) || ts.isMethodDeclaration(node)) &&
+    node.name &&
+    ts.isIdentifier(node.name)
+  ) {
+    return node.name.text;
+  }
+  if (
+    ts.isVariableDeclaration(node) &&
+    ts.isIdentifier(node.name) &&
+    node.initializer &&
+    (ts.isArrowFunction(node.initializer) || ts.isFunctionExpression(node.initializer))
+  ) {
+    return node.name.text;
+  }
+  return null;
+}
+
+// Synthetic scope for inline callbacks. Route handlers map onto the same
+// `endpoint:METHOD:path` ids the twin uses, so traces can start at endpoints.
+function syntheticScope(
+  callee: ts.Expression,
+  args: readonly ts.Expression[],
+  index: number
+): string | null {
+  if (
+    ts.isPropertyAccessExpression(callee) &&
+    ROUTE_METHODS.includes(callee.name.text.toLowerCase()) &&
+    args.length > 0 &&
+    ts.isStringLiteralLike(args[0])
+  ) {
+    return `endpoint:${callee.name.text.toUpperCase()}:${args[0].text}`;
+  }
+  if (ts.isIdentifier(callee)) {
+    return `${callee.text}#arg${index}`;
+  }
+  return null;
+}
+
+function dottedName(expr: ts.Expression): string | null {
+  if (ts.isIdentifier(expr)) return expr.text;
+  if (ts.isPropertyAccessExpression(expr)) {
+    const base = dottedName(expr.expression);
+    return base ? `${base}.${expr.name.text}` : null;
+  }
+  return null;
+}
+
+// Receivers that carry no architectural signal; member calls on these are noise.
+const NOISE_RECEIVERS = new Set([
+  "console",
+  "Math",
+  "JSON",
+  "Object",
+  "Reflect",
+  "Promise",
+  "Symbol",
+  "Number",
+  "String",
+  "Boolean",
+  "Array",
+  "BigInt",
+]);
+
 function extractFunctionCallsFromFile(filePath: string): Relationship[] {
   const relations: Relationship[] = [];
+  const scope: string[] = [];
+
+  function visit(node: ts.Node): void {
+    const name = scopeNameFor(node);
+    if (name) scope.push(name);
+
+    if (ts.isCallExpression(node)) {
+      // Bare calls: foo(). Member calls: obj.method() recorded dotted, so the
+      // walker can resolve them to definitions (chain.alpha -> alpha).
+      // Route registrations (router.get("/p", h)) are edges, not calls.
+      const isRouteRegistration =
+        ts.isPropertyAccessExpression(node.expression) &&
+        ROUTE_METHODS.includes(node.expression.name.text.toLowerCase()) &&
+        node.arguments.length > 0 &&
+        ts.isStringLiteralLike(node.arguments[0]);
+      const target = isRouteRegistration ? null : dottedName(node.expression);
+      const root =
+        ts.isIdentifier(node.expression)
+          ? node.expression.text
+          : ts.isPropertyAccessExpression(node.expression)
+            ? dottedName(node.expression.expression)
+            : null;
+      if (target && !(root && NOISE_RECEIVERS.has(root))) {
+        relations.push({
+          from: filePath,
+          to: target,
+          type: "CALLS",
+          ...(scope.length > 0 ? { caller: scope[scope.length - 1] } : {}),
+        });
+      }
+    }
+
+    if (ts.isCallExpression(node)) {
+      visit(node.expression);
+      const routeScope =
+        ts.isPropertyAccessExpression(node.expression) &&
+        ROUTE_METHODS.includes(node.expression.name.text.toLowerCase()) &&
+        node.arguments.length > 0 &&
+        ts.isStringLiteralLike(node.arguments[0])
+          ? `endpoint:${node.expression.name.text.toUpperCase()}:${(node.arguments[0] as ts.StringLiteralLike).text}`
+          : null;
+      node.arguments.forEach((arg, i) => {
+        // Handler references: router.get("/path", controller.index)
+        if (routeScope && (ts.isIdentifier(arg) || ts.isPropertyAccessExpression(arg))) {
+          const target = dottedName(arg);
+          if (target) {
+            relations.push({ from: filePath, to: target, type: "CALLS", caller: routeScope });
+          }
+        }
+        const label =
+          ts.isArrowFunction(arg) || ts.isFunctionExpression(arg)
+            ? syntheticScope(node.expression, node.arguments, i)
+            : null;
+        if (label) {
+          scope.push(label);
+          visit(arg);
+          scope.pop();
+        } else {
+          visit(arg);
+        }
+      });
+    } else {
+      ts.forEachChild(node, visit);
+    }
+
+    if (name) scope.pop();
+  }
 
   try {
     const source = readFileSync(filePath, "utf-8");
@@ -128,18 +263,7 @@ function extractFunctionCallsFromFile(filePath: string): Relationship[] {
       true
     );
 
-    ts.forEachChild(file, (node) => {
-      if (ts.isCallExpression(node)) {
-        const expression = node.expression;
-        if (ts.isIdentifier(expression)) {
-          relations.push({
-            from: filePath,
-            to: expression.text,
-            type: "CALLS",
-          });
-        }
-      }
-    });
+    visit(file);
   } catch (e) {
     // silently skip
   }
@@ -160,8 +284,7 @@ function parseFunctionsFromFile(filePath: string): ParsedFunction[] {
     );
 
     ts.forEachChild(file, (node) => {
-      if (ts.isFunctionDeclaration(node) && node.name) {
-        // @ts-ignore - pos properties vary by TS version
+      if (ts.isFunctionDeclaration(node) && node.name) {        // @ts-ignore - pos properties vary by TS version
         const line = node.name.pos?.lineNumber ?? node.pos?.lineNumber ?? 1;
         // @ts-ignore - pos properties vary by TS version
         const column = node.name.pos?.columnNumber ?? node.pos?.columnNumber ?? 1;
@@ -171,6 +294,23 @@ function parseFunctionsFromFile(filePath: string): ParsedFunction[] {
           path: filePath,
           line: typeof line === "number" ? line : 1,
           column: typeof column === "number" ? column : 1,
+        });
+      }
+      // Express-style handlers: exports.name = function () {...}
+      if (
+        ts.isExpressionStatement(node) &&
+        ts.isBinaryExpression(node.expression) &&
+        node.expression.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+        ts.isPropertyAccessExpression(node.expression.left) &&
+        (ts.isFunctionExpression(node.expression.right) ||
+          ts.isArrowFunction(node.expression.right))
+      ) {
+        functions.push({
+          id: randomUUID(),
+          name: node.expression.left.name.text,
+          path: filePath,
+          line: 1,
+          column: 1,
         });
       }
     });
@@ -220,13 +360,13 @@ function parseEndpointsFromFile(filePath: string): ParsedEndpoint[] {
 
   try {
     const source = readFileSync(filePath, "utf-8");
-    // Look for Express-style route definitions: method("path")
+    // Look for Express-style route definitions: method("path") or method('path')
     const routeRegex = /(?:get|post|put|delete|patch)\(['"]\/[^'"]*['"]/gi;
     const matches = source.match(routeRegex);
     if (matches) {
       for (const match of matches) {
         const methodMatch = match.match(/^[a-z]+/i);
-        const pathMatch = match.match(/'([^']+)'/);
+        const pathMatch = match.match(/['"]([^'"]+)['"]/);
         if (methodMatch && pathMatch) {
           endpoints.push({
             path: pathMatch[1],

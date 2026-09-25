@@ -1,4 +1,4 @@
-import { LAYERS, type TwinNode } from "./casefile";
+import { LAYERS, type TraceStep, type TwinNode } from "./casefile";
 
 export interface LiveFunction {
   id: string;
@@ -32,6 +32,7 @@ export interface LiveRelationship {
   from: string;
   to: string;
   type: string;
+  caller?: string;
 }
 
 export interface LiveStats {
@@ -228,4 +229,96 @@ export async function fetchLatestJob(repoUrl?: string): Promise<LiveJob | null> 
   } catch {
     return null;
   }
+}
+
+// Derive a static call chain from twin CALLS relationships, starting at the
+// endpoint with the richest call graph. Timings are unknown without sandbox
+// execution, so ms/result are marked as static rather than measured.
+export function traceFromTwin(job: LiveJob, maxSteps = 8, entryEndpoint?: LiveEndpoint): TraceStep[] {
+  const full = job.result?.full;
+  if (!full || full.endpoints.length === 0) return [];
+
+  const callsFromFile = new Map<string, string[]>();
+  const callsFromCaller = new Map<string, string[]>();
+  for (const rel of full.relationships) {
+    if (rel.type !== "CALLS") continue;
+    const fileList = callsFromFile.get(rel.from) ?? [];
+    if (!fileList.includes(rel.to)) fileList.push(rel.to);
+    callsFromFile.set(rel.from, fileList);
+    if (rel.caller) {
+      const callerList = callsFromCaller.get(rel.caller) ?? [];
+      if (!callerList.includes(rel.to)) callerList.push(rel.to);
+      callsFromCaller.set(rel.caller, callerList);
+    }
+  }
+
+  // Caller-scoped edges for display. File-level edges are only used to find
+  // the next hop, never shown as a function's own calls.
+
+  const funcByName = new Map(full.functions.map((f) => [f.name, f]));
+  // Resolve dotted handler references (book_controller.index) to defined functions.
+  const resolveFunc = (name: string): LiveFunction | undefined => {
+    const direct = funcByName.get(name);
+    if (direct) return direct;
+    const bare = name.split(".").pop() ?? "";
+    return bare === name ? undefined : funcByName.get(bare);
+  };
+  const ranked = [...full.endpoints].sort(
+    (a, b) => (callsFromFile.get(b.file)?.length ?? 0) - (callsFromFile.get(a.file)?.length ?? 0)
+  );
+  const entry =
+    (entryEndpoint &&
+      full.endpoints.find((e) => e.method === entryEndpoint.method && e.path === entryEndpoint.path)) ??
+    ranked[0];
+
+  const steps: TraceStep[] = [];
+  const visited = new Set<string>();
+  let file: string | null = entry.file;
+  let label = `${entry.method} ${entry.path}`;
+
+  steps.push({
+    node: `endpoint:${entry.method}:${entry.path}`,
+    label,
+    detail: "entry point",
+    func: "(entry)",
+    file: relativize(entry.file),
+    line: 1,
+    ms: "—",
+    result: "static",
+  });
+  visited.add(`endpoint:${entry.method}:${entry.path}`);
+  const entryId = `endpoint:${entry.method}:${entry.path}`;
+
+  let first = true;
+  while (file && steps.length < maxSteps) {
+    // First hop prefers the handler's own calls, then file-level calls.
+    const scoped = first ? (callsFromCaller.get(entryId) ?? []) : [];
+    const filed = callsFromFile.get(file) ?? [];
+    const pool = [...scoped, ...filed.filter((c) => !scoped.includes(c))];
+    first = false;
+    const fileCallees: string[] = pool;
+    // Follow the first callee defined in the twin; skip external/builtin calls.
+    const next: string | undefined = fileCallees
+      .map((c: string) => resolveFunc(c))
+      .filter((f): f is LiveFunction => f !== undefined && !visited.has(`function:${f.name}`))
+      .map((f) => f.name)
+      .at(0);
+    if (!next) break;
+    visited.add(`function:${next}`);
+    const fn: LiveFunction = resolveFunc(next)!;
+    const own: string[] = (callsFromCaller.get(next) ?? []).filter((c) => c !== next);
+    steps.push({
+      node: `function:${next}`,
+      label: next,
+      detail: own.length > 0 ? `calls ${own.slice(0, 3).join(", ")}` : "leaf — no further calls",
+      func: next,
+      file: relativize(fn.path),
+      line: fn.line ?? 1,
+      ms: "—",
+      result: "static",
+    });
+    file = fn.path;
+  }
+
+  return steps;
 }

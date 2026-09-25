@@ -15,21 +15,36 @@ export default function OverviewPage() {
   const [liveNodes, setLiveNodes] = useState<TwinNode[] | null>(null);
   const [liveName, setLiveName] = useState<string | null>(null);
   const [liveCells, setLiveCells] = useState<[string, string, string][] | null>(null);
+  const [checked, setChecked] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
     fetchLatestJob().then((job) => {
-      if (cancelled || !job) return;
-      const nodes = twinToNodes(job);
-      if (nodes.length === 0) return;
-      setLiveNodes(nodes);
-      setLiveName(liveRepoName(job));
-      setLiveCells(liveHealth(job));
+      if (!cancelled && job) {
+        const nodes = twinToNodes(job);
+        if (nodes.length > 0) {
+          setLiveNodes(nodes);
+          setLiveName(liveRepoName(job));
+          setLiveCells(liveHealth(job));
+        }
+      }
+      if (!cancelled) setChecked(true);
     });
     return () => {
       cancelled = true;
     };
   }, []);
+
+  if (!checked) {
+    return (
+      <div className="max-w-[1440px] mx-auto px-5 lg:px-[52px] pt-10 lg:pt-[50px] pb-12">
+        <p className="kicker">Repository / Overview</p>
+        <p className="font-mono text-[13px] text-[#7A7171] mt-4">
+          Loading twin…
+        </p>
+      </div>
+    );
+  }
 
   const nodes = liveNodes ?? NODES;
   const healthCells = liveCells ?? HEALTH.slice(0, 3);
