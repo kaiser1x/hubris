@@ -15,8 +15,11 @@ export {
   getOperation,
   runCommand,
   spawnInstance,
+  uploadFile,
   waitOperation,
   type RunResult,
+  type SpawnFileRef,
   type SpawnRequest,
   type SpawnResponse,
+  type UploadedFile,
 } from "./client";

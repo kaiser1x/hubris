@@ -140,6 +140,7 @@ hubris/
 | GET | `/api/jobs/:id` | Persisted job incl. full twin |
 | POST | `/api/investigate` `{ jobId, question? }` | Model assessment of a completed job |
 | POST | `/api/forge` `{ jobId, focus?, instruction? }` | Patch + regression-test proposal (`verified: false`) |
+| POST | `/api/checkout` `{ jobId, ref?, image? }` | Transfer job repo into a sandbox workspace (tarball upload + manifest verify) |
 
 ### Page status
 
@@ -154,8 +155,10 @@ selector), `/investigate`, `/forge`. Demo narrative until sandbox lands:
   investigation answers and patch proposals. Bounded prompts, capped tokens,
   failures surface as `502` — never silent.
 - **Sandboxes (live):** `services/sandbox` implements the ConTree REST
-  contract and `POST /api/reproduce` + `POST /api/verify` run disposable
-  commands, storing exit code, stdout, and stderr as job evidence.
+  contract; `POST /api/reproduce` + `POST /api/verify` run disposable
+  commands, and `POST /api/checkout` transfers a job's repo (tracked-files
+  tarball upload, sha256 + file-count verified) into a sandbox workspace.
+  Exit codes, stdout/stderr, and manifests are stored as job evidence.
 
 ## NVIDIA usage
 
@@ -167,7 +170,7 @@ credentials — and its output is labeled: assessments are opinions, patches are
 
 ## Roadmap
 
-1. Repository checkout upload into the sandbox (install deps, run repo tests)
+1. Sandbox install + dependency strategy inside checkouts (then run repo tests)
 2. Sandbox-backed `/verify` of forged patches against real checkouts
 2. Sandbox-backed `/verify` (apply proposal in sandbox, run tests, record)
 3. `/ship` evidence bundle from verified jobs

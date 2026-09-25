@@ -1,5 +1,12 @@
 import { sandboxHeaders, sandboxUrl, type SandboxConfig } from "./config";
 
+export interface SpawnFileRef {
+  uuid: string;
+  uid?: number;
+  gid?: number;
+  mode?: string;
+}
+
 export interface SpawnRequest {
   command: string;
   image: string;
@@ -7,6 +14,9 @@ export interface SpawnRequest {
   disposable?: boolean;
   timeout?: number;
   cwd?: string;
+  // Previously uploaded files to place in the sandbox before the command
+  // runs: absolute sandbox path -> file reference (see uploadFile).
+  files?: Record<string, SpawnFileRef>;
 }
 
 export interface SpawnResponse {
@@ -52,6 +62,7 @@ export async function spawnInstance(
       disposable: req.disposable ?? true,
       ...(req.timeout !== undefined ? { timeout: req.timeout } : {}),
       ...(req.cwd !== undefined ? { cwd: req.cwd } : {}),
+      ...(req.files !== undefined ? { files: req.files } : {}),
     }),
   });
 
@@ -139,6 +150,46 @@ export async function waitOperation(
     }
     await new Promise((resolve) => setTimeout(resolve, pollMs));
   }
+}
+
+export interface UploadedFile {
+  uuid: string;
+  sha256: string;
+  size: number;
+}
+
+// Upload raw file content (POST /v1/files, octet-stream). Returns the
+// server-assigned uuid plus sha256/size for integrity checks. The uuid is
+// then referenced from SpawnRequest.files to place the file in a sandbox.
+export async function uploadFile(
+  config: SandboxConfig,
+  content: Uint8Array,
+  options?: { timeoutMs?: number }
+): Promise<UploadedFile> {
+  const response = await fetch(sandboxUrl(config, "/files"), {
+    method: "POST",
+    headers: {
+      ...sandboxHeaders(config),
+      "Content-Type": "application/octet-stream",
+    },
+    body: content,
+    ...(options?.timeoutMs !== undefined
+      ? { signal: AbortSignal.timeout(options.timeoutMs) }
+      : {}),
+  });
+
+  if (response.status !== 201 && !response.ok) {
+    throw new Error(await readError(response));
+  }
+  const data = (await response.json()) as {
+    uuid?: string;
+    sha256?: string;
+    size?: number;
+  };
+  if (!data.uuid || !data.sha256) {
+    throw new Error("Sandbox file upload returned no uuid/sha256");
+  }
+  return { uuid: data.uuid, sha256: data.sha256, size: data.size ?? -1 };
 }
 
 export async function runCommand(

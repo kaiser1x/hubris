@@ -18,7 +18,15 @@ import {
   chatComplete,
   llmConfigFromEnv,
 } from "@hubris/llm";
-import { buildRepoCheckoutCommand, isSafeGitRef, runCommand, sandboxConfigFromEnv } from "@hubris/sandbox";
+import { createHash } from "crypto";
+import { buildRepoCheckoutCommand, isSafeGitRef, REPO_WORKDIR, runCommand, sandboxConfigFromEnv, uploadFile } from "@hubris/sandbox";
+import {
+  buildCheckoutScript,
+  CHECKOUT_UPLOAD_PATH,
+  isTransferExcluded,
+  limitsFromEnv,
+  parseCheckoutListing,
+} from "./checkout";
 
 const execFileAsync = promisify(execFile);
 
@@ -74,6 +82,12 @@ const VerifyBody = z.object({
   image: z.string().max(200).optional(),
   checkout: z.boolean().optional(),
   ref: GitRef.optional(),
+});
+
+const CheckoutBody = z.object({
+  jobId: z.string().min(1, "jobId is required"),
+  ref: GitRef.optional(),
+  image: z.string().max(200).optional(),
 });
 
 function shortPath(p: string): string {
@@ -634,6 +648,154 @@ app.post("/api/verify", async (c: Context) => {
   } catch (error: any) {
     console.error("Verify error:", error?.message);
     return c.json({ error: "Sandbox run failed", status: 502 }, 502);
+  }
+});
+
+// POST /api/checkout - Transfer a job's repository into a sandbox workspace.
+// Body: { jobId, ref?, image? }. Clones the job's public repoUrl locally
+// (never executes it), archives tracked files, uploads the tarball, and
+// spawns a disposable sandbox that extracts it to /tmp/hubris-repo and
+// reports a bounded manifest. Transfer integrity is verified twice:
+// tarball sha256 (local vs server echo) and workspace file count
+// (expected vs remote). Evidence lands on job.result.checkouts[].
+// Install/test execution is Phase D — this endpoint only places + verifies.
+app.post("/api/checkout", async (c: Context) => {
+  let rawBody: unknown;
+  try {
+    rawBody = await c.req.json();
+  } catch {
+    return c.json({ error: "Invalid JSON body", status: 400 }, 400);
+  }
+
+  const parsed = CheckoutBody.safeParse(rawBody);
+  if (!parsed.success) {
+    return c.json({ error: "jobId is required", status: 400 }, 400);
+  }
+
+  const db = getDb();
+  if (!db) {
+    return c.json({ error: "Job store unavailable", status: 503 }, 503);
+  }
+
+  const rows = await db.select().from(schema.jobs).where(eq(schema.jobs.id, parsed.data.jobId));
+  const job = rows[0];
+  if (!job) {
+    return c.json({ error: "Job not found", status: 404 }, 404);
+  }
+
+  const cloneUrl = toSafeCloneUrl(job.repoUrl);
+  if (!cloneUrl) {
+    return c.json({ error: "Job has unsupported repo URL", status: 400 }, 400);
+  }
+
+  const sandbox = sandboxConfigFromEnv();
+  if (!sandbox) {
+    return c.json({ error: "Sandbox not configured", status: 503 }, 503);
+  }
+
+  const limits = limitsFromEnv();
+  const ref = parsed.data.ref;
+  const tmp = await fs.promises.mkdtemp(path.join(os.tmpdir(), "hubris-checkout-"));
+  const src = path.join(tmp, "src");
+  const tarPath = path.join(tmp, "repo.tar");
+  try {
+    try {
+      await execFileAsync("git", [
+        "clone", "--depth", "1",
+        ...(ref ? ["--branch", ref] : []),
+        cloneUrl, src,
+      ], { timeout: 90000 });
+    } catch {
+      return c.json({ error: "Repository clone failed", status: 500 }, 500);
+    }
+
+    const ls = await execFileAsync("git", ["-C", src, "ls-files", "-z"], { timeout: 30000 });
+    const tracked = ls.stdout.split("\0").filter((p) => p.length > 0);
+    const excluded = tracked.filter(isTransferExcluded);
+    const expected = tracked.length - excluded.length;
+    if (expected <= 0) {
+      return c.json({ error: "Repository has no transferable files", status: 400 }, 400);
+    }
+    if (tracked.length > limits.maxFiles) {
+      return c.json(
+        { error: `Repository exceeds transfer limits (${tracked.length} files > ${limits.maxFiles})`, status: 413 },
+        413
+      );
+    }
+
+    try {
+      await execFileAsync("git", ["-C", src, "archive", "HEAD", "-o", tarPath], { timeout: 60000 });
+    } catch {
+      return c.json({ error: "Repository archive failed", status: 500 }, 500);
+    }
+    const tarBytes = await fs.promises.readFile(tarPath);
+    if (tarBytes.length > limits.maxBytes) {
+      return c.json(
+        { error: `Repository exceeds transfer limits (${tarBytes.length} bytes > ${limits.maxBytes})`, status: 413 },
+        413
+      );
+    }
+    const localSha = createHash("sha256").update(tarBytes).digest("hex");
+
+    let uploaded;
+    try {
+      uploaded = await uploadFile(sandbox, tarBytes, { timeoutMs: 60000 });
+    } catch (error: any) {
+      console.error("Checkout upload error:", error?.message);
+      return c.json({ error: "Sandbox upload failed", status: 502 }, 502);
+    }
+    if (uploaded.sha256 !== localSha) {
+      return c.json({ error: "Transfer integrity mismatch", status: 502 }, 502);
+    }
+
+    let result;
+    try {
+      result = await runCommand(sandbox, {
+        command: buildCheckoutScript(excluded),
+        image: parsed.data.image ?? "tag:busybox:latest",
+        files: { [CHECKOUT_UPLOAD_PATH]: { uuid: uploaded.uuid } },
+        shell: true,
+        disposable: true,
+        timeout: 120,
+        waitMs: 150000,
+      });
+    } catch (error: any) {
+      console.error("Checkout run error:", error?.message);
+      return c.json({ error: "Sandbox run failed", status: 502 }, 502);
+    }
+
+    const { count, excerpt } = parseCheckoutListing(result.stdout);
+    const verified =
+      result.exitCode === 0 && !result.timedOut && count === expected;
+    const entry = {
+      repoUrl: job.repoUrl,
+      ...(ref ? { ref } : {}),
+      image: parsed.data.image ?? "tag:busybox:latest",
+      workspace: REPO_WORKDIR,
+      files: expected,
+      excluded,
+      bytes: tarBytes.length,
+      sha256: localSha,
+      uploadSha256: uploaded.sha256,
+      remoteCount: count,
+      exitCode: result.exitCode,
+      timedOut: result.timedOut,
+      verified,
+      listing: excerpt,
+      stderr: result.stderr.slice(0, 4000),
+      at: new Date().toISOString(),
+    };
+    const prior = (job.result as { checkouts?: unknown[] } | null)?.checkouts ?? [];
+    await db
+      .update(schema.jobs)
+      .set({
+        result: { ...(job.result as object), checkouts: [...prior, entry] },
+        updatedAt: new Date(),
+      })
+      .where(eq(schema.jobs.id, job.id));
+    return c.json({ jobId: job.id, checkout: entry });
+  } finally {
+    await fs.promises.rm(tmp, { recursive: true, force: true });
   }
 });
 
