@@ -11,6 +11,11 @@
     "typecheck": "turbo typecheck",
     "test": "turbo test"
   },
+  "workspaces": [
+    "apps/*",
+    "packages/*",
+    "services/*"
+  ],
   "devDependencies": {
     "turbo": "^2.11.3"
   }

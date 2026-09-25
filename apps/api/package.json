@@ -1,0 +1,22 @@
+{
+  "name": "@hubris/api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "dev": "node dist/index.js",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@hono/node-server": "^1.19.5",
+    "@hubris/analyzer": "workspace:*",
+    "hono": "^4.13.9",
+    "zod": "^3.22.4"
+  },
+  "devDependencies": {
+    "vitest": "^5.0.1"
+  }
+}

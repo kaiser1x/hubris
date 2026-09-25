@@ -1,0 +1,25 @@
+# HUBRIS local infrastructure.
+# Usage: docker compose up -d postgres
+# App connection string: DATABASE_URL=postgresql://hubris:hubris@localhost:5432/hubris
+# Credentials below are local-dev only. Override with environment for anything shared.
+
+services:
+  postgres:
+    image: postgres:17
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: hubris
+      POSTGRES_USER: hubris
+      POSTGRES_PASSWORD: hubris
+    ports:
+      - "5432:5432"
+    volumes:
+      - hubris-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hubris -d hubris"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  hubris-pgdata:

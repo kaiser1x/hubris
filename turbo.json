@@ -1,0 +1,23 @@
+{
+  "globalDependencies": [
+    "pnpm-workspace.yaml"
+  ],
+  "tasks": {
+    "build": {
+      "dependsOn": ["^build"],
+      "inputs": ["$Turbo/dependents^", "src/**/*", "turbo.json"]
+    },
+    "lint": {
+      "dependsOn": ["^lint"],
+      "inputs": ["$Turbo/dependents^", "src/**/*", "turbo.json"]
+    },
+    "typecheck": {
+      "dependsOn": ["^typecheck"],
+      "inputs": ["$Turbo/dependents^", "src/**/*", "turbo.json"]
+    },
+    "test": {
+      "dependsOn": ["^test"],
+      "inputs": ["$Turbo/dependents^", "src/**/*", "turbo.json"]
+    }
+  }
+}

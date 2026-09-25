@@ -1,0 +1,201 @@
+@import "tailwindcss";
+
+:root {
+  --background: #f8f7f6;
+  --foreground: #0a0a0a;
+  --muted: #7a7171;
+  --line: #dedada;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+html {
+  background: var(--background);
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans), Arial, Helvetica, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Concept serif display: Georgia, tight, editorial */
+.font-display {
+  font-family: Georgia, "Times New Roman", serif;
+  letter-spacing: -0.025em;
+}
+
+/* Kicker micro-labels: mono, wide tracking, muted */
+.kicker {
+  font-family: var(--font-mono), monospace;
+  font-size: 11px;
+  letter-spacing: 0.13em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+/* Status dots breathe on a slow cycle. Stillness under reduced motion. */
+@keyframes hubris-breathe {
+  0%,
+  100% {
+    opacity: 0.45;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+.breathe-dot {
+  animation: hubris-breathe 4.5s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .breathe-dot {
+    animation: none;
+  }
+}
+
+/* ---- HUBRIS side panels: slow, asynchronous, monochrome ---- */
+
+.hubris-sidepanel .sp-grid {
+  background-image:
+    linear-gradient(rgba(10, 10, 10, 0.04) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(10, 10, 10, 0.04) 1px, transparent 1px);
+  background-size: 28px 28px;
+  animation: sp-grid-drift 16s linear infinite;
+}
+
+@keyframes sp-grid-drift {
+  to {
+    background-position: 28px 28px;
+  }
+}
+
+/* Vertical marquee lane: content duplicated, loops seamlessly. */
+.hubris-sidepanel .sp-marquee {
+  animation: sp-drift-y 20s linear infinite;
+}
+
+@keyframes sp-drift-y {
+  to {
+    transform: translateY(-50%);
+  }
+}
+
+/* Node pulse: faint swell every several seconds. */
+.hubris-sidepanel .sp-node-pulse {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: sp-node-pulse 7s ease-in-out infinite;
+}
+
+.hubris-sidepanel .sp-node-pulse.sp-delay {
+  animation-delay: 3.4s;
+}
+
+@keyframes sp-node-pulse {
+  0%,
+  72%,
+  100% {
+    opacity: 0.45;
+    transform: scale(1);
+  }
+  82% {
+    opacity: 0.9;
+    transform: scale(1.7);
+  }
+}
+
+/* Signal point travelling the vertical line. */
+.hubris-sidepanel .sp-signal {
+  animation: sp-signal-drop 7s linear infinite;
+}
+
+@keyframes sp-signal-drop {
+  0% {
+    transform: translateY(0);
+    opacity: 0;
+  }
+  8% {
+    opacity: 1;
+  }
+  88% {
+    opacity: 1;
+  }
+  96%,
+  100% {
+    transform: translateY(148px);
+    opacity: 0;
+  }
+}
+
+/* Execution dots: each flares in sequence on a shared 10s cycle. */
+.hubris-sidepanel .sp-execdot {
+  background: rgba(10, 10, 10, 0.22);
+  animation: sp-exec-blink 10s linear infinite;
+}
+
+@keyframes sp-exec-blink {
+  0%,
+  100% {
+    background: rgba(10, 10, 10, 0.22);
+  }
+  3%,
+  9% {
+    background: #0a0a0a;
+  }
+  14% {
+    background: rgba(10, 10, 10, 0.22);
+  }
+}
+
+/* Scan line: rare slow sweep, mostly absent. */
+.hubris-sidepanel .sp-scan {
+  opacity: 0;
+  animation: sp-scan-sweep 13s linear infinite;
+}
+
+@keyframes sp-scan-sweep {
+  0% {
+    top: 12%;
+    opacity: 0;
+  }
+  6% {
+    opacity: 1;
+  }
+  30% {
+    top: 78%;
+    opacity: 1;
+  }
+  38%,
+  100% {
+    top: 78%;
+    opacity: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .hubris-sidepanel,
+  .hubris-sidepanel * {
+    animation: none !important;
+  }
+}
+
+/* Thin scrollbars for panels */
+.hubris-scroll::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+.hubris-scroll::-webkit-scrollbar-thumb {
+  background: rgba(10, 10, 10, 0.16);
+  border-radius: 4px;
+}
+.hubris-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
