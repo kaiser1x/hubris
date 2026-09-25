@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import {
+  buildForgePrompt,
   buildInvestigatePrompt,
   chatComplete,
   INVESTIGATE_SYSTEM,
@@ -63,6 +64,35 @@ describe("buildInvestigatePrompt", () => {
     });
     expect(prompt).toContain("(none)");
     expect(prompt.length).toBeGreaterThan(50);
+  });
+});
+
+describe("buildForgePrompt", () => {
+  it("includes functions, focus, and the three-section contract", () => {
+    const prompt = buildForgePrompt({
+      repoName: "acme/api",
+      stats: { functions: 5, classes: 1, endpoints: 2, tests: 1, relationships: 9 },
+      functions: [{ name: "charge", file: "src/pay.ts", line: 12 }],
+      endpoints: ["POST /pay"],
+      relationships: ["src/pay.ts CALLS validate"],
+      focus: "charge",
+    });
+    expect(prompt).toContain("charge (src/pay.ts:12)");
+    expect(prompt).toContain("Focus area: charge");
+    expect(prompt).toContain("PATCH");
+    expect(prompt).toContain("TEST");
+    expect(prompt).toContain("WHY");
+  });
+
+  it("falls back to a default instruction", () => {
+    const prompt = buildForgePrompt({
+      repoName: "x/y",
+      stats: { functions: 0, classes: 0, endpoints: 0, tests: 0, relationships: 0 },
+      functions: [],
+      endpoints: [],
+      relationships: [],
+    });
+    expect(prompt).toContain("most valuable minimal fix");
   });
 });
 

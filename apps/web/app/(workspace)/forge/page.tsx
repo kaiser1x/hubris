@@ -1,16 +1,126 @@
+"use client";
+
 import Link from "next/link";
+import { useCallback, useEffect, useState } from "react";
 import { FORGE } from "../../lib/casefile";
+import { fetchLatestJob, liveRepoName } from "../../lib/live-twin";
+
+interface LiveProposal {
+  repo: string;
+  suggestion: string;
+}
 
 export default function ForgePage() {
+  const [jobId, setJobId] = useState<string | null>(null);
+  const [proposal, setProposal] = useState<LiveProposal | null>(null);
+  const [focus, setFocus] = useState("");
+  const [forging, setForging] = useState(false);
+  const [forgeError, setForgeError] = useState<string | null>(null);
+
+  const forge = useCallback(async (id: string, repo: string, focusValue: string) => {
+    setForging(true);
+    setForgeError(null);
+    try {
+      const res = await fetch("/api/forge", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(
+          focusValue.trim() ? { jobId: id, focus: focusValue.trim() } : { jobId: id }
+        ),
+      });
+      const data = await res.json();
+      if (!res.ok || typeof data.suggestion !== "string") {
+        setForgeError(data.error ?? "Forge request failed.");
+        setProposal(null);
+      } else {
+        setProposal({ repo, suggestion: data.suggestion });
+      }
+    } catch {
+      setForgeError("Analysis service unreachable. Is the API running?");
+      setProposal(null);
+    } finally {
+      setForging(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const job = await fetchLatestJob();
+      if (!job || cancelled) return;
+      const repo = liveRepoName(job);
+      setJobId(job.id);
+      setProposal({ repo, suggestion: "" });
+      await forge(job.id, repo, "");
+      if (cancelled) return;
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [forge]);
+
   return (
     <div className="max-w-[1440px] mx-auto px-5 lg:px-[52px] pt-10 lg:pt-[50px] pb-12">
-      <p className="kicker">Repository / Forge · case-031</p>
+      <p className="kicker">
+        Repository / Forge{proposal ? ` · live · ${proposal.repo}` : " · case-031"}
+      </p>
       <h1 className="font-display text-[clamp(32px,4vw,46px)] leading-[1.05] mt-4">
         Proposed patch
       </h1>
       <p className="font-mono text-[13px] text-[#7A7171] mt-3">
         src/services/transactions.ts · minimal diff · awaiting approval
       </p>
+
+      {jobId && (
+        <section className="mt-10 border border-[#dedada] bg-white/60 px-5 py-5">
+          <div className="flex flex-col sm:flex-row sm:items-center gap-3">
+            <p className="kicker">
+              Live proposal · {proposal?.repo} · <span className="underline underline-offset-4">UNVERIFIED</span>
+            </p>
+            <form
+              className="flex gap-2 sm:ml-auto"
+              onSubmit={(e) => {
+                e.preventDefault();
+                if (jobId && !forging) void forge(jobId, proposal?.repo ?? "", focus);
+              }}
+            >
+              <input
+                type="text"
+                aria-label="Focus area, e.g. a function or file name"
+                placeholder="focus: function or file (optional)"
+                value={focus}
+                onChange={(e) => setFocus(e.target.value)}
+                disabled={forging}
+                spellCheck={false}
+                className="w-56 bg-white border border-[#dedada] px-2.5 py-2.5 font-mono text-[13px] placeholder:text-[#7A7171] focus:outline-none focus:border-[#0A0A0A] disabled:opacity-50"
+              />
+              <button
+                type="submit"
+                disabled={forging}
+                className="bg-[#0A0A0A] text-white font-mono text-[11px] tracking-[0.08em] px-4 py-2.5 hover:bg-black active:scale-[0.98] disabled:opacity-40 disabled:cursor-not-allowed transition-all"
+              >
+                {forging ? "FORGING…" : "REGENERATE ↗"}
+              </button>
+            </form>
+          </div>
+          {forging && !proposal?.suggestion ? (
+            <p className="font-mono text-[13px] text-[#7A7171] mt-4">
+              Asking the model for a minimal patch…
+            </p>
+          ) : forgeError ? (
+            <p role="alert" className="font-mono text-xs mt-4 underline underline-offset-4 decoration-[#dedada]">
+              {forgeError}
+            </p>
+          ) : proposal?.suggestion ? (
+            <pre className="font-mono text-[12px] leading-[1.9] mt-4 whitespace-pre-wrap break-words max-w-4xl">
+              {proposal.suggestion}
+            </pre>
+          ) : null}
+          <p className="font-mono text-[10px] text-[#7A7171] mt-4">
+            Proposal only — nothing applied. Sandbox verification pending.
+          </p>
+        </section>
+      )}
 
       <div className="grid gap-10 mt-10 lg:grid-cols-2">
         <div>

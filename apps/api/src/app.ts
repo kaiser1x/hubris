@@ -11,7 +11,9 @@ import { desc, eq } from "drizzle-orm";
 import { analyzeRepository } from "@hubris/analyzer";
 import { getDb, schema } from "@hubris/db";
 import {
+  FORGE_SYSTEM,
   INVESTIGATE_SYSTEM,
+  buildForgePrompt,
   buildInvestigatePrompt,
   chatComplete,
   llmConfigFromEnv,
@@ -45,6 +47,24 @@ const InvestigateBody = z.object({
   jobId: z.string().min(1, "jobId is required"),
   question: z.string().max(2000).optional(),
 });
+
+const ForgeBody = z.object({
+  jobId: z.string().min(1, "jobId is required"),
+  focus: z.string().max(200).optional(),
+  instruction: z.string().max(2000).optional(),
+});
+
+function shortPath(p: string): string {
+  return p.split(/[\\/]/).filter(Boolean).slice(-3).join("/");
+}
+
+// Rewrite absolute clone-dir paths to repo-relative posix paths so stored
+// twins never leak the server's temp directory.
+export function toRepoRelative(tmp: string, abs: string): string {
+  const rel = path.relative(tmp, abs);
+  if (rel === "" || rel.startsWith("..")) return abs;
+  return rel.split(path.sep).join("/");
+}
 
 export const app = new Hono();
 
@@ -154,6 +174,14 @@ app.post("/api/analyze", async (c: Context) => {
       const started = Date.now();
       const twin = await analyzeRepository(tmp);
       twin.name = cloneUrl.split("/").slice(-2).join("/").replace(/\.git$/, "");
+      for (const fn of twin.functions) fn.path = toRepoRelative(tmp, fn.path);
+      for (const cls of twin.classes) cls.path = toRepoRelative(tmp, cls.path);
+      for (const e of twin.endpoints) e.file = toRepoRelative(tmp, e.file);
+      for (const t of twin.tests) {
+        t.path = toRepoRelative(tmp, t.path);
+        t.file = toRepoRelative(tmp, t.file);
+      }
+      for (const r of twin.relationships) r.from = toRepoRelative(tmp, r.from);
       const payload = {
         jobId,
         repository: {
@@ -319,6 +347,92 @@ app.post("/api/investigate", async (c: Context) => {
     return c.json({ jobId: job.id, answer });
   } catch (error: any) {
     console.error("Investigate error:", error?.message);
+    return c.json({ error: "Model request failed", status: 502 }, 502);
+  }
+});
+
+// POST /api/forge - Propose a minimal patch + regression test for a completed job.
+// Body: { jobId, focus?, instruction? }. Proposals are UNVERIFIED until the
+// sandbox phase lands; the response says so explicitly.
+app.post("/api/forge", async (c: Context) => {
+  let rawBody: unknown;
+  try {
+    rawBody = await c.req.json();
+  } catch {
+    return c.json({ error: "Invalid JSON body", status: 400 }, 400);
+  }
+
+  const parsed = ForgeBody.safeParse(rawBody);
+  if (!parsed.success) {
+    return c.json({ error: "jobId is required", status: 400 }, 400);
+  }
+
+  const db = getDb();
+  if (!db) {
+    return c.json({ error: "Job store unavailable", status: 503 }, 503);
+  }
+
+  const rows = await db.select().from(schema.jobs).where(eq(schema.jobs.id, parsed.data.jobId));
+  const job = rows[0];
+  if (!job) {
+    return c.json({ error: "Job not found", status: 404 }, 404);
+  }
+  const result = job.result as {
+    repository?: { name?: string };
+    stats?: { functions: number; classes: number; endpoints: number; tests: number; relationships: number };
+    full?: {
+      functions?: Array<{ name?: string; path?: string; line?: number }>;
+      endpoints?: Array<{ method?: string; path?: string }>;
+      relationships?: Array<{ from?: string; to?: string; type?: string }>;
+    };
+  } | null;
+  if (job.status !== "complete" || !result?.stats) {
+    return c.json({ error: "Job has no completed analysis", status: 400 }, 400);
+  }
+
+  const llm = llmConfigFromEnv();
+  if (!llm) {
+    return c.json({ error: "Model not configured", status: 503 }, 503);
+  }
+
+  const fullFunctions = result.full?.functions ?? [];
+  const prompt = buildForgePrompt(
+    {
+      repoName: result.repository?.name ?? job.repoUrl,
+      stats: result.stats,
+      functions: fullFunctions.map((f) => ({
+        name: f.name ?? "(anonymous)",
+        file: f.path ? shortPath(f.path) : "(unknown)",
+        line: f.line ?? 1,
+      })),
+      endpoints: (result.full?.endpoints ?? []).map((e) =>
+        `${e.method ?? ""} ${e.path ?? ""}`.trim()
+      ).filter(Boolean),
+      relationships: (result.full?.relationships ?? []).map((r) =>
+        `${r.from ? shortPath(r.from) : "?"} ${r.type ?? "?"} ${r.to ?? "?"}`
+      ),
+      focus: parsed.data.focus,
+      instruction: parsed.data.instruction,
+    }
+  );
+
+  try {
+    const suggestion = await chatComplete(
+      llm,
+      [
+        { role: "system", content: FORGE_SYSTEM },
+        { role: "user", content: prompt },
+      ],
+      { maxTokens: 1200, signal: AbortSignal.timeout(90000) }
+    );
+    return c.json({
+      jobId: job.id,
+      suggestion,
+      verified: false,
+      note: "Proposal only — nothing was applied. Sandbox verification pending.",
+    });
+  } catch (error: any) {
+    console.error("Forge error:", error?.message);
     return c.json({ error: "Model request failed", status: 502 }, 502);
   }
 });
