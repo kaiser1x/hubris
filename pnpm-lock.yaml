@@ -23,6 +23,9 @@ importers:
       '@hubris/db':
         specifier: workspace:*
         version: link:../../services/db
+      '@hubris/llm':
+        specifier: workspace:*
+        version: link:../../services/llm
       dotenv:
         specifier: ^18.0.3
         version: 18.0.3
@@ -108,6 +111,12 @@ importers:
       drizzle-kit:
         specifier: ^0.31.11
         version: 0.31.11
+
+  services/llm:
+    devDependencies:
+      vitest:
+        specifier: ^5.0.1
+        version: 5.0.1(vite@8.3.1(esbuild@0.28.2)(jiti@2.7.0)(tsx@4.23.15))
 
 packages:
 

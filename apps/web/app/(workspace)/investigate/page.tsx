@@ -1,9 +1,47 @@
+"use client";
+
 import Link from "next/link";
+import { useEffect, useState } from "react";
 import { CASES, EVIDENCE, VERIFICATION } from "../../lib/casefile";
+import { fetchLatestJob, liveRepoName } from "../../lib/live-twin";
 
 const primary = CASES[0];
 
+interface LiveAssessment {
+  repo: string;
+  answer: string;
+}
+
 export default function InvestigatePage() {
+  const [assessment, setAssessment] = useState<LiveAssessment | null>(null);
+  const [asking, setAsking] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const job = await fetchLatestJob();
+        if (!job || cancelled) return;
+        const res = await fetch("/api/investigate", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ jobId: job.id }),
+        });
+        if (!res.ok || cancelled) return;
+        const data = await res.json();
+        if (typeof data.answer === "string" && data.answer.trim()) {
+          setAssessment({ repo: liveRepoName(job), answer: data.answer.trim() });
+        }
+      } catch {
+        // fall through to demo narrative
+      } finally {
+        if (!cancelled) setAsking(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
   return (
     <div className="max-w-[1440px] mx-auto px-5 lg:px-[52px] pt-10 lg:pt-[50px] pb-12">
       <p className="kicker">Repository / Investigate · {primary.id}</p>
@@ -16,7 +54,21 @@ export default function InvestigatePage() {
 
       <div className="grid gap-12 mt-10 lg:grid-cols-[1fr_300px]">
         <div className="min-w-0">
-          <section>
+          {(assessment || asking) && (
+            <section>
+              <h2 className="kicker">Live assessment · {assessment?.repo ?? "…"}</h2>
+              {assessment ? (
+                <p className="text-[15px] leading-7 mt-3 max-w-2xl whitespace-pre-wrap">
+                  {assessment.answer}
+                </p>
+              ) : (
+                <p className="font-mono text-[13px] text-[#7A7171] mt-3">
+                  Asking the model about the latest analysis…
+                </p>
+              )}
+            </section>
+          )}
+          <section className={assessment || asking ? "mt-10" : undefined}>
             <h2 className="kicker">Problem</h2>
             <p className="text-[15px] leading-7 mt-3 max-w-2xl">
               Two concurrent requests for the same logical transaction both

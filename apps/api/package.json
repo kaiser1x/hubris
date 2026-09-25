@@ -14,6 +14,7 @@
     "@hono/node-server": "^1.19.5",
     "@hubris/analyzer": "workspace:*",
     "@hubris/db": "workspace:*",
+    "@hubris/llm": "workspace:*",
     "dotenv": "^18.0.3",
     "drizzle-orm": "^0.44.7",
     "hono": "^4.13.9",

@@ -13,6 +13,36 @@ describe("GET /api/jobs", () => {
   });
 });
 
+describe("POST /api/investigate validation", () => {
+  it("returns 400 on invalid JSON", async () => {
+    const res = await app.request("/api/investigate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{not json",
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it("returns 400 without jobId", async () => {
+    const res = await app.request("/api/investigate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it("returns 503 when no DATABASE_URL is configured", async () => {
+    expect(process.env.DATABASE_URL).toBeUndefined();
+    const res = await app.request("/api/investigate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ jobId: "00000000-0000-0000-0000-000000000000" }),
+    });
+    expect(res.status).toBe(503);
+  });
+});
+
 describe("GET /api/jobs/:id", () => {
   it("returns 503 when no DATABASE_URL is configured", async () => {
     expect(process.env.DATABASE_URL).toBeUndefined();

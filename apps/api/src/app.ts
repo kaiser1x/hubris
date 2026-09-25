@@ -10,6 +10,12 @@ import { z } from "zod";
 import { desc, eq } from "drizzle-orm";
 import { analyzeRepository } from "@hubris/analyzer";
 import { getDb, schema } from "@hubris/db";
+import {
+  INVESTIGATE_SYSTEM,
+  buildInvestigatePrompt,
+  chatComplete,
+  llmConfigFromEnv,
+} from "@hubris/llm";
 
 const execFileAsync = promisify(execFile);
 
@@ -33,6 +39,11 @@ export function toSafeCloneUrl(raw: string): string | null {
 
 const AnalyzeBody = z.object({
   repoUrl: z.string().min(1, "repoUrl is required"),
+});
+
+const InvestigateBody = z.object({
+  jobId: z.string().min(1, "jobId is required"),
+  question: z.string().max(2000).optional(),
 });
 
 export const app = new Hono();
@@ -239,6 +250,77 @@ app.get("/api/jobs/:id", async (c: Context) => {
     return c.json({ error: "Job not found", status: 404 }, 404);
   }
   return c.json(job);
+});
+
+// POST /api/investigate - Ask the model about a completed analysis job.
+// Body: { jobId, question? }. Requires job store + model configuration.
+app.post("/api/investigate", async (c: Context) => {
+  let rawBody: unknown;
+  try {
+    rawBody = await c.req.json();
+  } catch {
+    return c.json({ error: "Invalid JSON body", status: 400 }, 400);
+  }
+
+  const parsed = InvestigateBody.safeParse(rawBody);
+  if (!parsed.success) {
+    return c.json({ error: "jobId is required", status: 400 }, 400);
+  }
+
+  const db = getDb();
+  if (!db) {
+    return c.json({ error: "Job store unavailable", status: 503 }, 503);
+  }
+
+  const rows = await db.select().from(schema.jobs).where(eq(schema.jobs.id, parsed.data.jobId));
+  const job = rows[0];
+  if (!job) {
+    return c.json({ error: "Job not found", status: 404 }, 404);
+  }
+  const result = job.result as {
+    repository?: { name?: string };
+    stats?: { functions: number; classes: number; endpoints: number; tests: number; relationships: number };
+    sample?: { functions?: Array<{ name?: string }>; endpoints?: Array<{ method?: string; path?: string }> };
+    full?: {
+      functions?: Array<{ name?: string }>;
+      endpoints?: Array<{ method?: string; path?: string }>;
+    };
+  } | null;
+  if (job.status !== "complete" || !result?.stats) {
+    return c.json({ error: "Job has no completed analysis", status: 400 }, 400);
+  }
+
+  const llm = llmConfigFromEnv();
+  if (!llm) {
+    return c.json({ error: "Model not configured", status: 503 }, 503);
+  }
+
+  const functions = result.full?.functions ?? result.sample?.functions ?? [];
+  const endpoints = result.full?.endpoints ?? result.sample?.endpoints ?? [];
+  const prompt = buildInvestigatePrompt(
+    {
+      repoName: result.repository?.name ?? job.repoUrl,
+      stats: result.stats,
+      functionNames: functions.map((f) => f.name ?? "").filter(Boolean),
+      endpoints: endpoints.map((e) => `${e.method ?? ""} ${e.path ?? ""}`.trim()).filter(Boolean),
+    },
+    parsed.data.question
+  );
+
+  try {
+    const answer = await chatComplete(
+      llm,
+      [
+        { role: "system", content: INVESTIGATE_SYSTEM },
+        { role: "user", content: prompt },
+      ],
+      { signal: AbortSignal.timeout(60000) }
+    );
+    return c.json({ jobId: job.id, answer });
+  } catch (error: any) {
+    console.error("Investigate error:", error?.message);
+    return c.json({ error: "Model request failed", status: 502 }, 502);
+  }
 });
 
 // GET /health - Health check
