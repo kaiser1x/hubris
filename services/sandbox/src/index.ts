@@ -11,6 +11,11 @@ export {
   toSafeCloneUrl as toSafeSandboxCloneUrl,
 } from "./repo";
 export {
+  DEFAULT_EXECUTION_LIMITS,
+  executionLimitsFromEnv,
+  type ExecutionLimits,
+} from "./limits";
+export {
   cancelOperation,
   getOperation,
   runCommand,

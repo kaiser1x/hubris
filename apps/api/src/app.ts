@@ -19,14 +19,21 @@ import {
   llmConfigFromEnv,
 } from "@hubris/llm";
 import { createHash } from "crypto";
-import { buildRepoCheckoutCommand, isSafeGitRef, REPO_WORKDIR, runCommand, sandboxConfigFromEnv, uploadFile } from "@hubris/sandbox";
+import { buildRepoCheckoutCommand, executionLimitsFromEnv, isSafeGitRef, REPO_WORKDIR, runCommand, sandboxConfigFromEnv, uploadFile } from "@hubris/sandbox";
 import {
   buildCheckoutScript,
   CHECKOUT_UPLOAD_PATH,
+  cloneAndArchive,
   isTransferExcluded,
   limitsFromEnv,
   parseCheckoutListing,
 } from "./checkout";
+import {
+  buildInstallScript,
+  detectManager,
+  installTimingFromEnv,
+  type PackageManager,
+} from "./install";
 
 const execFileAsync = promisify(execFile);
 
@@ -88,6 +95,13 @@ const CheckoutBody = z.object({
   jobId: z.string().min(1, "jobId is required"),
   ref: GitRef.optional(),
   image: z.string().max(200).optional(),
+});
+
+const InstallBody = z.object({
+  jobId: z.string().min(1, "jobId is required"),
+  ref: GitRef.optional(),
+  image: z.string().max(200).optional(),
+  manager: z.enum(["pnpm", "npm"]).optional(),
 });
 
 function shortPath(p: string): string {
@@ -537,13 +551,15 @@ app.post("/api/reproduce", async (c: Context) => {
   }
 
   try {
+    const limits = executionLimitsFromEnv();
     const result = await runCommand(sandbox, {
       command,
       image: parsed.data.image ?? "tag:busybox:latest",
       shell: true,
       disposable: true,
-      timeout: 120,
-      waitMs: 150000,
+      timeout: limits.commandTimeoutS,
+      truncateOutputAt: limits.maxOutputBytes,
+      waitMs: limits.waitMs,
     });
     const evidence = {
       script: parsed.data.script,
@@ -617,13 +633,15 @@ app.post("/api/verify", async (c: Context) => {
   }
 
   try {
+    const limits = executionLimitsFromEnv();
     const result = await runCommand(sandbox, {
       command,
       image: parsed.data.image ?? "tag:busybox:latest",
       shell: true,
       disposable: true,
-      timeout: 120,
-      waitMs: 150000,
+      timeout: limits.commandTimeoutS,
+      truncateOutputAt: limits.maxOutputBytes,
+      waitMs: limits.waitMs,
     });
     const verification = {
       script: parsed.data.script,
@@ -694,23 +712,23 @@ app.post("/api/checkout", async (c: Context) => {
   }
 
   const limits = limitsFromEnv();
+  const execLimits = executionLimitsFromEnv();
   const ref = parsed.data.ref;
   const tmp = await fs.promises.mkdtemp(path.join(os.tmpdir(), "hubris-checkout-"));
-  const src = path.join(tmp, "src");
-  const tarPath = path.join(tmp, "repo.tar");
   try {
+    let staged;
     try {
-      await execFileAsync("git", [
-        "clone", "--depth", "1",
-        ...(ref ? ["--branch", ref] : []),
-        cloneUrl, src,
-      ], { timeout: 90000 });
-    } catch {
-      return c.json({ error: "Repository clone failed", status: 500 }, 500);
+      staged = await cloneAndArchive(cloneUrl, ref, tmp);
+    } catch (error: any) {
+      const step =
+        error?.message === "clone"
+          ? "clone"
+          : error?.message === "ls-files"
+            ? "listing"
+            : "archive";
+      return c.json({ error: `Repository ${step} failed`, status: 500 }, 500);
     }
-
-    const ls = await execFileAsync("git", ["-C", src, "ls-files", "-z"], { timeout: 30000 });
-    const tracked = ls.stdout.split("\0").filter((p) => p.length > 0);
+    const { tarPath, tracked } = staged;
     const excluded = tracked.filter(isTransferExcluded);
     const expected = tracked.length - excluded.length;
     if (expected <= 0) {
@@ -723,11 +741,6 @@ app.post("/api/checkout", async (c: Context) => {
       );
     }
 
-    try {
-      await execFileAsync("git", ["-C", src, "archive", "HEAD", "-o", tarPath], { timeout: 60000 });
-    } catch {
-      return c.json({ error: "Repository archive failed", status: 500 }, 500);
-    }
     const tarBytes = await fs.promises.readFile(tarPath);
     if (tarBytes.length > limits.maxBytes) {
       return c.json(
@@ -756,8 +769,9 @@ app.post("/api/checkout", async (c: Context) => {
         files: { [CHECKOUT_UPLOAD_PATH]: { uuid: uploaded.uuid } },
         shell: true,
         disposable: true,
-        timeout: 120,
-        waitMs: 150000,
+        timeout: execLimits.commandTimeoutS,
+        truncateOutputAt: execLimits.maxOutputBytes,
+        waitMs: execLimits.waitMs,
       });
     } catch (error: any) {
       console.error("Checkout run error:", error?.message);
@@ -794,6 +808,148 @@ app.post("/api/checkout", async (c: Context) => {
       })
       .where(eq(schema.jobs.id, job.id));
     return c.json({ jobId: job.id, checkout: entry });
+  } finally {
+    await fs.promises.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+// POST /api/install - Install a job's repository dependencies in a sandbox.
+// Body: { jobId, ref?, image?, manager? }. Same clone/archive/upload staging
+// as checkout, then runs the package manager with --ignore-scripts (never
+// lifecycle scripts in Phase D) on a node-capable image (default
+// tag:node:20-slim). Manager auto-detects from root lockfiles unless given.
+// Evidence lands on job.result.installs[]. Test execution is Phase E.
+app.post("/api/install", async (c: Context) => {
+  let rawBody: unknown;
+  try {
+    rawBody = await c.req.json();
+  } catch {
+    return c.json({ error: "Invalid JSON body", status: 400 }, 400);
+  }
+
+  const parsed = InstallBody.safeParse(rawBody);
+  if (!parsed.success) {
+    return c.json({ error: "jobId is required", status: 400 }, 400);
+  }
+
+  const db = getDb();
+  if (!db) {
+    return c.json({ error: "Job store unavailable", status: 503 }, 503);
+  }
+
+  const rows = await db.select().from(schema.jobs).where(eq(schema.jobs.id, parsed.data.jobId));
+  const job = rows[0];
+  if (!job) {
+    return c.json({ error: "Job not found", status: 404 }, 404);
+  }
+
+  const cloneUrl = toSafeCloneUrl(job.repoUrl);
+  if (!cloneUrl) {
+    return c.json({ error: "Job has unsupported repo URL", status: 400 }, 400);
+  }
+
+  const sandbox = sandboxConfigFromEnv();
+  if (!sandbox) {
+    return c.json({ error: "Sandbox not configured", status: 503 }, 503);
+  }
+
+  const limits = limitsFromEnv();
+  const execLimits = executionLimitsFromEnv();
+  const timing = installTimingFromEnv();
+  const ref = parsed.data.ref;
+  const tmp = await fs.promises.mkdtemp(path.join(os.tmpdir(), "hubris-install-"));
+  try {
+    let staged;
+    try {
+      staged = await cloneAndArchive(cloneUrl, ref, tmp);
+    } catch (error: any) {
+      const step =
+        error?.message === "clone"
+          ? "clone"
+          : error?.message === "ls-files"
+            ? "listing"
+            : "archive";
+      return c.json({ error: `Repository ${step} failed`, status: 500 }, 500);
+    }
+    const { tarPath, tracked } = staged;
+    const excluded = tracked.filter(isTransferExcluded);
+    const expected = tracked.length - excluded.length;
+    if (expected <= 0) {
+      return c.json({ error: "Repository has no transferable files", status: 400 }, 400);
+    }
+    if (tracked.length > limits.maxFiles) {
+      return c.json(
+        { error: `Repository exceeds transfer limits (${tracked.length} files > ${limits.maxFiles})`, status: 413 },
+        413
+      );
+    }
+
+    const tarBytes = await fs.promises.readFile(tarPath);
+    if (tarBytes.length > limits.maxBytes) {
+      return c.json(
+        { error: `Repository exceeds transfer limits (${tarBytes.length} bytes > ${limits.maxBytes})`, status: 413 },
+        413
+      );
+    }
+    const localSha = createHash("sha256").update(tarBytes).digest("hex");
+
+    let uploaded;
+    try {
+      uploaded = await uploadFile(sandbox, tarBytes, { timeoutMs: 60000 });
+    } catch (error: any) {
+      console.error("Install upload error:", error?.message);
+      return c.json({ error: "Sandbox upload failed", status: 502 }, 502);
+    }
+    if (uploaded.sha256 !== localSha) {
+      return c.json({ error: "Transfer integrity mismatch", status: 502 }, 502);
+    }
+
+    const detected = detectManager(tracked);
+    const manager: PackageManager = parsed.data.manager ?? detected ?? "pnpm";
+    let result;
+    try {
+      result = await runCommand(sandbox, {
+        command: buildInstallScript(manager, excluded),
+        image: parsed.data.image ?? "tag:node:20-slim",
+        files: { [CHECKOUT_UPLOAD_PATH]: { uuid: uploaded.uuid } },
+        shell: true,
+        disposable: true,
+        timeout: timing.timeoutS,
+        truncateOutputAt: execLimits.maxOutputBytes,
+        waitMs: timing.waitMs,
+      });
+    } catch (error: any) {
+      console.error("Install run error:", error?.message);
+      return c.json({ error: "Sandbox run failed", status: 502 }, 502);
+    }
+
+    const ok = result.exitCode === 0 && !result.timedOut;
+    const entry = {
+      repoUrl: job.repoUrl,
+      ...(ref ? { ref } : {}),
+      manager,
+      managerSource: parsed.data.manager ? "requested" : detected ? "detected" : "default",
+      image: parsed.data.image ?? "tag:node:20-slim",
+      workspace: REPO_WORKDIR,
+      files: expected,
+      bytes: tarBytes.length,
+      sha256: localSha,
+      exitCode: result.exitCode,
+      timedOut: result.timedOut,
+      ok,
+      stdout: result.stdout.slice(0, 4000),
+      stderr: result.stderr.slice(0, 4000),
+      at: new Date().toISOString(),
+    };
+    const prior = (job.result as { installs?: unknown[] } | null)?.installs ?? [];
+    await db
+      .update(schema.jobs)
+      .set({
+        result: { ...(job.result as object), installs: [...prior, entry] },
+        updatedAt: new Date(),
+      })
+      .where(eq(schema.jobs.id, job.id));
+    return c.json({ jobId: job.id, install: entry });
   } finally {
     await fs.promises.rm(tmp, { recursive: true, force: true });
   }

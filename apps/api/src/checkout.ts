@@ -15,7 +15,12 @@
 // Host secrets (NEBIUS_*, GITHUB_TOKEN, DATABASE_URL) are never in scope:
 // they live in server env, never in the clone, never in the spawn payload.
 
+import { execFile } from "child_process";
+import { promisify } from "util";
+import * as path from "path";
 import { REPO_WORKDIR } from "@hubris/sandbox";
+
+const execFileAsync = promisify(execFile);
 
 // Sandbox path the uploaded tarball is mapped to (via SpawnRequest.files).
 export const CHECKOUT_UPLOAD_PATH = "/tmp/hubris-upload/repo.tar";
@@ -86,4 +91,48 @@ export function parseCheckoutListing(stdout: string): {
 } {
   const m = stdout.match(/COUNT\s+(\d+)/);
   return { count: m ? Number(m[1]) : null, excerpt: stdout.slice(0, 4000) };
+}
+
+export interface StagedRepo {
+  src: string;
+  tarPath: string;
+  tracked: string[];
+}
+
+// Clone + list + archive under tmp. Never executes repo code — pure git
+// plumbing. Throws Error("clone" | "ls-files" | "archive") so handlers can
+// map to responses without leaking subprocess details.
+export async function cloneAndArchive(
+  cloneUrl: string,
+  ref: string | undefined,
+  tmp: string
+): Promise<StagedRepo> {
+  const src = path.join(tmp, "src");
+  const tarPath = path.join(tmp, "repo.tar");
+  try {
+    await execFileAsync(
+      "git",
+      ["clone", "--depth", "1", ...(ref ? ["--branch", ref] : []), cloneUrl, src],
+      { timeout: 90000 }
+    );
+  } catch {
+    throw new Error("clone");
+  }
+  let tracked: string[];
+  try {
+    const ls = await execFileAsync("git", ["-C", src, "ls-files", "-z"], {
+      timeout: 30000,
+    });
+    tracked = ls.stdout.split("\0").filter((p) => p.length > 0);
+  } catch {
+    throw new Error("ls-files");
+  }
+  try {
+    await execFileAsync("git", ["-C", src, "archive", "HEAD", "-o", tarPath], {
+      timeout: 60000,
+    });
+  } catch {
+    throw new Error("archive");
+  }
+  return { src, tarPath, tracked };
 }

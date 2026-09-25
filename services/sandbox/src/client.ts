@@ -17,6 +17,10 @@ export interface SpawnRequest {
   // Previously uploaded files to place in the sandbox before the command
   // runs: absolute sandbox path -> file reference (see uploadFile).
   files?: Record<string, SpawnFileRef>;
+  // Server-side recorded-bytes cap per stream (truncate_output_at).
+  truncateOutputAt?: number;
+  // Server-side writable-layer cap (resources_limits.max_layer_bytes).
+  maxLayerBytes?: number;
 }
 
 export interface SpawnResponse {
@@ -63,6 +67,10 @@ export async function spawnInstance(
       ...(req.timeout !== undefined ? { timeout: req.timeout } : {}),
       ...(req.cwd !== undefined ? { cwd: req.cwd } : {}),
       ...(req.files !== undefined ? { files: req.files } : {}),
+      ...(req.truncateOutputAt !== undefined ? { truncate_output_at: req.truncateOutputAt } : {}),
+      ...(req.maxLayerBytes !== undefined
+        ? { resources_limits: { max_layer_bytes: req.maxLayerBytes } }
+        : {}),
     }),
   });
 

@@ -1,5 +1,7 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import {
+  DEFAULT_EXECUTION_LIMITS,
+  executionLimitsFromEnv,
   spawnInstance,
   uploadFile,
 } from "../src/index";
@@ -64,5 +66,57 @@ describe("spawnInstance files", () => {
     await spawnInstance(CONFIG, { command: "echo hi", image: "tag:busybox:latest" });
     const [, init] = fetchMock.mock.calls[0];
     expect(JSON.parse(init?.body as string)).not.toHaveProperty("files");
+  });
+});
+
+describe("spawnInstance execution limits", () => {
+  it("passes truncate and layer caps through to the spawn body", async () => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ uuid: "op-1" }), { status: 201 }));
+    vi.stubGlobal("fetch", fetchMock);
+    await spawnInstance(CONFIG, {
+      command: "echo hi",
+      image: "tag:busybox:latest",
+      truncateOutputAt: 65535,
+      maxLayerBytes: 1073741824,
+    });
+    const [, init] = fetchMock.mock.calls[0];
+    const body = JSON.parse(init?.body as string);
+    expect(body.truncate_output_at).toBe(65535);
+    expect(body.resources_limits).toEqual({ max_layer_bytes: 1073741824 });
+  });
+
+  it("omits caps when not provided", async () => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ uuid: "op-1" }), { status: 201 }));
+    vi.stubGlobal("fetch", fetchMock);
+    await spawnInstance(CONFIG, { command: "echo hi", image: "tag:busybox:latest" });
+    const [, init] = fetchMock.mock.calls[0];
+    const body = JSON.parse(init?.body as string);
+    expect(body).not.toHaveProperty("truncate_output_at");
+    expect(body).not.toHaveProperty("resources_limits");
+  });
+});
+
+describe("executionLimitsFromEnv", () => {
+  it("returns conservative defaults", () => {
+    expect(executionLimitsFromEnv({})).toEqual(DEFAULT_EXECUTION_LIMITS);
+    expect(
+      executionLimitsFromEnv({ HUBRIS_SANDBOX_TIMEOUT: "nope", HUBRIS_SANDBOX_WAIT_MS: "-1" })
+    ).toEqual(DEFAULT_EXECUTION_LIMITS);
+  });
+
+  it("honors overrides", () => {
+    expect(
+      executionLimitsFromEnv({
+        HUBRIS_SANDBOX_TIMEOUT: "300",
+        HUBRIS_SANDBOX_WAIT_MS: "330000",
+        HUBRIS_MAX_OUTPUT_BYTES: "65535",
+        HUBRIS_MAX_LAYER_BYTES: "1073741824",
+      })
+    ).toEqual({
+      commandTimeoutS: 300,
+      waitMs: 330000,
+      maxOutputBytes: 65535,
+      maxLayerBytes: 1073741824,
+    });
   });
 });
