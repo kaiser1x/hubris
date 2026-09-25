@@ -12,11 +12,11 @@
       "inputs": ["$Turbo/dependents^", "src/**/*", "turbo.json"]
     },
     "typecheck": {
-      "dependsOn": ["^typecheck"],
+      "dependsOn": ["^build"],
       "inputs": ["$Turbo/dependents^", "src/**/*", "turbo.json"]
     },
     "test": {
-      "dependsOn": ["^test"],
+      "dependsOn": ["^build"],
       "inputs": ["$Turbo/dependents^", "src/**/*", "turbo.json"]
     }
   }
