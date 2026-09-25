@@ -49,6 +49,11 @@ export interface ParsedRepository {
   relationships: Relationship[];
 }
 
+// Directories that never contain first-party sources. node_modules is the
+// critical one: without this, a local checkout with installed dependencies
+// floods the twin with thousands of third-party files.
+const SKIPPED_DIRS = new Set(["node_modules", "dist", "build", "coverage", ".git", ".next", ".turbo"]);
+
 function getAllSourceFiles(repoPath: string): string[] {
   const files: string[] = [];
 
@@ -58,7 +63,7 @@ function getAllSourceFiles(repoPath: string): string[] {
       for (const entry of entries) {
         const fullPath = join(dir, entry.name);
         if (entry.isDirectory()) {
-          walk(fullPath);
+          if (!SKIPPED_DIRS.has(entry.name)) walk(fullPath);
         } else if (entry.name.endsWith(".ts") || entry.name.endsWith(".js")) {
           files.push(fullPath);
         }
