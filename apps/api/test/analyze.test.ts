@@ -5,6 +5,22 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+describe("GET /api/jobs", () => {
+  it("returns 503 when no DATABASE_URL is configured", async () => {
+    expect(process.env.DATABASE_URL).toBeUndefined();
+    const res = await app.request("/api/jobs");
+    expect(res.status).toBe(503);
+  });
+});
+
+describe("GET /api/jobs/:id", () => {
+  it("returns 503 when no DATABASE_URL is configured", async () => {
+    expect(process.env.DATABASE_URL).toBeUndefined();
+    const res = await app.request("/api/jobs/00000000-0000-0000-0000-000000000000");
+    expect(res.status).toBe(503);
+  });
+});
+
 describe("GET /health", () => {
   it("returns ok", async () => {
     const res = await app.request("/health");

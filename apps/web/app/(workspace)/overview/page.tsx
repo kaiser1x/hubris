@@ -1,11 +1,38 @@
 "use client";
 
 import Link from "next/link";
-import { useState } from "react";
-import { CASES, HEALTH, NODES, REPO } from "../../lib/casefile";
+import { useEffect, useState } from "react";
+import { CASES, HEALTH, NODES, REPO, type TwinNode } from "../../lib/casefile";
+import {
+  fetchLatestJob,
+  liveHealth,
+  liveRepoName,
+  twinToNodes,
+} from "../../lib/live-twin";
 
 export default function OverviewPage() {
   const [analyzed, setAnalyzed] = useState(false);
+  const [liveNodes, setLiveNodes] = useState<TwinNode[] | null>(null);
+  const [liveName, setLiveName] = useState<string | null>(null);
+  const [liveCells, setLiveCells] = useState<[string, string, string][] | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetchLatestJob().then((job) => {
+      if (cancelled || !job) return;
+      const nodes = twinToNodes(job);
+      if (nodes.length === 0) return;
+      setLiveNodes(nodes);
+      setLiveName(liveRepoName(job));
+      setLiveCells(liveHealth(job));
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const nodes = liveNodes ?? NODES;
+  const healthCells = liveCells ?? HEALTH.slice(0, 3);
 
   return (
     <div className="max-w-[1440px] mx-auto px-5 lg:px-[52px] pt-10 lg:pt-[50px] pb-12">
@@ -13,7 +40,7 @@ export default function OverviewPage() {
       <div className="flex flex-col sm:flex-row sm:items-end gap-4 mt-4">
         <div>
           <h1 className="font-display text-[clamp(38px,5vw,58px)] leading-[1.05]">
-            {REPO.name}
+            {liveName ?? REPO.name}
           </h1>
           <p className="font-mono text-[13px] text-[#7A7171] mt-3">
             A living case file for your codebase.
@@ -53,7 +80,7 @@ export default function OverviewPage() {
               <div className="bg-[#0A0A0A] h-full" style={{ width: "98.4%" }} />
             </div>
           </div>
-          {HEALTH.slice(0, 3).map(([label, value, sub], i) => (
+          {healthCells.map(([label, value, sub], i) => (
             <div
               key={label}
               className={`py-6 pr-5 ${i < 2 ? "pl-5 border-r border-[#dedada]" : "pl-5 max-lg:border-l max-lg:border-[#dedada]"} ${i === 0 ? "max-lg:border-l-0 max-lg:pl-0" : ""} max-lg:[&:nth-child(2)]:border-r-0`}
@@ -140,12 +167,17 @@ export default function OverviewPage() {
               backgroundSize: "13px 13px",
             }}
           >
-            {NODES.map((n) => (
+            {nodes.slice(0, 8).map((n) => (
               <p key={n.id} className="truncate">
                 <span className="text-[#7A7171]">{n.layer} / </span>
                 {n.label}
               </p>
             ))}
+            {nodes.length > 8 && (
+              <p className="truncate text-[#7A7171]">
+                + {nodes.length - 8} more in the codebase twin →
+              </p>
+            )}
           </div>
           <div className="border-t border-[#dedada] mt-4 pt-3.5 flex items-center justify-between">
             <div>

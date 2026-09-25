@@ -1,6 +1,8 @@
 # HUBRIS local infrastructure.
 # Usage: docker compose up -d postgres
-# App connection string: DATABASE_URL=postgresql://hubris:hubris@localhost:5432/hubris
+# Host port is 5433: a native Windows PostgreSQL service already occupies 5432
+# on this machine, and it is left untouched.
+# App connection string: DATABASE_URL=postgresql://hubris:hubris@localhost:5433/hubris
 # Credentials below are local-dev only. Override with environment for anything shared.
 
 services:
@@ -12,7 +14,7 @@ services:
       POSTGRES_USER: hubris
       POSTGRES_PASSWORD: hubris
     ports:
-      - "5432:5432"
+      - "5433:5432"
     volumes:
       - hubris-pgdata:/var/lib/postgresql/data
     healthcheck:

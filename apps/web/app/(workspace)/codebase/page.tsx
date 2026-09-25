@@ -1,7 +1,8 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { LAYERS, NODES, REPO, type TwinNode } from "../../lib/casefile";
+import { fetchLatestJob, liveRepoName, twinToNodes } from "../../lib/live-twin";
 
 function NodeRow({
   node,
@@ -46,6 +47,25 @@ export default function CodebasePage() {
   const [input, setInput] = useState("");
   const [repoInfo, setRepoInfo] = useState<RepoInfo | null>(null);
   const [repoError, setRepoError] = useState<string | null>(null);
+  const [liveNodes, setLiveNodes] = useState<TwinNode[] | null>(null);
+  const [liveName, setLiveName] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetchLatestJob().then((job) => {
+      if (cancelled || !job) return;
+      const nodes = twinToNodes(job);
+      if (nodes.length === 0) return;
+      setLiveNodes(nodes);
+      setLiveName(liveRepoName(job));
+      setSelectedId((current) =>
+        nodes.some((n) => n.id === current) ? current : nodes[0].id
+      );
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   async function syncRepo() {
     const value = input.trim();
@@ -74,17 +94,19 @@ export default function CodebasePage() {
     }
   }
 
+  const nodes = liveNodes ?? NODES;
+
   const selected = useMemo(
-    () => NODES.find((n) => n.id === selectedId) ?? NODES[0],
-    [selectedId]
+    () => nodes.find((n) => n.id === selectedId) ?? nodes[0],
+    [nodes, selectedId]
   );
 
   const byLayer = useMemo(() => {
     const map = new Map<string, TwinNode[]>();
     for (const layer of LAYERS) map.set(layer, []);
-    for (const n of NODES) map.get(n.layer)?.push(n);
+    for (const n of nodes) map.get(n.layer)?.push(n);
     return map;
-  }, []);
+  }, [nodes]);
 
   return (
     <div className="max-w-[1440px] mx-auto px-5 lg:px-[52px] pt-10 lg:pt-[50px] pb-12">
@@ -92,12 +114,14 @@ export default function CodebasePage() {
       <div className="flex flex-col sm:flex-row sm:items-end gap-4 mt-4">
         <div className="min-w-0">
           <h1 className="font-display text-[clamp(32px,4vw,46px)] leading-[1.05] truncate">
-            {repoInfo?.name ?? REPO.name}
+            {repoInfo?.name ?? liveName ?? REPO.name}
           </h1>
           <p className="font-mono text-[13px] text-[#7A7171] mt-3">
             {repoInfo
               ? `${repoInfo.owner} · ${repoInfo.language ?? "unknown language"} · ${repoInfo.stars} stars`
-              : `${NODES.length} components · deterministic twin · ${REPO.branch}`}
+              : liveNodes
+                ? `${liveNodes.length} components · live twin · ${liveName}`
+                : `${nodes.length} components · deterministic twin · ${REPO.branch}`}
           </p>
           {repoInfo?.description && (
             <p className="text-sm text-[#7A7171] mt-1 max-w-xl">
@@ -136,11 +160,18 @@ export default function CodebasePage() {
           </button>
         </form>
       </div>
-      {!repoInfo && !repoError && (
-        <p className="font-mono text-[11px] text-[#7A7171] mt-3">
-          Twin below is the demo ledger. Paste a repo to look up its real
-          metadata; full clone-and-parse ingestion lands with the sandbox.
+      {liveNodes ? (
+        <p className="font-mono text-[11px] text-[#0A0A0A] mt-3">
+          ● LIVE TWIN — rendered from the latest completed analysis.
         </p>
+      ) : (
+        !repoInfo &&
+        !repoError && (
+          <p className="font-mono text-[11px] text-[#7A7171] mt-3">
+            Twin below is the demo ledger. Paste a repo to look up its real
+            metadata; full clone-and-parse ingestion lands with the sandbox.
+          </p>
+        )
       )}
 
       <div className="grid gap-12 mt-10 lg:grid-cols-[1fr_280px]">
