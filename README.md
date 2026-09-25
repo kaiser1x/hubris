@@ -9,23 +9,43 @@ Built for the **Nebius x NVIDIA Global AI Hackathon**, track: **Coding and
 Agentic Engineering**.
 
 > **Status: working prototype.** Analysis, persistence, live code-twin UI,
-> model-backed investigation and patch proposals are live. Sandbox execution
-> (reproduce/verify) is scaffolded and pending Contree enablement — see
-> [Roadmap](#roadmap).
+> model-backed investigation and patch proposals, and sandbox-backed
+> reproduce/verify are live. Full details in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ---
 
 ## How it works
 
+```mermaid
+flowchart TD
+    User(["you paste a GitHub URL"])
+    Web["web :3000<br/>twin UI with demo fallback"]
+    API["api :3001<br/>validate, clone, analyze, persist"]
+    Twin["CodeTwin<br/>functions, calls, endpoints"]
+    DB[("PostgreSQL<br/>jobs + evidence")]
+    Pages["codebase · overview · trace<br/>investigate · forge · reproduce · verify · ship"]
+    Model["Nemotron via Nebius<br/>assessments + patch proposals"]
+    Sbx["disposable sandbox runs<br/>repro evidence + check history"]
+
+    User --> Web
+    Web --> API
+    API --> Twin
+    Twin --> DB
+    DB --> Pages
+    API --> Model
+    API --> Sbx
+
+    classDef live fill:#d3f9d8,stroke:#2b8a3e,color:#0b2e13
+    classDef store fill:#dbe4ff,stroke:#3b5bdb,color:#10215c
+    classDef ext fill:#e9ecef,stroke:#868e96,color:#343a40
+    class User,Web,API,Twin,Pages live
+    class DB store
+    class Model,Sbx ext
 ```
-GitHub repo URL
-    ↓  POST /api/analyze
-Clone (depth 1) → static analysis → twin graph → PostgreSQL
-    ↓
-/codebase · /overview · /trace   (live twin UI, demo fallback)
-/investigate · /forge            (NVIDIA Nemotron reasoning over the twin)
-/reproduce · /verify · /ship     (demo narrative until sandbox lands)
-```
+
+> Legend: green = live HUBRIS components · blue = persisted state ·
+> gray = external Nebius infrastructure. Full reference:
+> [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 HUBRIS never executes repository code during analysis — it parses it. Execution
 happens only inside VM-isolated Contree sandboxes (see
@@ -36,8 +56,7 @@ happens only inside VM-isolated Contree sandboxes (see
 - **Node.js** 24.19.0 (see `.nvmrc`)
 - **pnpm** 10.34.5
 - **Docker** (local PostgreSQL)
-- A **Nebius** API key + project (model inference live; sandboxes pending
-  enablement)
+- A **Nebius** API key + project (model inference and sandboxes live)
 
 ## Setup
 
@@ -99,7 +118,7 @@ hubris/
 │   │                        with caller attribution,incl. route handlers)
 │   ├── db/                  Drizzle + PostgreSQL (jobs store, migrations)
 │   ├── llm/                 OpenAI-compatible chat client + twin prompts
-│   └── sandbox/             Contree sandbox REST client (scaffold; see below)
+│   └── sandbox/             ConTree sandbox REST client (live: disposable runs)
 ├── packages/
 │   ├── config/ · types/     Shared stubs (reserved)
 ├── fixtures/
@@ -134,11 +153,9 @@ selector), `/investigate`, `/forge`. Demo narrative until sandbox lands:
   (`NEBIUS_BASE_URL`, key `NEBIUS_API_KEY`, model `NEBIUS_MODEL`) for
   investigation answers and patch proposals. Bounded prompts, capped tokens,
   failures surface as `502` — never silent.
-- **Sandboxes (scaffolded):** `services/sandbox` implements the ConTree REST
-  contract (`POST /v1/instances`, operation polling, cancel, base64 stream
-  decoding; auth `Authorization: Bearer` + `Project` header) with hermetic
-  tests. Live use is pending Contree enablement on our project; `POST
-  /api/reproduce` is the planned first consumer.
+- **Sandboxes (live):** `services/sandbox` implements the ConTree REST
+  contract and `POST /api/reproduce` + `POST /api/verify` run disposable
+  commands, storing exit code, stdout, and stderr as job evidence.
 
 ## NVIDIA usage
 
@@ -150,7 +167,8 @@ credentials — and its output is labeled: assessments are opinions, patches are
 
 ## Roadmap
 
-1. Contree enablement → `POST /api/reproduce` (sandbox evidence on jobs)
+1. Repository checkout upload into the sandbox (install deps, run repo tests)
+2. Sandbox-backed `/verify` of forged patches against real checkouts
 2. Sandbox-backed `/verify` (apply proposal in sandbox, run tests, record)
 3. `/ship` evidence bundle from verified jobs
 4. Server-side trace endpoint (today traces compute client-side from job data)

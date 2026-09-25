@@ -30,6 +30,13 @@ flowchart TD
     LLM --> Model
     API --> Sandbox
     Sandbox --> Infra
+
+    classDef live fill:#d3f9d8,stroke:#2b8a3e,color:#0b2e13
+    classDef store fill:#dbe4ff,stroke:#3b5bdb,color:#10215c
+    classDef ext fill:#e9ecef,stroke:#868e96,color:#343a40
+    class Web,API,Analyzer,LLM,Sandbox live
+    class DB store
+    class User,Model,Infra ext
 ```
 
 Dependency direction is strict: `apps/api` imports the four services.
@@ -63,6 +70,11 @@ flowchart LR
     Root --> Pkgs
     Root --> Fix
     Root --> Infra2
+
+    classDef live fill:#d3f9d8,stroke:#2b8a3e,color:#0b2e13
+    classDef future fill:#ffec99,stroke:#e67700,color:#4d3800
+    class Root,Apps,Web,Api,Services,Analyzer,Db,Llm,Sbx,Fix,Infra2 live
+    class Pkgs future
 ```
 
 ## 3. Dependency Direction
@@ -79,6 +91,9 @@ flowchart TD
     Api2 --> Db2
     Api2 --> Llm2
     Api2 --> Sbx2
+
+    classDef live fill:#d3f9d8,stroke:#2b8a3e,color:#0b2e13
+    class Api2,Analyzer2,Db2,Llm2,Sbx2 live
 ```
 
 Workspace packages resolve through **compiled `dist` entrypoints**, which do
@@ -119,6 +134,10 @@ flowchart TD
     Slim --> Clean
     Clone --> Fail
     Analyze --> Fail
+
+    classDef live fill:#d3f9d8,stroke:#2b8a3e,color:#0b2e13
+    classDef store fill:#dbe4ff,stroke:#3b5bdb,color:#10215c
+    class Req,Zod,Safe,Insert,Clone,NoExec,Analyze,Norm,Store,Slim,Clean,DbFail,Fail live
 ```
 
 Ingestion vs persistence as a sequence. Note the deliberate split: the HTTP
@@ -175,6 +194,11 @@ flowchart TD
     Fn --> Twin
     Ep --> Twin
     Tests --> Twin
+
+    classDef live fill:#d3f9d8,stroke:#2b8a3e,color:#0b2e13
+    classDef store fill:#dbe4ff,stroke:#3b5bdb,color:#10215c
+    class Files,TS,Fn,Ep,Tests,Calls,EScope,Member,Imports live
+    class Twin store
 ```
 
 Known limitation (not solved): `const X = () => …` arrow-component
@@ -204,7 +228,7 @@ erDiagram
         jsonb full
     }
     FULL ||--|{ FUNCTION : contains
-    FULL ||--|{ CLASS : contains
+    FULL ||--|{ CODE_CLASS : contains
     FULL ||--|{ ENDPOINT : contains
     FULL ||--|{ TEST : contains
     FULL ||--|{ RELATIONSHIP : contains
@@ -215,7 +239,7 @@ erDiagram
         int line
         int column
     }
-    CLASS {
+    CODE_CLASS {
         string id
         string name
         string path
@@ -270,6 +294,11 @@ flowchart TD
     Chat --> Nemo
     Nemo --> Resp
     Chat --> Fail
+
+    classDef live fill:#d3f9d8,stroke:#2b8a3e,color:#0b2e13
+    classDef ext fill:#e9ecef,stroke:#868e96,color:#343a40
+    class FE,JID,Load,Cfg,Prompt,Chat,Resp,Fail live
+    class Nemo ext
 ```
 
 The answer is model analysis grounded in the stored twin. It is opinion, not
@@ -297,6 +326,13 @@ flowchart TD
     Chat2 --> Nemo2
     Nemo2 --> Out
     Out --> Unver
+
+    classDef live fill:#d3f9d8,stroke:#2b8a3e,color:#0b2e13
+    classDef warn fill:#ffec99,stroke:#e67700,color:#4d3800
+    classDef ext fill:#e9ecef,stroke:#868e96,color:#343a40
+    class Job,Twin2,Cfg2,Prompt2,Chat2,Out live
+    class Unver warn
+    class Nemo2 ext
 ```
 
 Forge output is a **proposal only**. Nothing is applied, and verification does
@@ -335,6 +371,13 @@ flowchart TD
         Patch --> Verify2
         Verify2 --> Ship
     end
+
+    classDef live fill:#d3f9d8,stroke:#2b8a3e,color:#0b2e13
+    classDef future fill:#ffec99,stroke:#e67700,color:#4d3800
+    classDef ext fill:#e9ecef,stroke:#868e96,color:#343a40
+    class Forge,Repro,Verif,Client live
+    class Checkout,Install,RunTests,Repro2,Patch,Verify2,Ship future
+    class Nebius ext
 ```
 
 Repository code execution through an uploaded checkout is **not implemented**.
@@ -377,6 +420,9 @@ flowchart TD
     Legacy --> Cap
     Cap --> Render
     Render --> Timings
+
+    classDef live fill:#d3f9d8,stroke:#2b8a3e,color:#0b2e13
+    class Payload,FE2,Engine,Entry,Calls,Dotted,External,Cycle,Branch,Leaf,Legacy,Cap,Render,Timings live
 ```
 
 Proven adversarially: `fixtures/deep-chain` (branches, a cycle, externals, a
@@ -398,6 +444,9 @@ flowchart TD
     Fetch --> Gate
     Gate --> Live
     Gate --> Demo
+
+    classDef live fill:#d3f9d8,stroke:#2b8a3e,color:#0b2e13
+    class Page,Fetch,Gate,Live,Demo live
 ```
 
 All browser API traffic goes through Next proxy routes. The browser never
@@ -413,6 +462,11 @@ flowchart LR
     Browser --> Proxy
     Proxy --> Hono
     Browser -.-> NoDirect
+
+    classDef live fill:#d3f9d8,stroke:#2b8a3e,color:#0b2e13
+    classDef note fill:#e9ecef,stroke:#868e96,color:#343a40
+    class Browser,Proxy,Hono live
+    class NoDirect note
 ```
 
 Proxy routes exist for `analyze`, `jobs`, `jobs/[id]`, `investigate`,
@@ -435,6 +489,13 @@ flowchart TD
     Turbo --> Api2
     Api2 --> Pg
     Pg -.-> Native
+
+    classDef live fill:#d3f9d8,stroke:#2b8a3e,color:#0b2e13
+    classDef store fill:#dbe4ff,stroke:#3b5bdb,color:#10215c
+    classDef note fill:#e9ecef,stroke:#868e96,color:#343a40
+    class Dev,Pnpm,Turbo,Web2,Api2 live
+    class Pg store
+    class Native note
 ```
 
 Build order (why `dependsOn: ["^build"]`):
@@ -448,6 +509,9 @@ flowchart LR
     Src --> Build
     Build --> Dist
     Dist --> Check
+
+    classDef live fill:#d3f9d8,stroke:#2b8a3e,color:#0b2e13
+    class Src,Build,Dist,Check live
 ```
 
 ## 13. CI
@@ -470,6 +534,11 @@ flowchart TD
     Pg2 --> TC
     TC --> Test
     Test --> Build
+
+    classDef live fill:#d3f9d8,stroke:#2b8a3e,color:#0b2e13
+    classDef store fill:#dbe4ff,stroke:#3b5bdb,color:#10215c
+    class Push,GHA,Install,TC,Test,Build live
+    class Pg2 store
 ```
 
 Locally, DB-backed tests skip when `DATABASE_URL` is unset.
@@ -507,6 +576,9 @@ flowchart TD
     ReproF --> PatchF
     PatchF --> VerifyF
     VerifyF --> ShipF
+
+    classDef future fill:#ffec99,stroke:#e67700,color:#4d3800
+    class ForgeF,Upload,ReproF,PatchF,VerifyF,ShipF future
 ```
 
 Entry criteria for each step: live verification against the implementation,
