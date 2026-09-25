@@ -61,6 +61,12 @@ const ReproduceBody = z.object({
   image: z.string().max(200).optional(),
 });
 
+const VerifyBody = z.object({
+  jobId: z.string().min(1, "jobId is required"),
+  script: z.string().min(1).max(4000),
+  image: z.string().max(200).optional(),
+});
+
 function shortPath(p: string): string {
   return p.split(/[\\/]/).filter(Boolean).slice(-3).join("/");
 }
@@ -521,6 +527,73 @@ app.post("/api/reproduce", async (c: Context) => {
     return c.json({ jobId: job.id, evidence });
   } catch (error: any) {
     console.error("Reproduce error:", error?.message);
+    return c.json({ error: "Sandbox run failed", status: 502 }, 502);
+  }
+});
+
+// POST /api/verify - Run a verification check in a disposable sandbox and
+// record pass/fail on the job. Unlike reproduce (which captures failure
+// evidence), verify asserts a check exits 0. Repo file upload lands later;
+// checks are self-contained scripts for now.
+// Body: { jobId, script, image? }.
+app.post("/api/verify", async (c: Context) => {
+  let rawBody: unknown;
+  try {
+    rawBody = await c.req.json();
+  } catch {
+    return c.json({ error: "Invalid JSON body", status: 400 }, 400);
+  }
+
+  const parsed = VerifyBody.safeParse(rawBody);
+  if (!parsed.success) {
+    return c.json({ error: "jobId and script are required", status: 400 }, 400);
+  }
+
+  const db = getDb();
+  if (!db) {
+    return c.json({ error: "Job store unavailable", status: 503 }, 503);
+  }
+
+  const rows = await db.select().from(schema.jobs).where(eq(schema.jobs.id, parsed.data.jobId));
+  const job = rows[0];
+  if (!job) {
+    return c.json({ error: "Job not found", status: 404 }, 404);
+  }
+
+  const sandbox = sandboxConfigFromEnv();
+  if (!sandbox) {
+    return c.json({ error: "Sandbox not configured", status: 503 }, 503);
+  }
+
+  try {
+    const result = await runCommand(sandbox, {
+      command: parsed.data.script,
+      image: parsed.data.image ?? "tag:busybox:latest",
+      shell: true,
+      disposable: true,
+      timeout: 120,
+      waitMs: 150000,
+    });
+    const verification = {
+      script: parsed.data.script,
+      exitCode: result.exitCode,
+      passed: result.exitCode === 0 && !result.timedOut,
+      stdout: result.stdout.slice(0, 4000),
+      stderr: result.stderr.slice(0, 4000),
+      timedOut: result.timedOut,
+      at: new Date().toISOString(),
+    };
+    const prior = (job.result as { verifications?: unknown[] } | null)?.verifications ?? [];
+    await db
+      .update(schema.jobs)
+      .set({
+        result: { ...(job.result as object), verifications: [...prior, verification] },
+        updatedAt: new Date(),
+      })
+      .where(eq(schema.jobs.id, job.id));
+    return c.json({ jobId: job.id, verification });
+  } catch (error: any) {
+    console.error("Verify error:", error?.message);
     return c.json({ error: "Sandbox run failed", status: 502 }, 502);
   }
 });

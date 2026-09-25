@@ -105,6 +105,36 @@ describe("POST /api/reproduce validation", () => {
   });
 });
 
+describe("POST /api/verify validation", () => {
+  it("returns 400 on invalid JSON", async () => {
+    const res = await app.request("/api/verify", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{not json",
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it("returns 400 without jobId and script", async () => {
+    const res = await app.request("/api/verify", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it("returns 503 when no DATABASE_URL is configured", async () => {
+    vi.stubEnv("DATABASE_URL", "");
+    const res = await app.request("/api/verify", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ jobId: "00000000-0000-0000-0000-000000000000", script: "exit 0" }),
+    });
+    expect(res.status).toBe(503);
+  });
+});
+
 describe("GET /api/jobs/:id", () => {
   it("returns 503 when no DATABASE_URL is configured", async () => {
     vi.stubEnv("DATABASE_URL", "");
