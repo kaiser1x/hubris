@@ -34,6 +34,12 @@ import {
   installTimingFromEnv,
   type PackageManager,
 } from "./install";
+import {
+  buildTestScript,
+  parseTestCommand,
+  TEST_BEGIN_MARKER,
+  testTimingFromEnv,
+} from "./testrun";
 
 const execFileAsync = promisify(execFile);
 
@@ -102,6 +108,16 @@ const InstallBody = z.object({
   ref: GitRef.optional(),
   image: z.string().max(200).optional(),
   manager: z.enum(["pnpm", "npm"]).optional(),
+});
+
+const RunTestsBody = z.object({
+  jobId: z.string().min(1, "jobId is required"),
+  ref: GitRef.optional(),
+  image: z.string().max(200).optional(),
+  manager: z.enum(["pnpm", "npm"]).optional(),
+  // Explicit test command (max 500 chars) for future agent use. When
+  // omitted, package.json scripts.test from the clone is used.
+  testCommand: z.string().min(1).max(500).optional(),
 });
 
 function shortPath(p: string): string {
@@ -950,6 +966,175 @@ app.post("/api/install", async (c: Context) => {
       })
       .where(eq(schema.jobs.id, job.id));
     return c.json({ jobId: job.id, install: entry });
+  } finally {
+    await fs.promises.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+// POST /api/run-tests - Run a job's repository test suite in a sandbox.
+// Body: { jobId, ref?, image?, manager?, testCommand? }. Stages the repo
+// (clone/archive/upload, same guards as checkout), installs with
+// --ignore-scripts, then runs the repo's own test command: explicit
+// testCommand wins, otherwise package.json scripts.test from the clone
+// invoked via the manager. No test script anywhere -> 400, never a fake.
+// PASS = exit 0 without timeout; anything else is FAIL. The TEST_BEGIN
+// marker attributes failure to the install vs test phase without scoring.
+// Evidence lands on job.result.testRuns[].
+app.post("/api/run-tests", async (c: Context) => {
+  let rawBody: unknown;
+  try {
+    rawBody = await c.req.json();
+  } catch {
+    return c.json({ error: "Invalid JSON body", status: 400 }, 400);
+  }
+
+  const parsed = RunTestsBody.safeParse(rawBody);
+  if (!parsed.success) {
+    return c.json({ error: "jobId is required", status: 400 }, 400);
+  }
+
+  const db = getDb();
+  if (!db) {
+    return c.json({ error: "Job store unavailable", status: 503 }, 503);
+  }
+
+  const rows = await db.select().from(schema.jobs).where(eq(schema.jobs.id, parsed.data.jobId));
+  const job = rows[0];
+  if (!job) {
+    return c.json({ error: "Job not found", status: 404 }, 404);
+  }
+
+  const cloneUrl = toSafeCloneUrl(job.repoUrl);
+  if (!cloneUrl) {
+    return c.json({ error: "Job has unsupported repo URL", status: 400 }, 400);
+  }
+
+  const sandbox = sandboxConfigFromEnv();
+  if (!sandbox) {
+    return c.json({ error: "Sandbox not configured", status: 503 }, 503);
+  }
+
+  const limits = limitsFromEnv();
+  const execLimits = executionLimitsFromEnv();
+  const timing = testTimingFromEnv();
+  const ref = parsed.data.ref;
+  const tmp = await fs.promises.mkdtemp(path.join(os.tmpdir(), "hubris-testrun-"));
+  try {
+    let staged;
+    try {
+      staged = await cloneAndArchive(cloneUrl, ref, tmp);
+    } catch (error: any) {
+      const step =
+        error?.message === "clone"
+          ? "clone"
+          : error?.message === "ls-files"
+            ? "listing"
+            : "archive";
+      return c.json({ error: `Repository ${step} failed`, status: 500 }, 500);
+    }
+    const { src, tarPath, tracked } = staged;
+    const excluded = tracked.filter(isTransferExcluded);
+    const expected = tracked.length - excluded.length;
+    if (expected <= 0) {
+      return c.json({ error: "Repository has no transferable files", status: 400 }, 400);
+    }
+    if (tracked.length > limits.maxFiles) {
+      return c.json(
+        { error: `Repository exceeds transfer limits (${tracked.length} files > ${limits.maxFiles})`, status: 413 },
+        413
+      );
+    }
+
+    const tarBytes = await fs.promises.readFile(tarPath);
+    if (tarBytes.length > limits.maxBytes) {
+      return c.json(
+        { error: `Repository exceeds transfer limits (${tarBytes.length} bytes > ${limits.maxBytes})`, status: 413 },
+        413
+      );
+    }
+    const localSha = createHash("sha256").update(tarBytes).digest("hex");
+
+    let uploaded;
+    try {
+      uploaded = await uploadFile(sandbox, tarBytes, { timeoutMs: 60000 });
+    } catch (error: any) {
+      console.error("Test-run upload error:", error?.message);
+      return c.json({ error: "Sandbox upload failed", status: 502 }, 502);
+    }
+    if (uploaded.sha256 !== localSha) {
+      return c.json({ error: "Transfer integrity mismatch", status: 502 }, 502);
+    }
+
+    const detected = detectManager(tracked);
+    const manager: PackageManager = parsed.data.manager ?? detected ?? "pnpm";
+    const requested = parsed.data.testCommand;
+    let declared: string | null = null;
+    if (!requested) {
+      let pkgText: string | null = null;
+      try {
+        pkgText = await fs.promises.readFile(path.join(src, "package.json"), "utf-8");
+      } catch {
+        pkgText = null;
+      }
+      declared = pkgText ? parseTestCommand(pkgText) : null;
+      if (!declared) {
+        return c.json({ error: "Repository has no test script", status: 400 }, 400);
+      }
+    }
+    const invoke = requested ?? `${manager} test`;
+    const commandSource = requested ? "requested" : "detected";
+
+    const started = Date.now();
+    let result;
+    try {
+      result = await runCommand(sandbox, {
+        command: buildTestScript(manager, excluded, invoke),
+        image: parsed.data.image ?? "tag:node:20-slim",
+        files: { [CHECKOUT_UPLOAD_PATH]: { uuid: uploaded.uuid } },
+        shell: true,
+        disposable: true,
+        timeout: timing.timeoutS,
+        truncateOutputAt: execLimits.maxOutputBytes,
+        waitMs: timing.waitMs,
+      });
+    } catch (error: any) {
+      console.error("Test-run error:", error?.message);
+      return c.json({ error: "Sandbox run failed", status: 502 }, 502);
+    }
+    const durationMs = Date.now() - started;
+
+    const phase = result.stdout.includes(TEST_BEGIN_MARKER) ? "test" : "install";
+    const passed = result.exitCode === 0 && !result.timedOut;
+    const entry = {
+      repoUrl: job.repoUrl,
+      ...(ref ? { ref } : {}),
+      manager,
+      testCommand: invoke,
+      ...(declared ? { declaredTest: declared } : {}),
+      commandSource,
+      phase,
+      image: parsed.data.image ?? "tag:node:20-slim",
+      workspace: REPO_WORKDIR,
+      files: expected,
+      bytes: tarBytes.length,
+      sha256: localSha,
+      exitCode: result.exitCode,
+      timedOut: result.timedOut,
+      passed,
+      durationMs,
+      stdout: result.stdout.slice(0, 4000),
+      stderr: result.stderr.slice(0, 4000),
+      at: new Date().toISOString(),
+    };
+    const prior = (job.result as { testRuns?: unknown[] } | null)?.testRuns ?? [];
+    await db
+      .update(schema.jobs)
+      .set({
+        result: { ...(job.result as object), testRuns: [...prior, entry] },
+        updatedAt: new Date(),
+      })
+      .where(eq(schema.jobs.id, job.id));
+    return c.json({ jobId: job.id, testRun: entry });
   } finally {
     await fs.promises.rm(tmp, { recursive: true, force: true });
   }

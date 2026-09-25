@@ -40,6 +40,8 @@ const INSTALL_COMMANDS: Record<PackageManager, string> = {
   npm: "npm ci --ignore-scripts --no-audit --no-fund",
 };
 
+export { INSTALL_COMMANDS };
+
 // Installs run longer than probes: 300s execution + 330s poll budget by
 // default, env-overridable. Output stays under the shared execution limits.
 export interface InstallTiming {
