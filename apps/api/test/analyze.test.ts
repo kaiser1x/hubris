@@ -105,6 +105,35 @@ describe("POST /api/reproduce validation", () => {
   });
 });
 
+describe("POST /api/reproduce checkout validation", () => {
+  it("returns 400 for an unsafe ref", async () => {
+    const res = await app.request("/api/reproduce", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        jobId: "00000000-0000-0000-0000-000000000000",
+        script: "echo hi",
+        checkout: true,
+        ref: "bad;rm -rf",
+      }),
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it("returns 400 for an overlong ref", async () => {
+    const res = await app.request("/api/reproduce", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        jobId: "00000000-0000-0000-0000-000000000000",
+        script: "echo hi",
+        ref: "a".repeat(101),
+      }),
+    });
+    expect(res.status).toBe(400);
+  });
+});
+
 describe("POST /api/verify validation", () => {
   it("returns 400 on invalid JSON", async () => {
     const res = await app.request("/api/verify", {
@@ -132,6 +161,20 @@ describe("POST /api/verify validation", () => {
       body: JSON.stringify({ jobId: "00000000-0000-0000-0000-000000000000", script: "exit 0" }),
     });
     expect(res.status).toBe(503);
+  });
+
+  it("returns 400 for an unsafe ref", async () => {
+    const res = await app.request("/api/verify", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        jobId: "00000000-0000-0000-0000-000000000000",
+        script: "exit 0",
+        checkout: true,
+        ref: "$(whoami)",
+      }),
+    });
+    expect(res.status).toBe(400);
   });
 });
 

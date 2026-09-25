@@ -18,7 +18,7 @@ import {
   chatComplete,
   llmConfigFromEnv,
 } from "@hubris/llm";
-import { runCommand, sandboxConfigFromEnv } from "@hubris/sandbox";
+import { buildRepoCheckoutCommand, isSafeGitRef, runCommand, sandboxConfigFromEnv } from "@hubris/sandbox";
 
 const execFileAsync = promisify(execFile);
 
@@ -55,16 +55,25 @@ const ForgeBody = z.object({
   instruction: z.string().max(2000).optional(),
 });
 
+const GitRef = z
+  .string()
+  .max(100)
+  .refine((r) => isSafeGitRef(r), "Invalid ref");
+
 const ReproduceBody = z.object({
   jobId: z.string().min(1, "jobId is required"),
   script: z.string().min(1).max(4000),
   image: z.string().max(200).optional(),
+  checkout: z.boolean().optional(),
+  ref: GitRef.optional(),
 });
 
 const VerifyBody = z.object({
   jobId: z.string().min(1, "jobId is required"),
   script: z.string().min(1).max(4000),
   image: z.string().max(200).optional(),
+  checkout: z.boolean().optional(),
+  ref: GitRef.optional(),
 });
 
 function shortPath(p: string): string {
@@ -468,8 +477,11 @@ app.post("/api/forge", async (c: Context) => {
 
 // POST /api/reproduce - Run a repro script in a disposable sandbox and
 // store the evidence (exit code, stdout, stderr) on the job.
-// Body: { jobId, script, image? }. Script is capped at 4000 chars;
-// stored streams are truncated to protect the row.
+// Body: { jobId, script, image?, checkout?, ref? }. Script is capped at
+// 4000 chars; stored streams are truncated to protect the row.
+// checkout:true clones the job's repoUrl into the sandbox and runs the
+// script from the checkout (branch/tag via ref). Default false preserves
+// the original self-contained mode.
 app.post("/api/reproduce", async (c: Context) => {
   let rawBody: unknown;
   try {
@@ -499,9 +511,20 @@ app.post("/api/reproduce", async (c: Context) => {
     return c.json({ error: "Sandbox not configured", status: 503 }, 503);
   }
 
+  const checkout = parsed.data.checkout ?? false;
+  const ref = parsed.data.ref;
+  let command = parsed.data.script;
+  if (checkout) {
+    try {
+      command = buildRepoCheckoutCommand(job.repoUrl, parsed.data.script, ref);
+    } catch {
+      return c.json({ error: "Job has unsupported repo URL", status: 400 }, 400);
+    }
+  }
+
   try {
     const result = await runCommand(sandbox, {
-      command: parsed.data.script,
+      command,
       image: parsed.data.image ?? "tag:busybox:latest",
       shell: true,
       disposable: true,
@@ -514,6 +537,8 @@ app.post("/api/reproduce", async (c: Context) => {
       stdout: result.stdout.slice(0, 4000),
       stderr: result.stderr.slice(0, 4000),
       timedOut: result.timedOut,
+      checkout,
+      ...(checkout ? { repoUrl: job.repoUrl, ...(ref ? { ref } : {}) } : {}),
       at: new Date().toISOString(),
     };
     const prior = (job.result as { reproductions?: unknown[] } | null)?.reproductions ?? [];
@@ -533,9 +558,10 @@ app.post("/api/reproduce", async (c: Context) => {
 
 // POST /api/verify - Run a verification check in a disposable sandbox and
 // record pass/fail on the job. Unlike reproduce (which captures failure
-// evidence), verify asserts a check exits 0. Repo file upload lands later;
-// checks are self-contained scripts for now.
-// Body: { jobId, script, image? }.
+// evidence), verify asserts a check exits 0.
+// Body: { jobId, script, image?, checkout?, ref? }. checkout:true clones the
+// job's repoUrl first (same contract as reproduce); default false keeps
+// checks self-contained.
 app.post("/api/verify", async (c: Context) => {
   let rawBody: unknown;
   try {
@@ -565,9 +591,20 @@ app.post("/api/verify", async (c: Context) => {
     return c.json({ error: "Sandbox not configured", status: 503 }, 503);
   }
 
+  const checkout = parsed.data.checkout ?? false;
+  const ref = parsed.data.ref;
+  let command = parsed.data.script;
+  if (checkout) {
+    try {
+      command = buildRepoCheckoutCommand(job.repoUrl, parsed.data.script, ref);
+    } catch {
+      return c.json({ error: "Job has unsupported repo URL", status: 400 }, 400);
+    }
+  }
+
   try {
     const result = await runCommand(sandbox, {
-      command: parsed.data.script,
+      command,
       image: parsed.data.image ?? "tag:busybox:latest",
       shell: true,
       disposable: true,
@@ -581,6 +618,8 @@ app.post("/api/verify", async (c: Context) => {
       stdout: result.stdout.slice(0, 4000),
       stderr: result.stderr.slice(0, 4000),
       timedOut: result.timedOut,
+      checkout,
+      ...(checkout ? { repoUrl: job.repoUrl, ...(ref ? { ref } : {}) } : {}),
       at: new Date().toISOString(),
     };
     const prior = (job.result as { verifications?: unknown[] } | null)?.verifications ?? [];
