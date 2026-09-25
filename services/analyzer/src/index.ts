@@ -1,6 +1,7 @@
 import * as ts from "typescript";
-import * as fs from "fs";
-import * as path from "path";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { basename, extname, join } from "node:path";
+import { randomUUID } from "node:crypto";
 
 export interface ParsedFunction {
   id: string;
@@ -52,9 +53,9 @@ function getAllSourceFiles(repoPath: string): string[] {
 
   function walk(dir: string) {
     try {
-      const entries = fs.readdirSync(dir, { withFileTypes: true });
+      const entries = readdirSync(dir, { withFileTypes: true });
       for (const entry of entries) {
-        const fullPath = path.join(dir, entry.name);
+        const fullPath = join(dir, entry.name);
         if (entry.isDirectory()) {
           walk(fullPath);
         } else if (entry.name.endsWith(".ts") || entry.name.endsWith(".js")) {
@@ -74,7 +75,7 @@ function extractImports(filePath: string): Relationship[] {
   const relations: Relationship[] = [];
 
   try {
-    const source = fs.readFileSync(filePath, "utf-8");
+    const source = readFileSync(filePath, "utf-8");
     const file = ts.createSourceFile(
       filePath,
       source,
@@ -119,7 +120,7 @@ function extractFunctionCallsFromFile(filePath: string): Relationship[] {
   const relations: Relationship[] = [];
 
   try {
-    const source = fs.readFileSync(filePath, "utf-8");
+    const source = readFileSync(filePath, "utf-8");
     const file = ts.createSourceFile(
       filePath,
       source,
@@ -150,7 +151,7 @@ function parseFunctionsFromFile(filePath: string): ParsedFunction[] {
   const functions: ParsedFunction[] = [];
 
   try {
-    const source = fs.readFileSync(filePath, "utf-8");
+    const source = readFileSync(filePath, "utf-8");
     const file = ts.createSourceFile(
       filePath,
       source,
@@ -165,7 +166,7 @@ function parseFunctionsFromFile(filePath: string): ParsedFunction[] {
         // @ts-ignore - pos properties vary by TS version
         const column = node.name.pos?.columnNumber ?? node.pos?.columnNumber ?? 1;
         functions.push({
-          id: crypto.randomUUID(),
+          id: randomUUID(),
           name: node.name.text,
           path: filePath,
           line: typeof line === "number" ? line : 1,
@@ -184,7 +185,7 @@ function parseClassesFromFile(filePath: string): ParsedClass[] {
   const classes: ParsedClass[] = [];
 
   try {
-    const source = fs.readFileSync(filePath, "utf-8");
+    const source = readFileSync(filePath, "utf-8");
     const file = ts.createSourceFile(
       filePath,
       source,
@@ -199,7 +200,7 @@ function parseClassesFromFile(filePath: string): ParsedClass[] {
         // @ts-ignore - pos properties vary by TS version
         const column = node.name.pos?.columnNumber ?? node.pos?.columnNumber ?? 1;
         classes.push({
-          id: crypto.randomUUID(),
+          id: randomUUID(),
           name: node.name.text,
           path: filePath,
           line: typeof line === "number" ? line : 1,
@@ -218,7 +219,7 @@ function parseEndpointsFromFile(filePath: string): ParsedEndpoint[] {
   const endpoints: ParsedEndpoint[] = [];
 
   try {
-    const source = fs.readFileSync(filePath, "utf-8");
+    const source = readFileSync(filePath, "utf-8");
     // Look for Express-style route definitions: method("path")
     const routeRegex = /(?:get|post|put|delete|patch)\(['"]\/[^'"]*['"]/gi;
     const matches = source.match(routeRegex);
@@ -246,15 +247,15 @@ function parseTestsFromFile(filePath: string): ParsedTest[] {
   const tests: ParsedTest[] = [];
 
   try {
-    const basename = path.basename(filePath);
+    const fileName = basename(filePath);
     if (
-      basename.endsWith(".test.ts") ||
-      basename.endsWith(".test.js") ||
-      basename.endsWith(".spec.ts") ||
-      basename.endsWith(".spec.js")
+      fileName.endsWith(".test.ts") ||
+      fileName.endsWith(".test.js") ||
+      fileName.endsWith(".spec.ts") ||
+      fileName.endsWith(".spec.js")
     ) {
       tests.push({
-        name: path.basename(basename, path.extname(basename)),
+        name: basename(fileName, extname(fileName)),
         path: filePath,
         file: filePath,
       });
@@ -267,12 +268,12 @@ function parseTestsFromFile(filePath: string): ParsedTest[] {
 }
 
 export async function analyzeRepository(repoPath: string): Promise<ParsedRepository> {
-  const repoName = path.basename(repoPath);
-  const packageJsonPath = path.join(repoPath, "package.json");
+  const repoName = basename(repoPath);
+  const packageJsonPath = join(repoPath, "package.json");
 
   let packageJson: any;
-  if (fs.existsSync(packageJsonPath)) {
-    packageJson = JSON.parse(fs.readFileSync(packageJsonPath, "utf-8"));
+  if (existsSync(packageJsonPath)) {
+    packageJson = JSON.parse(readFileSync(packageJsonPath, "utf-8"));
   } else {
     packageJson = { dependencies: {}, devDependencies: {} };
   }
@@ -318,7 +319,7 @@ export async function analyzeRepository(repoPath: string): Promise<ParsedReposit
   }
 
   return {
-    repositoryId: crypto.randomUUID(),
+    repositoryId: randomUUID(),
     name: repoName,
     packages,
     functions,
