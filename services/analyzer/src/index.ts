@@ -206,9 +206,10 @@ function extractFunctionCallsFromFile(filePath: string): Relationship[] {
   const relations: Relationship[] = [];
   const scope: string[] = [];
 
-  function visit(node: ts.Node): void {
-    const name = scopeNameFor(node);
-    if (name) scope.push(name);
+  function visit(node: ts.Node, parentScope: string | null): void {
+    const base = scopeNameFor(node);
+    const qualified = base ? (parentScope ? `${parentScope}.${base}` : base) : null;
+    if (qualified) scope.push(qualified);
 
     if (ts.isCallExpression(node)) {
       // Bare calls: foo(). Member calls: obj.method() recorded dotted, so the
@@ -237,7 +238,7 @@ function extractFunctionCallsFromFile(filePath: string): Relationship[] {
     }
 
     if (ts.isCallExpression(node)) {
-      visit(node.expression);
+      visit(node.expression, qualified ?? parentScope);
       const routeScope =
         ts.isPropertyAccessExpression(node.expression) &&
         ROUTE_METHODS.includes(node.expression.name.text.toLowerCase()) &&
@@ -259,17 +260,17 @@ function extractFunctionCallsFromFile(filePath: string): Relationship[] {
             : null;
         if (label) {
           scope.push(label);
-          visit(arg);
+          visit(arg, label);
           scope.pop();
         } else {
-          visit(arg);
+          visit(arg, qualified ?? parentScope);
         }
       });
     } else {
-      ts.forEachChild(node, visit);
+      ts.forEachChild(node, (child) => visit(child, qualified ?? parentScope));
     }
 
-    if (name) scope.pop();
+    if (qualified) scope.pop();
   }
 
   try {
@@ -281,7 +282,7 @@ function extractFunctionCallsFromFile(filePath: string): Relationship[] {
       true
     );
 
-    visit(file);
+    visit(file, null);
   } catch (e) {
     // silently skip
   }
@@ -291,6 +292,38 @@ function extractFunctionCallsFromFile(filePath: string): Relationship[] {
 
 function parseFunctionsFromFile(filePath: string): ParsedFunction[] {
   const functions: ParsedFunction[] = [];
+  const seen = new Set<string>();
+
+  function pushFn(name: string): void {
+    if (seen.has(name)) return;
+    seen.add(name);
+    functions.push({ id: randomUUID(), name, path: filePath, line: 1, column: 1 });
+  }
+
+  // Arrow / function-expression variables at any depth, plus nested named
+  // declarations. Top-level declarations are covered by the main pass below;
+  // the shared `seen` set keeps the canonical representation single.
+  function collectArrows(node: ts.Node, scope: string | null): void {
+    let childScope = scope;
+    if (
+      ts.isVariableDeclaration(node) &&
+      ts.isIdentifier(node.name) &&
+      node.initializer &&
+      (ts.isArrowFunction(node.initializer) || ts.isFunctionExpression(node.initializer))
+    ) {
+      const name = scope ? `${scope}.${node.name.text}` : node.name.text;
+      pushFn(name);
+      childScope = name;
+    } else if (ts.isFunctionDeclaration(node) && node.name && ts.isIdentifier(node.name)) {
+      const name = scope ? `${scope}.${node.name.text}` : node.name.text;
+      pushFn(name);
+      childScope = name;
+    } else {
+      const base = scopeNameFor(node);
+      if (base) childScope = scope ? `${scope}.${base}` : base;
+    }
+    ts.forEachChild(node, (child) => collectArrows(child, childScope));
+  }
 
   try {
     const source = readFileSync(filePath, "utf-8");
@@ -302,17 +335,8 @@ function parseFunctionsFromFile(filePath: string): ParsedFunction[] {
     );
 
     ts.forEachChild(file, (node) => {
-      if (ts.isFunctionDeclaration(node) && node.name) {        // @ts-ignore - pos properties vary by TS version
-        const line = node.name.pos?.lineNumber ?? node.pos?.lineNumber ?? 1;
-        // @ts-ignore - pos properties vary by TS version
-        const column = node.name.pos?.columnNumber ?? node.pos?.columnNumber ?? 1;
-        functions.push({
-          id: randomUUID(),
-          name: node.name.text,
-          path: filePath,
-          line: typeof line === "number" ? line : 1,
-          column: typeof column === "number" ? column : 1,
-        });
+      if (ts.isFunctionDeclaration(node) && node.name) {
+        pushFn(node.name.text);
       }
       // Express-style handlers: exports.name = function () {...}
       if (
@@ -323,15 +347,10 @@ function parseFunctionsFromFile(filePath: string): ParsedFunction[] {
         (ts.isFunctionExpression(node.expression.right) ||
           ts.isArrowFunction(node.expression.right))
       ) {
-        functions.push({
-          id: randomUUID(),
-          name: node.expression.left.name.text,
-          path: filePath,
-          line: 1,
-          column: 1,
-        });
+        pushFn(node.expression.left.name.text);
       }
     });
+    ts.forEachChild(file, (child) => collectArrows(child, null));
   } catch (e) {
     // skip
   }

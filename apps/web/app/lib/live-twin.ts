@@ -256,6 +256,12 @@ export function traceFromTwin(job: LiveJob, maxSteps = 8, entryEndpoint?: LiveEn
   // the next hop, never shown as a function's own calls.
 
   const funcByName = new Map(full.functions.map((f) => [f.name, f]));
+  // Bare-suffix aliases so unqualified references resolve to qualified
+  // definitions (inner -> outer.inner), without shadowing exact names.
+  for (const [name, fn] of [...funcByName]) {
+    const bare = name.split(".").pop() ?? "";
+    if (bare !== name && !funcByName.has(bare)) funcByName.set(bare, fn);
+  }
   // Resolve dotted handler references (book_controller.index) to defined functions.
   const resolveFunc = (name: string): LiveFunction | undefined => {
     const direct = funcByName.get(name);
