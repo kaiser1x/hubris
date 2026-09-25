@@ -201,9 +201,10 @@ flowchart TD
     class Twin store
 ```
 
-Known limitation (not solved): `const X = () => …` arrow-component
-discovery is still missing from function nodes. Calls inside such components
-are tracked; the components themselves are not nodes.
+Known boundary: class/object-literal methods are not function nodes yet
+(only their inner calls are tracked). `const X = () => …` arrows are
+discovered since the arrow-discovery phase, with `outer.inner` qualification
+for nested cases.
 
 ## 6. Data Model
 
@@ -545,13 +546,15 @@ Locally, DB-backed tests skip when `DATABASE_URL` is unset.
 
 ## 14. Current Limitations
 
-Explicit and complete as of this writing:
+Explicit and complete as of this writing. Each item is a tracked engineering
+task, not a permanent verdict — the arrow-function limitation previously
+listed here was fixed the same way:
 
 - Sandbox **repository execution** (uploaded checkout, install, test) is not
   implemented; reproduce/verify run caller scripts only.
 - **No server-side trace endpoint**; traces compute client-side from job data.
-- **Arrow-component discovery** (`const X = () => …`) is missing from
-  function nodes (calls inside them are tracked).
+- **Method discovery** is incomplete: class and object-literal methods are not
+  function nodes yet (their inner calls are tracked).
 - **Model output is unverified**: investigation is opinion, forge output is
   labeled `verified: false`.
 - Analyzer parses **TypeScript/JavaScript only**; other languages complete
