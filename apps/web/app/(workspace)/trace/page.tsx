@@ -14,19 +14,29 @@ export default function TracePage() {
 
   useEffect(() => {
     let cancelled = false;
-    fetchLatestJob().then((j) => {
-      if (cancelled) return;
-      if (j) {
-        const steps = traceFromTwin(j);
-        if (steps.length > 0) {
-          setJob(j);
-          setLiveSteps(steps);
-          setLiveName(liveRepoName(j));
-          setSelected(0);
+    fetchLatestJob()
+      .then((j) => {
+        if (cancelled) return;
+        if (j) {
+          try {
+            const steps = traceFromTwin(j);
+            if (steps.length > 0) {
+              setJob(j);
+              setLiveSteps(steps);
+              setLiveName(liveRepoName(j));
+              setSelected(0);
+            }
+          } catch {
+            // fall through to demo narrative
+          }
         }
-      }
-      setChecked(true);
-    });
+      })
+      .catch(() => {
+        // fall through to demo narrative
+      })
+      .finally(() => {
+        if (!cancelled) setChecked(true);
+      });
     return () => {
       cancelled = true;
     };

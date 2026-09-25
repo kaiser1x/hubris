@@ -211,10 +211,27 @@ export function liveRepoName(job: LiveJob): string {
 }
 
 async function fetchJobs(url: string): Promise<LiveJob[]> {
-  const res = await fetch(url);
-  if (!res.ok) return [];
-  const data = await res.json();
-  return Array.isArray(data.jobs) ? (data.jobs as LiveJob[]) : [];
+  // Bound the wait: a hung API/DB must degrade to the demo narrative,
+  // never leave a page on its loading gate forever.
+  // Dev-safe diagnostics: status + elapsed only, never bodies or secrets.
+  const t0 = Date.now();
+  console.log("OVERVIEW_FETCH_START", url.split("?")[0]);
+  try {
+    const res = await fetch(url, { signal: AbortSignal.timeout(15000) });
+    console.log("OVERVIEW_FETCH_STATUS", res.status, `${Date.now() - t0}ms`);
+    if (!res.ok) return [];
+    const data = await res.json();
+    const jobs = Array.isArray(data.jobs) ? (data.jobs as LiveJob[]) : [];
+    console.log("OVERVIEW_FETCH_SUCCESS", `${jobs.length} jobs`, `${Date.now() - t0}ms`);
+    return jobs;
+  } catch (e) {
+    console.log(
+      "OVERVIEW_FETCH_ERROR",
+      e instanceof Error && e.name === "TimeoutError" ? "timeout" : "fetch-failed",
+      `${Date.now() - t0}ms`
+    );
+    return [];
+  }
 }
 
 export async function fetchLatestJob(repoUrl?: string): Promise<LiveJob | null> {
@@ -226,6 +243,30 @@ export async function fetchLatestJob(repoUrl?: string): Promise<LiveJob | null> 
       jobs.find((j) => j.status === "complete" && j.result?.stats && (j.result.stats.functions > 0 || j.result.stats.classes > 0)) ??
       null
     );
+  } catch {
+    return null;
+  }
+}
+
+// The exact view-model the Overview loading gate resolves: live content for
+// a valid completed job, null for everything else (job missing, empty twin,
+// malformed shape). Never throws, so no failure path can wedge the UI on
+// "Loading twin…". Extracted pure for deterministic regression tests.
+export interface LiveOverview {
+  nodes: TwinNode[];
+  name: string;
+  cells: [string, string, string][];
+}
+
+export function resolveLiveOverview(job: LiveJob | null): LiveOverview | null {
+  // Same gate as fetchLatestJob's selection: a twin with no functions or
+  // classes is not live content, even if stray nodes could be derived.
+  const stats = job?.result?.stats;
+  if (!stats || (stats.functions <= 0 && stats.classes <= 0)) return null;
+  try {
+    const nodes = twinToNodes(job);
+    if (nodes.length === 0) return null;
+    return { nodes, name: liveRepoName(job), cells: liveHealth(job) };
   } catch {
     return null;
   }

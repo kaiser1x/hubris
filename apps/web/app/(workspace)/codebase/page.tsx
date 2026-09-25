@@ -53,19 +53,29 @@ export default function CodebasePage() {
 
   useEffect(() => {
     let cancelled = false;
-    fetchLatestJob().then((job) => {
-      if (!cancelled && job) {
-        const nodes = twinToNodes(job);
-        if (nodes.length > 0) {
-          setLiveNodes(nodes);
-          setLiveName(liveRepoName(job));
-          setSelectedId((current) =>
-            nodes.some((n) => n.id === current) ? current : nodes[0].id
-          );
+    fetchLatestJob()
+      .then((job) => {
+        if (!cancelled && job) {
+          try {
+            const nodes = twinToNodes(job);
+            if (nodes.length > 0) {
+              setLiveNodes(nodes);
+              setLiveName(liveRepoName(job));
+              setSelectedId((current) =>
+                nodes.some((n) => n.id === current) ? current : nodes[0].id
+              );
+            }
+          } catch {
+            // fall through to demo narrative
+          }
         }
-      }
-      if (!cancelled) setChecked(true);
-    });
+      })
+      .catch(() => {
+        // fall through to demo narrative
+      })
+      .finally(() => {
+        if (!cancelled) setChecked(true);
+      });
     return () => {
       cancelled = true;
     };

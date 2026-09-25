@@ -5,9 +5,7 @@ import { useEffect, useState } from "react";
 import { CASES, HEALTH, NODES, REPO, type TwinNode } from "../../lib/casefile";
 import {
   fetchLatestJob,
-  liveHealth,
-  liveRepoName,
-  twinToNodes,
+  resolveLiveOverview,
 } from "../../lib/live-twin";
 
 export default function OverviewPage() {
@@ -19,17 +17,26 @@ export default function OverviewPage() {
 
   useEffect(() => {
     let cancelled = false;
-    fetchLatestJob().then((job) => {
-      if (!cancelled && job) {
-        const nodes = twinToNodes(job);
-        if (nodes.length > 0) {
-          setLiveNodes(nodes);
-          setLiveName(liveRepoName(job));
-          setLiveCells(liveHealth(job));
+    fetchLatestJob()
+      .then((job) => {
+        const live = resolveLiveOverview(job);
+        if (!cancelled && live) {
+          console.log("OVERVIEW_TRANSFORM", `${live.nodes.length} nodes`);
+          setLiveNodes(live.nodes);
+          setLiveName(live.name);
+          setLiveCells(live.cells);
+        } else {
+          console.log(job ? "OVERVIEW_NO_CONTENT" : "OVERVIEW_NO_JOB");
         }
-      }
-      if (!cancelled) setChecked(true);
-    });
+      })
+      .catch(() => {
+        console.log("OVERVIEW_FETCH_REJECTED");
+        // fall through to demo narrative
+      })
+      .finally(() => {
+        console.log("OVERVIEW_SET_LOADING_FALSE");
+        if (!cancelled) setChecked(true);
+      });
     return () => {
       cancelled = true;
     };
