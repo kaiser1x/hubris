@@ -71,6 +71,20 @@ export default function CodebasePage() {
     };
   }, []);
 
+  const nodes = liveNodes ?? NODES;
+
+  const selected = useMemo(
+    () => nodes.find((n) => n.id === selectedId) ?? nodes[0],
+    [nodes, selectedId]
+  );
+
+  const byLayer = useMemo(() => {
+    const map = new Map<string, TwinNode[]>();
+    for (const layer of LAYERS) map.set(layer, []);
+    for (const n of nodes) map.get(n.layer)?.push(n);
+    return map;
+  }, [nodes]);
+
   if (!checked) {
     return (
       <div className="max-w-[1440px] mx-auto px-5 lg:px-[52px] pt-10 lg:pt-[50px] pb-12">
@@ -108,20 +122,6 @@ export default function CodebasePage() {
       setLoading(false);
     }
   }
-
-  const nodes = liveNodes ?? NODES;
-
-  const selected = useMemo(
-    () => nodes.find((n) => n.id === selectedId) ?? nodes[0],
-    [nodes, selectedId]
-  );
-
-  const byLayer = useMemo(() => {
-    const map = new Map<string, TwinNode[]>();
-    for (const layer of LAYERS) map.set(layer, []);
-    for (const n of nodes) map.get(n.layer)?.push(n);
-    return map;
-  }, [nodes]);
 
   return (
     <div className="max-w-[1440px] mx-auto px-5 lg:px-[52px] pt-10 lg:pt-[50px] pb-12">

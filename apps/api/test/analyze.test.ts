@@ -4,11 +4,12 @@ import { app, toRepoRelative, toSafeCloneUrl } from "../src/app";
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  vi.unstubAllEnvs();
 });
 
 describe("GET /api/jobs", () => {
   it("returns 503 when no DATABASE_URL is configured", async () => {
-    expect(process.env.DATABASE_URL).toBeUndefined();
+    vi.stubEnv("DATABASE_URL", "");
     const res = await app.request("/api/jobs");
     expect(res.status).toBe(503);
   });
@@ -34,7 +35,7 @@ describe("POST /api/investigate validation", () => {
   });
 
   it("returns 503 when no DATABASE_URL is configured", async () => {
-    expect(process.env.DATABASE_URL).toBeUndefined();
+    vi.stubEnv("DATABASE_URL", "");
     const res = await app.request("/api/investigate", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -64,7 +65,7 @@ describe("POST /api/forge validation", () => {
   });
 
   it("returns 503 when no DATABASE_URL is configured", async () => {
-    expect(process.env.DATABASE_URL).toBeUndefined();
+    vi.stubEnv("DATABASE_URL", "");
     const res = await app.request("/api/forge", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -76,7 +77,7 @@ describe("POST /api/forge validation", () => {
 
 describe("GET /api/jobs/:id", () => {
   it("returns 503 when no DATABASE_URL is configured", async () => {
-    expect(process.env.DATABASE_URL).toBeUndefined();
+    vi.stubEnv("DATABASE_URL", "");
     const res = await app.request("/api/jobs/00000000-0000-0000-0000-000000000000");
     expect(res.status).toBe(503);
   });

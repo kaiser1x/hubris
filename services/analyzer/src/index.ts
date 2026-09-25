@@ -135,6 +135,19 @@ function scopeNameFor(node: ts.Node): string | null {
   ) {
     return node.name.text;
   }
+  // Express-style assignment: exports.name = function/arrow, or
+  // exports.name = [middleware..., async handler]. The property name scopes
+  // everything inside, including array-wrapped handlers.
+  if (
+    ts.isBinaryExpression(node) &&
+    node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+    ts.isPropertyAccessExpression(node.left) &&
+    (ts.isFunctionExpression(node.right) ||
+      ts.isArrowFunction(node.right) ||
+      ts.isArrayLiteralExpression(node.right))
+  ) {
+    return node.left.name.text;
+  }
   return null;
 }
 

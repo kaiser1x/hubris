@@ -7,12 +7,14 @@
   "scripts": {
     "build": "tsc",
     "analyze": "tsc && node dist/index.js",
+    "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "typescript": "^5.9.2"
   },
   "devDependencies": {
-    "@types/node": "^20.19.43"
+    "@types/node": "^20.19.43",
+    "vitest": "^5.0.1"
   }
 }

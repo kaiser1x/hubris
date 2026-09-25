@@ -274,7 +274,7 @@ export function traceFromTwin(job: LiveJob, maxSteps = 8, entryEndpoint?: LiveEn
   const steps: TraceStep[] = [];
   const visited = new Set<string>();
   let file: string | null = entry.file;
-  let label = `${entry.method} ${entry.path}`;
+  const label = `${entry.method} ${entry.path}`;
 
   steps.push({
     node: `endpoint:${entry.method}:${entry.path}`,
@@ -289,13 +289,19 @@ export function traceFromTwin(job: LiveJob, maxSteps = 8, entryEndpoint?: LiveEn
   visited.add(`endpoint:${entry.method}:${entry.path}`);
   const entryId = `endpoint:${entry.method}:${entry.path}`;
 
-  let first = true;
+  // Traversal rule: follow a function's own recorded calls. File-level calls
+  // are only a fallback for twins recorded before caller attribution existed
+  // (no caller fields at all). An empty own-call set is a leaf — the walk
+  // never backtracks into skipped branches.
+  const hasCallerData = full.relationships.some((r) => r.caller);
+  let func: string | null = null;
   while (file && steps.length < maxSteps) {
-    // First hop prefers the handler's own calls, then file-level calls.
-    const scoped = first ? (callsFromCaller.get(entryId) ?? []) : [];
-    const filed = callsFromFile.get(file) ?? [];
-    const pool = [...scoped, ...filed.filter((c) => !scoped.includes(c))];
-    first = false;
+    const scoped =
+      (func ? callsFromCaller.get(func) : callsFromCaller.get(entryId)) ?? [];
+    const pool =
+      scoped.length > 0 || hasCallerData
+        ? scoped
+        : (callsFromFile.get(file) ?? []);
     const fileCallees: string[] = pool;
     // Follow the first callee defined in the twin; skip external/builtin calls.
     const next: string | undefined = fileCallees
@@ -317,6 +323,7 @@ export function traceFromTwin(job: LiveJob, maxSteps = 8, entryEndpoint?: LiveEn
       ms: "—",
       result: "static",
     });
+    func = fn.name;
     file = fn.path;
   }
 
