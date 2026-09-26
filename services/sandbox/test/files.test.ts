@@ -120,3 +120,55 @@ describe("executionLimitsFromEnv", () => {
     });
   });
 });
+
+describe("uploadFile transport behavior", () => {
+  it("propagates fetch transport failures without hanging", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        throw new TypeError("fetch failed");
+      })
+    );
+    const t0 = Date.now();
+    await expect(
+      uploadFile(CONFIG, new TextEncoder().encode("probe"), { timeoutMs: 30000 })
+    ).rejects.toThrow("fetch failed");
+    expect(Date.now() - t0).toBeLessThan(5000);
+  });
+
+  it("surfaces aborts as rejections within a bounded wait", async () => {
+    const fetchMock = vi.fn(
+      (url: string, init?: { signal?: AbortSignal }) =>
+        new Promise((_, reject) => {
+          init?.signal?.addEventListener("abort", () =>
+            reject(new DOMException("signal timed out", "TimeoutError"))
+          );
+        })
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const t0 = Date.now();
+    await expect(
+      uploadFile(CONFIG, new TextEncoder().encode("probe"), { timeoutMs: 50 })
+    ).rejects.toThrow();
+    expect(Date.now() - t0).toBeLessThan(5000);
+    expect(fetchMock.mock.calls[0][1]).toHaveProperty("signal");
+  });
+
+  it("rejects when a 201 body is not JSON", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response("not-json{{{", { status: 201 }))
+    );
+    await expect(uploadFile(CONFIG, new Uint8Array([1]))).rejects.toThrow();
+  });
+
+  it("sends no timeout signal when timeoutMs is omitted", async () => {
+    const fetchMock = vi.fn(
+      async () =>
+        new Response(JSON.stringify({ uuid: "f", sha256: "s", size: 1 }), { status: 201 })
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    await uploadFile(CONFIG, new Uint8Array([1]));
+    expect(fetchMock.mock.calls[0][1]).not.toHaveProperty("signal");
+  });
+});

@@ -87,6 +87,7 @@ vi.mock("../src/checkout", async (importOriginal) => {
 });
 
 import { app } from "../src/app";
+import { chatComplete } from "@hubris/llm";
 import { runCommand, uploadFile } from "@hubris/sandbox";
 
 function stubCreds() {
@@ -346,5 +347,65 @@ describe("POST /api/forge-structured source revision (mocked clone/sandbox)", ()
       ref: "hubris/buggy-idempotency",
     });
     expect((runs[1] as Record<string, unknown>).source).toMatchObject({ ref: "main" });
+  });
+});
+
+describe("POST /api/forge-structured model failure classes (mocked model)", () => {
+  // Failure-class taxonomy for the draft stage: every class maps
+  // deterministically without sandbox use and without loosening validation.
+  // chatComplete-only failures (any ModelError kind) → 502; unparsable
+  // output → 400 malformed; schema rule violations → 400 invalid.
+  beforeEach(async () => {
+    store.jobRef = undefined;
+    store.cloneCalls = [];
+    store.updates = [];
+    vi.mocked(runCommand).mockReset();
+    vi.mocked(uploadFile).mockReset();
+  });
+
+  it("model empty response → 502, no sandbox, no run, no rejection entry", async () => {
+    stubCreds();
+    const { ModelError } = await import("@hubris/llm");
+    vi.mocked(chatComplete).mockRejectedValueOnce(
+      new ModelError("empty", "Model API returned no content")
+    );
+    const res = await postStructured({ focus: "do things" });
+    expect(res.status).toBe(502);
+    expect(await res.json()).toEqual({ error: "Model request failed", status: 502 });
+    expect(runCommand).not.toHaveBeenCalled();
+    expect(uploadFile).not.toHaveBeenCalled();
+    expect(store.updates).toHaveLength(0);
+  });
+
+  it("model transport failure → 502, no sandbox", async () => {
+    stubCreds();
+    const { ModelError } = await import("@hubris/llm");
+    vi.mocked(chatComplete).mockRejectedValueOnce(
+      new ModelError("transport", "Model transport error: fetch failed")
+    );
+    const res = await postStructured({ focus: "do things" });
+    expect(res.status).toBe(502);
+    expect(runCommand).not.toHaveBeenCalled();
+    expect(uploadFile).not.toHaveBeenCalled();
+  });
+
+  it("prose response → 400 malformed (distinct from schema failure)", async () => {
+    stubCreds();
+    store.draftPlan = "After analysis, no patch is needed. All good.";
+    const res = await postStructured({ focus: "do things" });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ error: "Malformed edit plan", status: 400 });
+    expect(runCommand).not.toHaveBeenCalled();
+  });
+
+  it("oldText === newText → 400 invalid (schema holds, not loosened)", async () => {
+    stubCreds();
+    store.draftPlan = plan([
+      { path: "src/a.ts", oldText: "foo();", newText: "foo();" },
+    ]);
+    const res = await postStructured({ focus: "do things" });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ error: "Invalid edit plan", status: 400 });
+    expect(runCommand).not.toHaveBeenCalled();
   });
 });

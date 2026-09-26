@@ -2280,11 +2280,25 @@ app.post("/api/forge-structured", async (c: Context) => {
         raw = JSON.parse(stripCodeFences(draft));
       } catch {
         await persistRejection("malformed edit plan", draft);
+        // Metadata only: lengths, never draft text or values.
+        console.error(
+          "Forge-structured parse failure:",
+          JSON.stringify({ reason: "malformed edit plan", draftChars: draft.length })
+        );
         return c.json({ error: "Malformed edit plan", status: 400 }, 400);
       }
       const check = EditPlanSchema.safeParse(raw);
       if (!check.success) {
         await persistRejection("invalid edit plan", draft);
+        // Metadata only: issue codes + field paths, never received values.
+        console.error(
+          "Forge-structured schema failure:",
+          JSON.stringify({
+            reason: "invalid edit plan",
+            draftChars: draft.length,
+            issues: check.error.issues.map((i) => `${i.code}:${i.path.join(".")}`),
+          })
+        );
         return c.json({ error: "Invalid edit plan", status: 400 }, 400);
       }
       plan = check.data;
