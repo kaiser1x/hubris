@@ -145,6 +145,7 @@ hubris/
 | POST | `/api/run-tests` `{ jobId, ref?, image?, manager?, testCommand? }` | Run the repo's own test suite in an installed sandbox (exit 0 = PASS) |
 | POST | `/api/regression` `{ jobId, testContent XOR generate, ... }` | Write a regression test into the workspace and execute the suite |
 | POST | `/api/apply` `{ jobId, diff, ... }` | Apply a unified diff in the sandbox workspace, then run the suite |
+| POST | `/api/forge-verify` `{ jobId, diff?/draft, ... }` | Forge → Apply → Verify lifecycle with explicit states (VERIFIED only on exit 0) |
 
 ### Page status
 
@@ -168,7 +169,10 @@ selector), `/investigate`, `/forge`. Demo narrative until sandbox lands:
   `POST /api/regression` writes a caller-provided or Nemotron-drafted
   regression test into the workspace before running the suite, and
   `POST /api/apply` applies a caller-provided unified diff there first
-  (real repo never touched) and runs the suite against it. Exit codes, stdout/stderr, and
+  (real repo never touched) and runs the suite against it.
+  `POST /api/forge-verify` runs the whole Forge → Apply → Verify lifecycle
+  in one disposable sandbox, recording explicit states
+  (PROPOSED → … → VERIFIED) and claiming VERIFIED only on exit 0. Exit codes, stdout/stderr, and
   manifests are stored as job evidence. Every run carries explicit
   timeout/wait/output caps (`HUBRIS_SANDBOX_*`, `HUBRIS_MAX_OUTPUT_BYTES`).
 

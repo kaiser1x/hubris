@@ -3,6 +3,7 @@ export {
   buildForgePrompt,
   buildInvestigatePrompt,
   buildRegressionPrompt,
+  extractForgePatch,
   FORGE_SYSTEM,
   INVESTIGATE_SYSTEM,
   REGRESSION_SYSTEM,

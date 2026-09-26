@@ -18,6 +18,7 @@ import {
   buildInvestigatePrompt,
   buildRegressionPrompt,
   chatComplete,
+  extractForgePatch,
   llmConfigFromEnv,
   stripCodeFences,
 } from "@hubris/llm";
@@ -39,10 +40,17 @@ import {
 } from "./install";
 import {
   buildTestScript,
-  parseTestCommand,
+  readPackageTestScript,
   TEST_BEGIN_MARKER,
   testTimingFromEnv,
 } from "./testrun";
+import {
+  buildForgeVerifyScript,
+  getForgeContext,
+  resolveForgeStatus,
+  VERIFY_BEGIN_MARKER,
+  type TwinJobLike,
+} from "./forgeverify";
 import {
   buildRegressionScript,
   DEFAULT_REGRESSION_TEST_PATH,
@@ -159,9 +167,20 @@ const ApplyBody = z.object({
   diff: z.string().min(10).max(20000),
 });
 
-function shortPath(p: string): string {
-  return p.split(/[\\/]/).filter(Boolean).slice(-3).join("/");
-}
+const ForgeVerifyBody = z.object({
+  jobId: z.string().min(1, "jobId is required"),
+  ref: GitRef.optional(),
+  image: z.string().max(200).optional(),
+  manager: z.enum(["pnpm", "npm"]).optional(),
+  // Caller-provided patch: skips drafting, runs the lifecycle
+  // deterministically. Omit to draft via Forge (focus/instruction apply).
+  diff: z.string().min(10).max(20000).optional(),
+  focus: z.string().max(200).optional(),
+  instruction: z.string().max(2000).optional(),
+  // Explicit verification command (max 500 chars). Defaults to the repo's
+  // own test command via the manager. Never defaulted to echo.
+  verificationCommand: z.string().min(1).max(500).optional(),
+});
 
 // Rewrite absolute clone-dir paths to repo-relative posix paths so stored
 // twins never leak the server's temp directory.
@@ -516,26 +535,15 @@ app.post("/api/forge", async (c: Context) => {
     return c.json({ error: "Model not configured", status: 503 }, 503);
   }
 
-  const fullFunctions = result.full?.functions ?? [];
-  const prompt = buildForgePrompt(
-    {
-      repoName: result.repository?.name ?? job.repoUrl,
-      stats: result.stats,
-      functions: fullFunctions.map((f) => ({
-        name: f.name ?? "(anonymous)",
-        file: f.path ? shortPath(f.path) : "(unknown)",
-        line: f.line ?? 1,
-      })),
-      endpoints: (result.full?.endpoints ?? []).map((e) =>
-        `${e.method ?? ""} ${e.path ?? ""}`.trim()
-      ).filter(Boolean),
-      relationships: (result.full?.relationships ?? []).map((r) =>
-        `${r.from ? shortPath(r.from) : "?"} ${r.type ?? "?"} ${r.to ?? "?"}`
-      ),
-      focus: parsed.data.focus,
-      instruction: parsed.data.instruction,
-    }
+  const forgeCtx = getForgeContext(
+    { repoUrl: job.repoUrl, status: job.status, result },
+    parsed.data.focus,
+    parsed.data.instruction
   );
+  if (!forgeCtx) {
+    return c.json({ error: "Job has no completed analysis", status: 400 }, 400);
+  }
+  const prompt = buildForgePrompt(forgeCtx);
 
   try {
     const suggestion = await chatComplete(
@@ -1109,13 +1117,7 @@ app.post("/api/run-tests", async (c: Context) => {
     const requested = parsed.data.testCommand;
     let declared: string | null = null;
     if (!requested) {
-      let pkgText: string | null = null;
-      try {
-        pkgText = await fs.promises.readFile(path.join(src, "package.json"), "utf-8");
-      } catch {
-        pkgText = null;
-      }
-      declared = pkgText ? parseTestCommand(pkgText) : null;
+      declared = await readPackageTestScript(src);
       if (!declared) {
         return c.json({ error: "Repository has no test script", status: 400 }, 400);
       }
@@ -1572,6 +1574,251 @@ app.post("/api/apply", async (c: Context) => {
       })
       .where(eq(schema.jobs.id, job.id));
     return c.json({ jobId: job.id, apply: entry });
+  } finally {
+    await fs.promises.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+// POST /api/forge-verify - One-call Forge → Apply → Verify lifecycle.
+// Body: { jobId, diff?, focus?, instruction?, ref?, image?, manager?,
+// verificationCommand? }. Without diff, drafts a patch via Forge from the
+// job's twin (focus/instruction ground it); with diff, that patch runs
+// deterministically. Either way: stage → apply → install → run the
+// verification command (explicit wins, else the repo's own test command;
+// absent command is a 400, never an echo) in ONE disposable sandbox.
+// States: PROPOSED → APPLYING → APPLIED → VERIFYING → VERIFIED, with
+// APPLY_FAILED / FAILED / TIMEOUT terminals. VERIFIED requires actual
+// exit 0; exit≠0 is FAILED, timeout is TIMEOUT. Evidence (with the full
+// state trail) lands on job.result.forgeRuns[].
+app.post("/api/forge-verify", async (c: Context) => {
+  let rawBody: unknown;
+  try {
+    rawBody = await c.req.json();
+  } catch {
+    return c.json({ error: "Invalid JSON body", status: 400 }, 400);
+  }
+
+  const parsed = ForgeVerifyBody.safeParse(rawBody);
+  if (!parsed.success) {
+    return c.json({ error: "jobId is required", status: 400 }, 400);
+  }
+  if (parsed.data.diff !== undefined && !isPlausibleDiff(parsed.data.diff)) {
+    return c.json({ error: "diff is not a plausible unified diff", status: 400 }, 400);
+  }
+
+  const db = getDb();
+  if (!db) {
+    return c.json({ error: "Job store unavailable", status: 503 }, 503);
+  }
+
+  const rows = await db.select().from(schema.jobs).where(eq(schema.jobs.id, parsed.data.jobId));
+  const job = rows[0];
+  if (!job) {
+    return c.json({ error: "Job not found", status: 404 }, 404);
+  }
+
+  const cloneUrl = toSafeCloneUrl(job.repoUrl);
+  if (!cloneUrl) {
+    return c.json({ error: "Job has unsupported repo URL", status: 400 }, 400);
+  }
+
+  const sandbox = sandboxConfigFromEnv();
+  if (!sandbox) {
+    return c.json({ error: "Sandbox not configured", status: 503 }, 503);
+  }
+
+  // Draft the patch before spending sandbox ops. Caller diffs skip this.
+  let diff = parsed.data.diff;
+  let patchSource: "provided" | "forge" = "provided";
+  if (diff === undefined) {
+    const forgeCtx = getForgeContext(
+      {
+        repoUrl: job.repoUrl,
+        status: job.status,
+        result: job.result as TwinJobLike["result"],
+      },
+      parsed.data.focus,
+      parsed.data.instruction
+    );
+    if (!forgeCtx) {
+      return c.json({ error: "Job has no completed analysis", status: 400 }, 400);
+    }
+    const llm = llmConfigFromEnv();
+    if (!llm) {
+      return c.json({ error: "Model not configured", status: 503 }, 503);
+    }
+    let suggestion: string;
+    try {
+      suggestion = await chatComplete(
+        llm,
+        [
+          { role: "system", content: FORGE_SYSTEM },
+          { role: "user", content: buildForgePrompt(forgeCtx) },
+        ],
+        { maxTokens: 1200, signal: AbortSignal.timeout(90000) }
+      );
+    } catch (error: any) {
+      console.error("Forge-verify draft error:", error?.message);
+      return c.json({ error: "Model request failed", status: 502 }, 502);
+    }
+    const extracted = extractForgePatch(suggestion);
+    if (!extracted || !isPlausibleDiff(extracted)) {
+      return c.json({ error: "Forge produced no usable patch", status: 400 }, 400);
+    }
+    diff = extracted;
+    patchSource = "forge";
+  }
+
+  const limits = limitsFromEnv();
+  const execLimits = executionLimitsFromEnv();
+  const timing = testTimingFromEnv();
+  const ref = parsed.data.ref;
+  const tmp = await fs.promises.mkdtemp(path.join(os.tmpdir(), "hubris-forge-verify-"));
+  const runId = crypto.randomUUID();
+  const startedAt = new Date().toISOString();
+  try {
+    let staged;
+    try {
+      staged = await cloneAndArchive(cloneUrl, ref, tmp);
+    } catch (error: any) {
+      const step =
+        error?.message === "clone"
+          ? "clone"
+          : error?.message === "ls-files"
+            ? "listing"
+            : "archive";
+      return c.json({ error: `Repository ${step} failed`, status: 500 }, 500);
+    }
+    const { src, tarPath, tracked } = staged;
+    const excluded = tracked.filter(isTransferExcluded);
+    const expected = tracked.length - excluded.length;
+    if (expected <= 0) {
+      return c.json({ error: "Repository has no transferable files", status: 400 }, 400);
+    }
+    if (tracked.length > limits.maxFiles) {
+      return c.json(
+        { error: `Repository exceeds transfer limits (${tracked.length} files > ${limits.maxFiles})`, status: 413 },
+        413
+      );
+    }
+
+    const tarBytes = await fs.promises.readFile(tarPath);
+    if (tarBytes.length > limits.maxBytes) {
+      return c.json(
+        { error: `Repository exceeds transfer limits (${tarBytes.length} bytes > ${limits.maxBytes})`, status: 413 },
+        413
+      );
+    }
+    const localSha = createHash("sha256").update(tarBytes).digest("hex");
+
+    let uploaded;
+    let diffUpload;
+    try {
+      uploaded = await uploadFile(sandbox, tarBytes, { timeoutMs: 60000 });
+      diffUpload = await uploadFile(sandbox, new TextEncoder().encode(diff!), {
+        timeoutMs: 60000,
+      });
+    } catch (error: any) {
+      console.error("Forge-verify upload error:", error?.message);
+      return c.json({ error: "Sandbox upload failed", status: 502 }, 502);
+    }
+    if (uploaded.sha256 !== localSha) {
+      return c.json({ error: "Transfer integrity mismatch", status: 502 }, 502);
+    }
+
+    const detected = detectManager(tracked);
+    const manager: PackageManager = parsed.data.manager ?? detected ?? "pnpm";
+    const requested = parsed.data.verificationCommand;
+    let verifyInvoke = requested;
+    let commandSource = "requested";
+    if (!verifyInvoke) {
+      const declared = await readPackageTestScript(src);
+      if (!declared) {
+        return c.json({ error: "Repository has no test command", status: 400 }, 400);
+      }
+      verifyInvoke = `${manager} test`;
+      commandSource = "detected";
+    }
+
+    const runStarted = Date.now();
+    let result;
+    try {
+      result = await runCommand(sandbox, {
+        command: buildForgeVerifyScript(manager, excluded, verifyInvoke),
+        image: parsed.data.image ?? "tag:node:20-slim",
+        files: {
+          [CHECKOUT_UPLOAD_PATH]: { uuid: uploaded.uuid },
+          [DIFF_STAGING_PATH]: { uuid: diffUpload.uuid },
+        },
+        shell: true,
+        disposable: true,
+        timeout: timing.timeoutS,
+        truncateOutputAt: execLimits.maxOutputBytes,
+        waitMs: timing.waitMs,
+      });
+    } catch (error: any) {
+      console.error("Forge-verify run error:", error?.message);
+      return c.json({ error: "Sandbox run failed", status: 502 }, 502);
+    }
+    const durationMs = Date.now() - runStarted;
+
+    const patchOk = result.stdout.includes(PATCH_OK_MARKER);
+    const verifyBegin = result.stdout.includes(VERIFY_BEGIN_MARKER);
+    const status = resolveForgeStatus({
+      patchOk,
+      verifyBegin,
+      exitCode: result.exitCode,
+      timedOut: result.timedOut,
+    });
+    const history = [
+      { state: "PROPOSED" as const, at: startedAt },
+      { state: "APPLYING" as const, at: new Date().toISOString() },
+      ...(patchOk
+        ? [
+            { state: "APPLIED" as const, at: new Date().toISOString() },
+            { state: "VERIFYING" as const, at: new Date().toISOString() },
+          ]
+        : []),
+      { state: status, at: new Date().toISOString() },
+    ];
+    const entry = {
+      id: runId,
+      status,
+      history,
+      patch: {
+        source: patchSource,
+        diffSha256: createHash("sha256").update(diff!).digest("hex"),
+        diffBytes: new TextEncoder().encode(diff!).length,
+      },
+      apply: { applied: patchOk },
+      verification: {
+        command: verifyInvoke,
+        commandSource,
+        exitCode: result.exitCode,
+        timedOut: result.timedOut,
+        passed: status === "VERIFIED",
+      },
+      image: parsed.data.image ?? "tag:node:20-slim",
+      manager,
+      workspace: REPO_WORKDIR,
+      files: expected,
+      bytes: tarBytes.length,
+      sha256: localSha,
+      durationMs,
+      verified: status === "VERIFIED",
+      stdout: result.stdout.slice(0, 4000),
+      stderr: result.stderr.slice(0, 4000),
+      at: new Date().toISOString(),
+    };
+    const prior = (job.result as { forgeRuns?: unknown[] } | null)?.forgeRuns ?? [];
+    await db
+      .update(schema.jobs)
+      .set({
+        result: { ...(job.result as object), forgeRuns: [...prior, entry] },
+        updatedAt: new Date(),
+      })
+      .where(eq(schema.jobs.id, job.id));
+    return c.json({ jobId: job.id, forgeRun: entry });
   } finally {
     await fs.promises.rm(tmp, { recursive: true, force: true });
   }

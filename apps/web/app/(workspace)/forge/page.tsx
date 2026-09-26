@@ -10,12 +10,24 @@ interface LiveProposal {
   suggestion: string;
 }
 
+interface LiveVerification {
+  status: string;
+  history: string[];
+  applied: boolean;
+  command: string;
+  exitCode: number | null;
+  passed: boolean;
+}
+
 export default function ForgePage() {
   const [jobId, setJobId] = useState<string | null>(null);
   const [proposal, setProposal] = useState<LiveProposal | null>(null);
   const [focus, setFocus] = useState("");
   const [forging, setForging] = useState(false);
   const [forgeError, setForgeError] = useState<string | null>(null);
+  const [verifying, setVerifying] = useState(false);
+  const [verification, setVerification] = useState<LiveVerification | null>(null);
+  const [verifyError, setVerifyError] = useState<string | null>(null);
 
   const forge = useCallback(async (id: string, repo: string, focusValue: string) => {
     setForging(true);
@@ -58,6 +70,40 @@ export default function ForgePage() {
       cancelled = true;
     };
   }, [forge]);
+
+  async function verifyInSandbox() {
+    if (!jobId || verifying) return;
+    setVerifying(true);
+    setVerifyError(null);
+    setVerification(null);
+    try {
+      const res = await fetch("/api/forge-verify", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(
+          focus.trim() ? { jobId, focus: focus.trim() } : { jobId }
+        ),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.forgeRun) {
+        setVerifyError(data.error ?? "Verification request failed.");
+      } else {
+        const run = data.forgeRun;
+        setVerification({
+          status: run.status,
+          history: Array.isArray(run.history) ? run.history.map((h: { state: string }) => h.state) : [],
+          applied: Boolean(run.apply?.applied),
+          command: String(run.verification?.command ?? ""),
+          exitCode: typeof run.verification?.exitCode === "number" ? run.verification.exitCode : null,
+          passed: Boolean(run.verified),
+        });
+      }
+    } catch {
+      setVerifyError("Analysis service unreachable. Is the API running?");
+    } finally {
+      setVerifying(false);
+    }
+  }
 
   return (
     <div className="max-w-[1440px] mx-auto px-5 lg:px-[52px] pt-10 lg:pt-[50px] pb-12">
@@ -119,6 +165,51 @@ export default function ForgePage() {
           <p className="font-mono text-[10px] text-[#7A7171] mt-4">
             Proposal only — nothing applied. Sandbox verification pending.
           </p>
+
+          <div className="border-t border-[#dedada] mt-5 pt-4">
+            <div className="flex flex-col sm:flex-row sm:items-center gap-3">
+              <p className="kicker">
+                Sandbox verification ·{" "}
+                {verification ? verification.status : "not run"}
+              </p>
+              <button
+                type="button"
+                onClick={() => void verifyInSandbox()}
+                disabled={verifying}
+                className="sm:ml-auto shrink-0 bg-[#0A0A0A] text-white font-mono text-[11px] tracking-[0.08em] px-4 py-2.5 hover:bg-black active:scale-[0.98] disabled:opacity-40 disabled:cursor-not-allowed transition-all"
+              >
+                {verifying ? "VERIFYING…" : "VERIFY IN SANDBOX ↗"}
+              </button>
+            </div>
+            {verifying && !verification ? (
+              <p className="font-mono text-[13px] text-[#7A7171] mt-4">
+                Applying patch and running verification in a disposable sandbox…
+              </p>
+            ) : verifyError ? (
+              <p role="alert" className="font-mono text-xs mt-4 underline underline-offset-4 decoration-[#dedada]">
+                {verifyError}
+              </p>
+            ) : verification ? (
+              <dl className="mt-4 font-mono text-xs">
+                <div className="flex justify-between py-1.5 border-b border-[#dedada]">
+                  <dt className="text-[#7A7171]">Patch</dt>
+                  <dd>{verification.applied ? "✓ Applied" : "✕ Rejected"}</dd>
+                </div>
+                <div className="flex justify-between py-1.5 border-b border-[#dedada]">
+                  <dt className="text-[#7A7171]">Verify</dt>
+                  <dd className="truncate max-w-[60%] text-right">{verification.command || "—"}</dd>
+                </div>
+                <div className="flex justify-between py-1.5 border-b border-[#dedada]">
+                  <dt className="text-[#7A7171]">Exit</dt>
+                  <dd>{verification.exitCode ?? "—"}</dd>
+                </div>
+                <div className="flex justify-between py-1.5">
+                  <dt className="text-[#7A7171]">State</dt>
+                  <dd>{verification.passed ? "VERIFIED" : verification.status}</dd>
+                </div>
+              </dl>
+            ) : null}
+          </div>
         </section>
       )}
 

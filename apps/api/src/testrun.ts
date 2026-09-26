@@ -17,6 +17,8 @@
 //   failed and presence means the TEST phase ran. PASS/FAIL is still just
 //   exit code + timeout.
 
+import * as fs from "fs";
+import * as path from "path";
 import { REPO_WORKDIR } from "@hubris/sandbox";
 import { CHECKOUT_UPLOAD_PATH } from "./checkout";
 import { INSTALL_COMMANDS, type PackageManager } from "./install";
@@ -60,6 +62,18 @@ export function parseTestCommand(pkgText: string): string | null {
   } catch {
     return null;
   }
+}
+
+// Read scripts.test from a local clone checkout. Null when the file is
+// missing or declares no test script. Never throws.
+export async function readPackageTestScript(src: string): Promise<string | null> {
+  let pkgText: string | null = null;
+  try {
+    pkgText = await fs.promises.readFile(path.join(src, "package.json"), "utf-8");
+  } catch {
+    return null;
+  }
+  return parseTestCommand(pkgText);
 }
 
 function shQuote(s: string): string {

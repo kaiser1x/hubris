@@ -113,3 +113,30 @@ export function buildRegressionPrompt(ctx: RegressionContext): string {
 
 export const REGRESSION_SYSTEM =
   "You are HUBRIS, a precise regression-test author. Write a single focused Vitest test grounded in the provided codebase summary. Output only code.";
+
+// Extract the PATCH section from a Forge suggestion (format: PATCH diff,
+// then TEST, then WHY). Handles fenced and plain output. Returns the diff
+// text or null when no usable patch exists. Never throws. Trailing prose
+// (TEST/WHY sections) is cut: it would corrupt git apply.
+export function extractForgePatch(suggestion: string): string | null {
+  const plain = stripCodeFences(suggestion);
+  const start = plain.indexOf("diff --git");
+  if (start < 0) return null;
+  const lines = plain.slice(start).split("\n");
+  const kept: string[] = [];
+  for (const line of lines) {
+    // Stray fence lines around an inline-fenced diff carry no patch content.
+    if (line.startsWith("```")) continue;
+    const head = line[0];
+    if (
+      head !== " " && head !== "+" && head !== "-" && head !== "@" &&
+      /^(#{1,6}\s+|\d+\)\s*|TEST\b|WHY\b)/i.test(line)
+    ) {
+      break;
+    }
+    kept.push(line);
+  }
+  const diff = kept.join("\n").trim();
+  if (!diff.includes("@@")) return null;
+  return diff;
+}
