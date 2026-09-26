@@ -1,9 +1,14 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
+import { createHash } from "node:crypto";
 import { app } from "../src/app";
 import {
+  buildApplyCheckScript,
   buildForgeVerifyScript,
+  CHECK_DONE_MARKER,
   getForgeContext,
+  parseApplyCheckResult,
   resolveForgeStatus,
+  toAttemptRecord,
   VERIFY_BEGIN_MARKER,
 } from "../src/forgeverify";
 
@@ -118,5 +123,65 @@ describe("buildForgeVerifyScript", () => {
     const idx = order.map((s) => cmd.indexOf(s));
     expect(idx.every((i) => i > -1)).toBe(true);
     expect([...idx].sort((a, b) => a - b)).toEqual(idx);
+  });
+});
+
+describe("buildApplyCheckScript", () => {
+  it("extracts and checks without installing or testing", () => {
+    const cmd = buildApplyCheckScript([".env"]);
+    expect(cmd).toContain("tar -xf '/tmp/hubris-upload/repo.tar'");
+    expect(cmd).toContain("rm -f '.env'");
+    expect(cmd).toContain("git apply --check '/tmp/hubris-upload/patch.diff'");
+    expect(cmd).toContain(`echo ${CHECK_DONE_MARKER}`);
+    expect(cmd).not.toContain("pnpm install");
+    expect(cmd).not.toContain("TEST_BEGIN");
+  });
+});
+
+describe("parseApplyCheckResult", () => {
+  it("passes only on exit 0 with the marker and no timeout", () => {
+    const good = parseApplyCheckResult({
+      exitCode: 0, stdout: `ok\n${CHECK_DONE_MARKER}\n`, stderr: "", timedOut: false,
+    });
+    expect(good).toEqual({ passed: true, timedOut: false, error: expect.any(String) });
+    // Marker missing despite exit 0 is NOT a pass (script may have died early).
+    expect(
+      parseApplyCheckResult({ exitCode: 0, stdout: "ok", stderr: "", timedOut: false }).passed
+    ).toBe(false);
+    expect(
+      parseApplyCheckResult({ exitCode: 1, stdout: "x", stderr: "corrupt", timedOut: false }).passed
+    ).toBe(false);
+    const timed = parseApplyCheckResult({
+      exitCode: null, stdout: "", stderr: "", timedOut: true,
+    });
+    expect(timed.passed).toBe(false);
+    expect(timed.timedOut).toBe(true);
+  });
+
+  it("bounds the error text for the redraft prompt", () => {
+    const big = "e".repeat(5000);
+    const out = parseApplyCheckResult({ exitCode: 1, stdout: big, stderr: big, timedOut: false });
+    expect(out.error.length).toBeLessThanOrEqual(2000);
+  });
+});
+
+describe("toAttemptRecord", () => {
+  it("records hashes and verdicts, never patch text", async () => {
+    const { toAttemptRecord } = await import("../src/forgeverify");
+    const { createHash } = await import("node:crypto");
+    const diff = "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n";
+    const rec = toAttemptRecord({ attempt: 1, source: "forge", diff, parseAccepted: true, applyCheckPassed: false });
+    expect(rec).toEqual({
+      attempt: 1,
+      source: "forge",
+      patchSha256: createHash("sha256").update(diff).digest("hex"),
+      patchBytes: Buffer.byteLength(diff, "utf-8"),
+      parseAccepted: true,
+      applyCheckPassed: false,
+    });
+    expect(JSON.stringify(rec)).not.toContain("diff --git");
+    const empty = toAttemptRecord({ attempt: 2, source: "forge-redraft", diff: null, parseAccepted: false, applyCheckPassed: null });
+    expect(empty.patchSha256).toBeNull();
+    expect(empty.patchBytes).toBeNull();
   });
 });

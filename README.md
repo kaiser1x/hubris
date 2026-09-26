@@ -145,7 +145,8 @@ hubris/
 | POST | `/api/run-tests` `{ jobId, ref?, image?, manager?, testCommand? }` | Run the repo's own test suite in an installed sandbox (exit 0 = PASS) |
 | POST | `/api/regression` `{ jobId, testContent XOR generate, ... }` | Write a regression test into the workspace and execute the suite |
 | POST | `/api/apply` `{ jobId, diff, ... }` | Apply a unified diff in the sandbox workspace, then run the suite |
-| POST | `/api/forge-verify` `{ jobId, diff?/draft, ... }` | Forge → Apply → Verify lifecycle with explicit states (VERIFIED only on exit 0) |
+| POST | `/api/forge-verify` `{ jobId, diff?/draft, ... }` | Forge → Apply → Verify lifecycle with explicit states (VERIFIED only on exit 0; one bounded redraft on check failure) |
+| POST | `/api/forge-structured` `{ jobId, focus, ... }` | Structured-edit Forge: model JSON plan → exact-match validation → mechanical edit → git-canonical diff → verify |
 
 ### Page status
 

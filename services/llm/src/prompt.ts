@@ -1,5 +1,4 @@
-export interface TwinSummary {
-  repoName: string;
+export interface TwinSummary {  repoName: string;
   stats: {
     functions: number;
     classes: number;
@@ -131,6 +130,100 @@ export function buildRegressionPrompt(ctx: RegressionContext): string {
 
 export const REGRESSION_SYSTEM =
   "You are HUBRIS, a precise regression-test author. Write a single focused Vitest test grounded in the provided codebase summary. Output only code.";
+
+// Bounded redraft instruction (Phase I). Sent at most ONCE per Forge run,
+// only after git apply --check rejected the initial patch. Carries the
+// original task plus the bounded git error — never secrets, never repo
+// dumps. The model must return a complete unified diff, same contract.
+export const REDRAFT_ERROR_CHARS = 1500;
+
+export interface RedraftContext {
+  originalDiff: string;
+  gitError: string;
+  focus?: string;
+  instruction?: string;
+}
+
+export function buildRedraftPrompt(ctx: RedraftContext): string {
+  const lines = [
+    ctx.focus?.trim() ? `Original task: ${ctx.focus.trim()}` : "",
+    ctx.instruction?.trim() ? `Additional instruction: ${ctx.instruction.trim()}` : "",
+    "",
+    "Your previous patch was rejected by `git apply --check`. Git error:",
+    ctx.gitError.slice(0, REDRAFT_ERROR_CHARS),
+    "",
+    "Regenerate ONLY the PATCH section as a complete unified diff that applies cleanly to the provided repository.",
+    "Do not change the intended fix.",
+    "Use the exact file paths and context from the repository.",
+    "Ensure all @@ line counts match the actual hunk contents.",
+    "Return a complete Git-applicable unified diff.",
+    "",
+    "Previous patch for reference:",
+    ctx.originalDiff,
+  ];
+  return lines.filter((l) => l !== "").join("\n");
+}
+
+export const REDRAFT_SYSTEM =
+  "You are HUBRIS, a careful patch author. Correct the rejected patch so it applies cleanly with git apply. Output only the complete unified diff.";
+
+export interface StructuredExcerpt {
+  path: string;
+  function: string;
+  lines: string;
+  text: string;
+}
+
+export interface StructuredContext {
+  repoName: string;
+  excerpts: StructuredExcerpt[];
+  focus: string;
+  instruction?: string;
+}
+
+// Structured edit plans replace direct diff generation: the model names
+// the file, function, and exact texts, while HUBRIS owns hunk arithmetic
+// (mechanical edit + git-generated canonical diff). JSON only — no prose,
+// no fences — so parsing never guesses.
+export function buildStructuredPrompt(ctx: StructuredContext): string {
+  const blocks = ctx.excerpts.map(
+    (e) => `--- ${e.path} (${e.function}, lines ${e.lines}) ---\n${e.text}`
+  );
+  const lines = [
+    `Repository: ${ctx.repoName}`,
+    `Target behavior: ${ctx.focus.trim()}`,
+    ctx.instruction?.trim() ? `Additional instruction: ${ctx.instruction.trim()}` : "",
+    "",
+    "Relevant source:",
+    blocks.join("\n\n") || "(none)",
+    "",
+    "Respond with ONLY a JSON object of exactly this shape, no markdown, no prose, no fences:",
+    `{"edits": [{"path": "src/file.ts", "function": "name", "oldText": "exact existing source", "newText": "replacement source"}]}`,
+    "Use double quotes, no comments, no trailing commas. Start your response with { and end with }.",
+    "Make the smallest possible change required to fix the reported bug.",
+    "Preserve all existing externally observable behavior unless the task explicitly requires changing it.",
+    "Do not change existing error messages, return values, API shapes, function signatures, logging behavior, or unrelated logic unless required by the bug.",
+    "Reuse existing constants, strings, and behavior whenever possible.",
+    "Do not invent replacement wording when an existing error message already expresses the required behavior.",
+    "Rules: paths are repo-relative; oldText must match the source above EXACTLY (character for character); copy it verbatim rather than retyping; keep newText minimal and consistent with surrounding style.",
+  ];
+  return lines.filter((l) => l !== "").join("\n");
+}
+
+export const STRUCTURED_SYSTEM =
+  "You are HUBRIS, a precise edit planner. Output only a JSON edit plan grounding every edit in the provided source excerpts.";
+
+// Output budget for Forge-family calls (patch/test drafting). Reasoning
+// models spend tokens thinking before answering: 1200 starved them
+// mid-reasoning (finish_reason:length, content:null). 4096 gives the final
+// content room to exist. Env-overridable; investigate (short answers)
+// intentionally keeps the client default.
+export const DEFAULT_FORGE_MAX_TOKENS = 4096;
+
+export function forgeMaxTokens(env: NodeJS.ProcessEnv = process.env): number {
+  const v = Number(env.HUBRIS_FORGE_MAX_TOKENS);
+  return Number.isFinite(v) && v > 0 ? Math.floor(v) : DEFAULT_FORGE_MAX_TOKENS;
+}
 
 // Extract the PATCH section from a Forge suggestion (format: PATCH diff,
 // then TEST, then WHY). Handles fenced and plain output. Returns the diff

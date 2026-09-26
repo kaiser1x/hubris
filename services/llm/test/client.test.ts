@@ -228,3 +228,24 @@ describe("chatComplete error taxonomy", () => {
     expect(err.kind).toBe("transport");
   });
 });
+
+describe("chatComplete response_format", () => {
+  it("sends response_format only when requested", async () => {
+    const fetchMock = vi.fn(async () =>
+      new Response(JSON.stringify({ choices: [{ message: { content: "{}" } }] }), {
+        status: 200,
+      })
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const cfg = { baseUrl: "https://example.test/v1/", apiKey: "k", model: "m" };
+    const msgs = [{ role: "user", content: "hi" }] as Parameters<typeof chatComplete>[1];
+    await chatComplete(cfg, msgs, { responseFormat: "json_object" });
+    const [, withFormat] = fetchMock.mock.calls[0];
+    expect(JSON.parse(withFormat?.body as string).response_format).toEqual({
+      type: "json_object",
+    });
+    await chatComplete(cfg, msgs);
+    const [, withoutFormat] = fetchMock.mock.calls[1];
+    expect(JSON.parse(withoutFormat?.body as string)).not.toHaveProperty("response_format");
+  });
+});

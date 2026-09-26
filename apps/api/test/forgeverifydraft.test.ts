@@ -114,6 +114,11 @@ describe("POST /api/forge-verify draft rejection (mocked model)", () => {
       status: 400,
     });
     expect(chatComplete).toHaveBeenCalledOnce();
+    expect(chatComplete).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      expect.objectContaining({ maxTokens: 4096 })
+    );
     expect(runCommand).not.toHaveBeenCalled();
     expect(uploadFile).not.toHaveBeenCalled();
     const [entry] = rejections();

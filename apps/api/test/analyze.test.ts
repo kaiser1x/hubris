@@ -264,6 +264,18 @@ describe("POST /api/analyze validation", () => {
     });
     expect(res.status).toBe(400);
   });
+
+  it("returns 400 for an unsafe ref", async () => {
+    const res = await app.request("/api/analyze", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        repoUrl: "https://github.com/kaiser1x/ts-js-dummy",
+        ref: "bad;rm -rf",
+      }),
+    });
+    expect(res.status).toBe(400);
+  });
 });
 
 describe("toRepoRelative", () => {

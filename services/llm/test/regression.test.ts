@@ -1,9 +1,15 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi, afterEach } from "vitest";
 import {
   buildRegressionPrompt,
+  DEFAULT_FORGE_MAX_TOKENS,
+  forgeMaxTokens,
   REGRESSION_SYSTEM,
   stripCodeFences,
 } from "../src/index";
+
+afterEach(() => {
+  vi.unstubAllEnvs();
+});
 
 const CTX = {
   repoName: "kaiser1x/ts-js-dummy",
@@ -44,5 +50,19 @@ describe("stripCodeFences", () => {
 
   it("exposes a code-only system prompt", () => {
     expect(REGRESSION_SYSTEM).toContain("Output only code");
+  });
+});
+
+describe("forgeMaxTokens", () => {
+  it("defaults to 4096 (reasoning headroom past the 1200 starvation)", () => {
+    expect(DEFAULT_FORGE_MAX_TOKENS).toBe(4096);
+    expect(forgeMaxTokens({})).toBe(4096);
+    expect(forgeMaxTokens({ HUBRIS_FORGE_MAX_TOKENS: "0" })).toBe(4096);
+    expect(forgeMaxTokens({ HUBRIS_FORGE_MAX_TOKENS: "-5" })).toBe(4096);
+    expect(forgeMaxTokens({ HUBRIS_FORGE_MAX_TOKENS: "nope" })).toBe(4096);
+  });
+
+  it("honors an explicit override", () => {
+    expect(forgeMaxTokens({ HUBRIS_FORGE_MAX_TOKENS: "8000" })).toBe(8000);
   });
 });

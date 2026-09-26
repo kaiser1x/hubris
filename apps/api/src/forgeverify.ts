@@ -1,7 +1,9 @@
 // Phase H — Forge → Apply → Verify lifecycle (single-path, no engine).
 //
-// One endpoint, one disposable run: stage the repo, apply a patch (drafted
-// by Forge or caller-provided), install, then run a verification command.
+// One endpoint, up to two disposable runs: stage the repo, VALIDATE the
+// patch with `git apply --check`, and only then apply + install + verify.
+// A failed check earns exactly ONE model redraft (same contract, plus the
+// bounded git error); a second failure ends APPLY_FAILED. No loops.
 // Verification rule (no scores, no percentages):
 //   exit 0       → VERIFIED
 //   non-zero     → FAILED
@@ -10,6 +12,7 @@
 // A patch that never applies ends APPLY_FAILED; an install failure that
 // never reaches verification ends FAILED (never VERIFIED).
 
+import { createHash } from "node:crypto";
 import { REPO_WORKDIR } from "@hubris/sandbox";
 import { CHECKOUT_UPLOAD_PATH } from "./checkout";
 import { INSTALL_COMMANDS, type PackageManager } from "./install";
@@ -70,6 +73,78 @@ export function buildForgeVerifyScript(
 
 export const VERIFY_BEGIN_MARKER = "VERIFY_BEGIN";
 
+export const CHECK_DONE_MARKER = "CHECK_DONE";
+
+// Lean validation run: extract the tarball and run `git apply --check` on
+// the staged diff. No install, no tests — it answers one question quickly:
+// would the real apply accept this patch? Same workspace shape (exclusions)
+// as the full run so the verdict transfers.
+export function buildApplyCheckScript(excluded: string[]): string {
+  const dir = shQuote(REPO_WORKDIR);
+  const tar = shQuote(CHECKOUT_UPLOAD_PATH);
+  const diff = shQuote(DIFF_STAGING_PATH);
+  const rm =
+    excluded.length > 0 ? `rm -f ${excluded.map(shQuote).join(" ")}; ` : "";
+  return (
+    `set -e; rm -rf ${dir}; mkdir -p ${dir}; ` +
+    `tar -xf ${tar} -C ${dir}; cd ${dir}; ${rm}` +
+    `export DEBIAN_FRONTEND=noninteractive; apt-get update -qq && apt-get install -y -qq git >/dev/null 2>&1; ` +
+    `git apply --check ${diff}; echo ${CHECK_DONE_MARKER}`
+  );
+}
+
+export interface ApplyCheckOutcome {
+  passed: boolean;
+  timedOut: boolean;
+  // Bounded git output for the redraft prompt / evidence.
+  error: string;
+}
+
+// exit 0 (and reached the marker) is the only pass. Anything else —
+// nonzero, timeout, transport throw handled by the caller — is a fail.
+export function parseApplyCheckResult(result: {
+  exitCode: number | null;
+  stdout: string;
+  stderr: string;
+  timedOut: boolean;
+}): ApplyCheckOutcome {
+  const passed =
+    result.exitCode === 0 &&
+    !result.timedOut &&
+    result.stdout.includes(CHECK_DONE_MARKER);
+  const error = `${result.stdout}\n${result.stderr}`.slice(0, 2000).trim();
+  return { passed, timedOut: result.timedOut, error };
+}
+
+export interface GenerationAttempt {
+  attempt: 1 | 2;
+  source: "forge" | "forge-redraft" | "provided";
+  patchSha256: string | null;
+  patchBytes: number | null;
+  parseAccepted: boolean;
+  applyCheckPassed: boolean | null;
+}
+
+// Attempt records carry hashes and verdicts, never patch text or model
+// prose — safe to persist and cheap to compare.
+export function toAttemptRecord(input: {
+  attempt: 1 | 2;
+  source: "forge" | "forge-redraft" | "provided";
+  diff: string | null;
+  parseAccepted: boolean;
+  applyCheckPassed: boolean | null;
+}): GenerationAttempt {
+  return {
+    attempt: input.attempt,
+    source: input.source,
+    patchSha256:
+      input.diff === null ? null : createHash("sha256").update(input.diff).digest("hex"),
+    patchBytes: input.diff === null ? null : Buffer.byteLength(input.diff, "utf-8"),
+    parseAccepted: input.parseAccepted,
+    applyCheckPassed: input.applyCheckPassed,
+  };
+}
+
 // Rejected-draft diagnostics (Phase I instrumentation). When a Forge draft
 // carries no usable patch, the endpoint persists a SMALL, scrubbed preview
 // so the next classification is evidence-based instead of inferential.
@@ -94,11 +169,11 @@ function scrubSecrets(text: string): string {
     );
 }
 
-export function buildRejectedDraftPreview(draft: string): RejectedDraft {
+export function buildRejectedDraftPreview(draft: string, reason = "no usable patch"): RejectedDraft {
   return {
     draftRejected: true,
     draftPreview: scrubSecrets(draft).slice(0, DRAFT_PREVIEW_CHARS),
-    reason: "no usable patch",
+    reason,
   };
 }
 
