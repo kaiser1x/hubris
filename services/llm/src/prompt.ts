@@ -70,7 +70,20 @@ export function buildForgePrompt(ctx: ForgeContext): string {
     ctx.instruction?.trim() ||
       "Propose the single most valuable minimal fix for this codebase.",
     "",
-    "Respond with exactly three sections: 1) PATCH — a minimal unified diff, 2) TEST — a regression test that fails before and passes after, 3) WHY — two sentences maximum. Do not apply anything; this is a proposal only.",
+    "Respond with exactly three sections:",
+    "1) PATCH — exactly one complete unified Git diff, and nothing else inside its code fence.",
+    "The PATCH fence must contain ONLY the diff: no prose, no explanation, and never the target file mentioned only in a sentence.",
+    "Every hunk must carry full Git headers, exactly like this:",
+    "diff --git a/src/file.ts b/src/file.ts",
+    "--- a/src/file.ts",
+    "+++ b/src/file.ts",
+    "@@ -<old line>,<count> +<new line>,<count> @@",
+    "- old line",
+    "+ new line",
+    "The diff must pass `git apply --check patch.diff` verbatim.",
+    "2) TEST — a regression test that fails before and passes after.",
+    "3) WHY — two sentences maximum.",
+    "Do not apply anything; this is a proposal only.",
   ];
   return lines.filter((l) => l !== "").join("\n");
 }
