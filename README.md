@@ -143,6 +143,7 @@ hubris/
 | POST | `/api/checkout` `{ jobId, ref?, image? }` | Transfer job repo into a sandbox workspace (tarball upload + manifest verify) |
 | POST | `/api/install` `{ jobId, ref?, image?, manager? }` | Install repo deps in a sandbox (`--ignore-scripts`, lockfile-honoring) |
 | POST | `/api/run-tests` `{ jobId, ref?, image?, manager?, testCommand? }` | Run the repo's own test suite in an installed sandbox (exit 0 = PASS) |
+| POST | `/api/regression` `{ jobId, testContent XOR generate, ... }` | Write a regression test into the workspace and execute the suite |
 
 ### Page status
 
@@ -162,7 +163,9 @@ selector), `/investigate`, `/forge`. Demo narrative until sandbox lands:
   tarball upload, sha256 + file-count verified) into a sandbox workspace,
   and `POST /api/install` installs its dependencies there — always with
   `--ignore-scripts`, honoring lockfiles. `POST /api/run-tests` executes the
-  repo's own test command in the installed workspace (exit 0 = PASS). Exit codes, stdout/stderr, and
+  repo's own test command in the installed workspace (exit 0 = PASS), and
+  `POST /api/regression` writes a caller-provided or Nemotron-drafted
+  regression test into the workspace before running the suite. Exit codes, stdout/stderr, and
   manifests are stored as job evidence. Every run carries explicit
   timeout/wait/output caps (`HUBRIS_SANDBOX_*`, `HUBRIS_MAX_OUTPUT_BYTES`).
 
@@ -176,7 +179,7 @@ credentials — and its output is labeled: assessments are opinions, patches are
 
 ## Roadmap
 
-1. Autonomous reproduction on bug reports (hypothesis → repro → evidence)
+1. Controlled-bug FORGE loop (regress → patch → verify → VERIFIED states)
 2. Sandbox-backed `/verify` of forged patches against real checkouts
 2. Sandbox-backed `/verify` (apply proposal in sandbox, run tests, record)
 3. `/ship` evidence bundle from verified jobs

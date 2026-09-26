@@ -13,10 +13,13 @@ import { getDb, schema } from "@hubris/db";
 import {
   FORGE_SYSTEM,
   INVESTIGATE_SYSTEM,
+  REGRESSION_SYSTEM,
   buildForgePrompt,
   buildInvestigatePrompt,
+  buildRegressionPrompt,
   chatComplete,
   llmConfigFromEnv,
+  stripCodeFences,
 } from "@hubris/llm";
 import { createHash } from "crypto";
 import { buildRepoCheckoutCommand, executionLimitsFromEnv, isSafeGitRef, REPO_WORKDIR, runCommand, sandboxConfigFromEnv, uploadFile } from "@hubris/sandbox";
@@ -40,6 +43,12 @@ import {
   TEST_BEGIN_MARKER,
   testTimingFromEnv,
 } from "./testrun";
+import {
+  buildRegressionScript,
+  DEFAULT_REGRESSION_TEST_PATH,
+  isSafeTestPath,
+  REGRESSION_STAGING_PATH,
+} from "./regression";
 
 const execFileAsync = promisify(execFile);
 
@@ -118,6 +127,20 @@ const RunTestsBody = z.object({
   // Explicit test command (max 500 chars) for future agent use. When
   // omitted, package.json scripts.test from the clone is used.
   testCommand: z.string().min(1).max(500).optional(),
+});
+
+const RegressionBody = z.object({
+  jobId: z.string().min(1, "jobId is required"),
+  ref: GitRef.optional(),
+  image: z.string().max(200).optional(),
+  manager: z.enum(["pnpm", "npm"]).optional(),
+  testPath: z.string().max(200).optional(),
+  // Caller-provided test file content, or generate:true for a Nemotron
+  // draft grounded on the twin. Exactly one of the two is required.
+  testContent: z.string().min(1).max(8000).optional(),
+  generate: z.boolean().optional(),
+  focus: z.string().min(1).max(500).optional(),
+  instruction: z.string().max(2000).optional(),
 });
 
 function shortPath(p: string): string {
@@ -1135,6 +1158,237 @@ app.post("/api/run-tests", async (c: Context) => {
       })
       .where(eq(schema.jobs.id, job.id));
     return c.json({ jobId: job.id, testRun: entry });
+  } finally {
+    await fs.promises.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+// POST /api/regression - Write a regression test into a sandbox workspace
+// and execute the suite against it.
+// Body: { jobId, ref?, image?, manager?, testPath?, testContent XOR
+// generate, focus?, instruction? }. testContent is caller-provided test
+// file source; generate:true drafts it with Nemotron grounded on the job's
+// twin (focus required, the behavior to pin down). The file travels as a
+// second upload, is copied into the workspace after extraction, then the
+// suite runs (same install + TEST_BEGIN discipline as run-tests).
+// PASS = exit 0 without timeout. Evidence on job.result.regressions[].
+app.post("/api/regression", async (c: Context) => {
+  let rawBody: unknown;
+  try {
+    rawBody = await c.req.json();
+  } catch {
+    return c.json({ error: "Invalid JSON body", status: 400 }, 400);
+  }
+
+  const parsed = RegressionBody.safeParse(rawBody);
+  if (!parsed.success) {
+    return c.json({ error: "jobId is required", status: 400 }, 400);
+  }
+  const hasContent = parsed.data.testContent !== undefined;
+  const wantGenerate = parsed.data.generate ?? false;
+  if (hasContent === wantGenerate) {
+    return c.json(
+      { error: "Provide exactly one of testContent or generate", status: 400 },
+      400
+    );
+  }
+  if (wantGenerate && !parsed.data.focus?.trim()) {
+    return c.json({ error: "focus is required when generating", status: 400 }, 400);
+  }
+  const testPath = parsed.data.testPath ?? DEFAULT_REGRESSION_TEST_PATH;
+  if (!isSafeTestPath(testPath)) {
+    return c.json({ error: "Invalid testPath", status: 400 }, 400);
+  }
+
+  const db = getDb();
+  if (!db) {
+    return c.json({ error: "Job store unavailable", status: 503 }, 503);
+  }
+
+  const rows = await db.select().from(schema.jobs).where(eq(schema.jobs.id, parsed.data.jobId));
+  const job = rows[0];
+  if (!job) {
+    return c.json({ error: "Job not found", status: 404 }, 404);
+  }
+
+  // Draft the test before touching the sandbox so model failures never
+  // spend sandbox ops.
+  let testContent = parsed.data.testContent;
+  let generated = false;
+  if (wantGenerate) {
+    const result = job.result as {
+      repository?: { name?: string };
+      stats?: { functions: number; classes: number; endpoints: number; tests: number; relationships: number };
+      full?: {
+        functions?: Array<{ name?: string; path?: string; line?: number }>;
+      };
+    } | null;
+    if (job.status !== "complete" || !result?.stats || !result.full?.functions) {
+      return c.json({ error: "Job has no completed analysis", status: 400 }, 400);
+    }
+    const llm = llmConfigFromEnv();
+    if (!llm) {
+      return c.json({ error: "Model not configured", status: 503 }, 503);
+    }
+    const prompt = buildRegressionPrompt({
+      repoName: result.repository?.name ?? job.repoUrl,
+      stats: result.stats,
+      functions: result.full.functions.map((f) => ({
+        name: f.name ?? "(anonymous)",
+        file: f.path ?? "(unknown)",
+        line: f.line ?? 1,
+      })),
+      focus: parsed.data.focus!,
+      instruction: parsed.data.instruction,
+    });
+    let draft: string;
+    try {
+      draft = await chatComplete(
+        llm,
+        [
+          { role: "system", content: REGRESSION_SYSTEM },
+          { role: "user", content: prompt },
+        ],
+        { maxTokens: 1200, signal: AbortSignal.timeout(90000) }
+      );
+    } catch (error: any) {
+      console.error("Regression draft error:", error?.message);
+      return c.json({ error: "Model request failed", status: 502 }, 502);
+    }
+    const stripped = stripCodeFences(draft);
+    if (!stripped) {
+      return c.json({ error: "Model returned an empty test", status: 502 }, 502);
+    }
+    if (stripped.length > 8000) {
+      return c.json({ error: "Generated test exceeds size limits", status: 502 }, 502);
+    }
+    testContent = stripped;
+    generated = true;
+  }
+
+  const cloneUrl = toSafeCloneUrl(job.repoUrl);
+  if (!cloneUrl) {
+    return c.json({ error: "Job has unsupported repo URL", status: 400 }, 400);
+  }
+
+  const sandbox = sandboxConfigFromEnv();
+  if (!sandbox) {
+    return c.json({ error: "Sandbox not configured", status: 503 }, 503);
+  }
+
+  const limits = limitsFromEnv();
+  const execLimits = executionLimitsFromEnv();
+  const timing = testTimingFromEnv();
+  const ref = parsed.data.ref;
+  const tmp = await fs.promises.mkdtemp(path.join(os.tmpdir(), "hubris-regression-"));
+  try {
+    let staged;
+    try {
+      staged = await cloneAndArchive(cloneUrl, ref, tmp);
+    } catch (error: any) {
+      const step =
+        error?.message === "clone"
+          ? "clone"
+          : error?.message === "ls-files"
+            ? "listing"
+            : "archive";
+      return c.json({ error: `Repository ${step} failed`, status: 500 }, 500);
+    }
+    const { tarPath, tracked } = staged;
+    const excluded = tracked.filter(isTransferExcluded);
+    const expected = tracked.length - excluded.length;
+    if (expected <= 0) {
+      return c.json({ error: "Repository has no transferable files", status: 400 }, 400);
+    }
+    if (tracked.length > limits.maxFiles) {
+      return c.json(
+        { error: `Repository exceeds transfer limits (${tracked.length} files > ${limits.maxFiles})`, status: 413 },
+        413
+      );
+    }
+
+    const tarBytes = await fs.promises.readFile(tarPath);
+    if (tarBytes.length > limits.maxBytes) {
+      return c.json(
+        { error: `Repository exceeds transfer limits (${tarBytes.length} bytes > ${limits.maxBytes})`, status: 413 },
+        413
+      );
+    }
+    const localSha = createHash("sha256").update(tarBytes).digest("hex");
+
+    let uploaded;
+    let testUpload;
+    try {
+      uploaded = await uploadFile(sandbox, tarBytes, { timeoutMs: 60000 });
+      testUpload = await uploadFile(sandbox, new TextEncoder().encode(testContent!), {
+        timeoutMs: 60000,
+      });
+    } catch (error: any) {
+      console.error("Regression upload error:", error?.message);
+      return c.json({ error: "Sandbox upload failed", status: 502 }, 502);
+    }
+    if (uploaded.sha256 !== localSha) {
+      return c.json({ error: "Transfer integrity mismatch", status: 502 }, 502);
+    }
+
+    const detected = detectManager(tracked);
+    const manager: PackageManager = parsed.data.manager ?? detected ?? "pnpm";
+    const started = Date.now();
+    let result;
+    try {
+      result = await runCommand(sandbox, {
+        command: buildRegressionScript(manager, excluded, testPath),
+        image: parsed.data.image ?? "tag:node:20-slim",
+        files: {
+          [CHECKOUT_UPLOAD_PATH]: { uuid: uploaded.uuid },
+          [REGRESSION_STAGING_PATH]: { uuid: testUpload.uuid },
+        },
+        shell: true,
+        disposable: true,
+        timeout: timing.timeoutS,
+        truncateOutputAt: execLimits.maxOutputBytes,
+        waitMs: timing.waitMs,
+      });
+    } catch (error: any) {
+      console.error("Regression run error:", error?.message);
+      return c.json({ error: "Sandbox run failed", status: 502 }, 502);
+    }
+    const durationMs = Date.now() - started;
+
+    const phase = result.stdout.includes(TEST_BEGIN_MARKER) ? "test" : "install";
+    const passed = result.exitCode === 0 && !result.timedOut;
+    const entry = {
+      repoUrl: job.repoUrl,
+      ...(ref ? { ref } : {}),
+      manager,
+      testCommand: `${manager} test`,
+      testPath,
+      testBytes: new TextEncoder().encode(testContent!).length,
+      generated,
+      ...(generated && parsed.data.focus ? { focus: parsed.data.focus } : {}),
+      phase,
+      image: parsed.data.image ?? "tag:node:20-slim",
+      workspace: REPO_WORKDIR,
+      files: expected,
+      bytes: tarBytes.length,
+      sha256: localSha,
+      exitCode: result.exitCode,
+      timedOut: result.timedOut,
+      passed,
+      durationMs,
+      stdout: result.stdout.slice(0, 4000),
+      stderr: result.stderr.slice(0, 4000),
+      at: new Date().toISOString(),
+    };
+    const prior = (job.result as { regressions?: unknown[] } | null)?.regressions ?? [];
+    await db
+      .update(schema.jobs)
+      .set({
+        result: { ...(job.result as object), regressions: [...prior, entry] },
+        updatedAt: new Date(),
+      })
+      .where(eq(schema.jobs.id, job.id));
+    return c.json({ jobId: job.id, regression: entry });
   } finally {
     await fs.promises.rm(tmp, { recursive: true, force: true });
   }

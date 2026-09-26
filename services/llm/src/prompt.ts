@@ -77,3 +77,39 @@ export function buildForgePrompt(ctx: ForgeContext): string {
 
 export const FORGE_SYSTEM =
   "You are HUBRIS, a careful patch author. Propose minimal, surgical changes grounded in the provided codebase summary. Never claim a fix is verified.";
+
+export interface RegressionContext {
+  repoName: string;
+  stats: TwinSummary["stats"];
+  functions: ForgeFunction[];
+  // What behavior the test must pin down (e.g. "duplicate idempotency keys
+  // are rejected"). Required: a test without a target is not a regression.
+  focus: string;
+  instruction?: string;
+}
+
+// Strip markdown code fences models love to wrap output in. Returns the
+// inner content trimmed; untouched when no fences are present. Never throws.
+export function stripCodeFences(text: string): string {
+  const m = text.match(/^```(?:\w+)?\s*\n([\s\S]*?)\n?```\s*$/);
+  return (m ? m[1] : text).trim();
+}
+
+export function buildRegressionPrompt(ctx: RegressionContext): string {
+  const fnLines = ctx.functions
+    .slice(0, 40)
+    .map((f) => `- ${f.name} (${f.file}:${f.line})`);
+  const lines = [
+    `Repository: ${ctx.repoName}`,
+    `Functions: ${ctx.stats.functions}, Classes: ${ctx.stats.classes}, Endpoints: ${ctx.stats.endpoints}, Tests: ${ctx.stats.tests}, Relationships: ${ctx.stats.relationships}`,
+    `Functions:\n${fnLines.join("\n") || "(none)"}`,
+    `Target behavior: ${ctx.focus.trim()}`,
+    ctx.instruction?.trim() ? `Additional instruction: ${ctx.instruction.trim()}` : "",
+    "",
+    "Write ONE Vitest test file that pins down the target behavior. Import from the relative paths shown above. Use only functions and files listed above — do not invent paths. Output ONLY the test file content: no markdown fences, no explanation.",
+  ];
+  return lines.filter((l) => l !== "").join("\n");
+}
+
+export const REGRESSION_SYSTEM =
+  "You are HUBRIS, a precise regression-test author. Write a single focused Vitest test grounded in the provided codebase summary. Output only code.";
