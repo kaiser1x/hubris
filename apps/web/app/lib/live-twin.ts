@@ -57,6 +57,11 @@ export interface LiveJobResult {
     tests: LiveTest[];
     relationships: LiveRelationship[];
   };
+  // Persisted Forge evidence. Unknown by design: the forge-run mapper
+  // validates every entry before display, so the page never renders
+  // unvalidated backend shapes.
+  forgeRuns?: unknown[];
+  draftRejections?: unknown[];
 }
 
 export interface LiveJob {
@@ -245,6 +250,18 @@ export async function fetchLatestJob(repoUrl?: string): Promise<LiveJob | null> 
     );
   } catch {
     return null;
+  }
+}
+
+// Recent jobs for Forge evidence selection. One load, caller-triggered
+// refresh only — never polled. Returns [] on any failure so the page can
+// render its empty state instead of hanging.
+export async function fetchRecentJobs(limit = 10): Promise<LiveJob[]> {
+  try {
+    const params = new URLSearchParams({ limit: String(limit) });
+    return await fetchJobs(`/api/jobs?${params}`);
+  } catch {
+    return [];
   }
 }
 

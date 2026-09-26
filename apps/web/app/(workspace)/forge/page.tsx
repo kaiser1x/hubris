@@ -2,8 +2,19 @@
 
 import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
+import ForgeRunPanel from "../../components/ForgeRunPanel";
 import { FORGE } from "../../lib/casefile";
-import { fetchLatestJob, liveRepoName } from "../../lib/live-twin";
+import {
+  fetchLatestJob,
+  fetchRecentJobs,
+  liveRepoName,
+  type LiveJob,
+} from "../../lib/live-twin";
+import {
+  resolveForgeRuns,
+  selectForgeEvidenceJob,
+  type ForgeRunView,
+} from "../../lib/forge-run";
 
 interface LiveProposal {
   repo: string;
@@ -28,6 +39,30 @@ export default function ForgePage() {
   const [verifying, setVerifying] = useState(false);
   const [verification, setVerification] = useState<LiveVerification | null>(null);
   const [verifyError, setVerifyError] = useState<string | null>(null);
+  const [runs, setRuns] = useState<ForgeRunView[] | null>(null);
+  const [runsJob, setRunsJob] = useState<string | null>(null);
+  const [runsChecked, setRunsChecked] = useState(false);
+
+  const loadRuns = useCallback(async () => {
+    setRunsChecked(false);
+    try {
+      const jobs = await fetchRecentJobs(10);
+      const evidence = selectForgeEvidenceJob(jobs);
+      if (!evidence || typeof evidence !== "object") {
+        setRuns([]);
+        setRunsJob(null);
+      } else {
+        const job = evidence as LiveJob;
+        setRuns(resolveForgeRuns(evidence).slice().reverse());
+        setRunsJob(`${liveRepoName(job)} · ${job.id.slice(0, 8)}`);
+      }
+    } catch {
+      setRuns([]);
+      setRunsJob(null);
+    } finally {
+      setRunsChecked(true);
+    }
+  }, []);
 
   const forge = useCallback(async (id: string, repo: string, focusValue: string) => {
     setForging(true);
@@ -58,6 +93,7 @@ export default function ForgePage() {
   useEffect(() => {
     let cancelled = false;
     (async () => {
+      await loadRuns();
       const job = await fetchLatestJob();
       if (!job || cancelled) return;
       const repo = liveRepoName(job);
@@ -69,7 +105,7 @@ export default function ForgePage() {
     return () => {
       cancelled = true;
     };
-  }, [forge]);
+  }, [forge, loadRuns]);
 
   async function verifyInSandbox() {
     if (!jobId || verifying) return;
@@ -97,6 +133,8 @@ export default function ForgePage() {
           exitCode: typeof run.verification?.exitCode === "number" ? run.verification.exitCode : null,
           passed: Boolean(run.verified),
         });
+        // Explicit refresh only — the new run is now persisted evidence.
+        await loadRuns();
       }
     } catch {
       setVerifyError("Analysis service unreachable. Is the API running?");
@@ -212,6 +250,48 @@ export default function ForgePage() {
           </div>
         </section>
       )}
+
+      <section className="mt-10">
+        <div className="flex flex-col sm:flex-row sm:items-center gap-3">
+          <p className="kicker">
+            Persisted Forge runs{runsJob ? ` · ${runsJob}` : ""}
+          </p>
+          <button
+            type="button"
+            onClick={() => void loadRuns()}
+            disabled={!runsChecked}
+            className="sm:ml-auto shrink-0 bg-white border border-[#0A0A0A] font-mono text-[11px] tracking-[0.08em] px-4 py-2.5 hover:bg-white/60 active:scale-[0.98] disabled:opacity-40 disabled:cursor-not-allowed transition-all"
+          >
+            REFRESH EVIDENCE
+          </button>
+        </div>
+        <p className="font-mono text-[11px] text-[#7A7171] mt-3 leading-6">
+          Controlled demo · kaiser1x/ts-js-dummy · bug: duplicate idempotency
+          keys processed instead of rejected · fix: restore the duplicate-key
+          guard, preserve the existing error message · verification: pnpm test
+          · expected: 13 / 13 PASS
+        </p>
+        {!runsChecked ? (
+          <p className="font-mono text-[13px] text-[#7A7171] mt-4">
+            Loading persisted Forge evidence…
+          </p>
+        ) : !runs || runs.length === 0 ? (
+          <div className="border border-[#dedada] bg-white/60 px-5 py-5 mt-4">
+            <p className="kicker">No Forge runs yet</p>
+            <p className="font-mono text-[12px] mt-3 leading-6">
+              Nothing has been forged against this job. Run VERIFY IN SANDBOX
+              above, or trigger a structured run — its persisted evidence will
+              appear here with the full stage trail.
+            </p>
+          </div>
+        ) : (
+          <div className="grid gap-6 mt-4">
+            {runs.map((run) => (
+              <ForgeRunPanel key={run.id} run={run} />
+            ))}
+          </div>
+        )}
+      </section>
 
       <div className="grid gap-10 mt-10 lg:grid-cols-2">
         <div>
