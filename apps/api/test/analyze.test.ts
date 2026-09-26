@@ -315,3 +315,44 @@ describe("toSafeCloneUrl", () => {
     expect(toSafeCloneUrl(raw)).toBeNull();
   });
 });
+
+describe("POST /api/analyze ref validation", () => {
+  it("returns 400 for an unsafe ref", async () => {
+    const res = await app.request("/api/analyze", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        repoUrl: "https://github.com/kaiser1x/ts-js-dummy",
+        ref: "bad;rm -rf",
+      }),
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it("returns 400 for an overlong ref", async () => {
+    const res = await app.request("/api/analyze", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        repoUrl: "https://github.com/kaiser1x/ts-js-dummy",
+        ref: "a".repeat(101),
+      }),
+    });
+    expect(res.status).toBe(400);
+  });
+});
+
+describe("POST /api/forge-structured ref validation", () => {
+  it("returns 400 for an unsafe caller ref override", async () => {
+    const res = await app.request("/api/forge-structured", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        jobId: "00000000-0000-0000-0000-000000000000",
+        focus: "do things",
+        ref: "bad;rm -rf",
+      }),
+    });
+    expect(res.status).toBe(400);
+  });
+});

@@ -13,7 +13,7 @@
 import { execFile } from "child_process";
 import { promisify } from "util";
 import { z } from "zod";
-import { REPO_WORKDIR } from "@hubris/sandbox";
+import { isSafeGitRef, REPO_WORKDIR } from "@hubris/sandbox";
 import { CHECKOUT_UPLOAD_PATH } from "./checkout";
 import { INSTALL_COMMANDS, type PackageManager } from "./install";
 import { VERIFY_BEGIN_MARKER } from "./forgeverify";
@@ -70,6 +70,18 @@ export interface SourceExcerpt {
   function: string;
   lines: string;
   text: string;
+}
+
+// Resolve the revision a Forge run must check out: the job's persisted
+// analyzed ref (result.ref, written by POST /api/analyze when it cloned
+// with --branch). Returns null for legacy jobs analyzed before ref
+// persistence or with an unsafe value — callers then keep the previous
+// default-branch behavior explicitly, never a fabricated ref.
+export function resolveJobRef(result: unknown): string | null {
+  if (typeof result !== "object" || result === null) return null;
+  const ref = (result as { ref?: unknown }).ref;
+  if (typeof ref !== "string" || ref.length === 0 || ref.length > 100) return null;
+  return isSafeGitRef(ref) ? ref : null;
 }
 
 async function blobLines(src: string, filePath: string): Promise<string[] | null> {
@@ -176,14 +188,22 @@ function shQuote(s: string): string {
 
 export const EDIT_OK_MARKER = "EDIT_OK";
 export const CANONICAL_MARKER = "CANONICAL_SHA";
+export const SOURCE_REF_MARKER = "SOURCE_REF";
+export const SOURCE_SHA_MARKER = "SOURCE_SHA";
 
 // Full structured run: extract, baseline-commit, mechanical apply,
 // canonical diff + both git checks, install, verification command.
 // Canonical diff is machine-generated (git diff), never model-written.
+// The expected source revision (resolved server-side from the job) is
+// echoed back as markers so the outcome can prove the sandbox executed
+// the intended command uncorrupted. File provenance itself rests on the
+// tarball sha256 + file-count checks; these markers are command-integrity
+// evidence, not a substitute for them.
 export function buildStructuredScript(
   manager: PackageManager,
   excluded: string[],
-  verifyInvoke: string
+  verifyInvoke: string,
+  expected: { ref: string | null; sha: string | null } = { ref: null, sha: null }
 ): string {
   const dir = shQuote(REPO_WORKDIR);
   const tar = shQuote(CHECKOUT_UPLOAD_PATH);
@@ -199,6 +219,7 @@ export function buildStructuredScript(
     `git init -q; git config user.email t@t; git config user.name t; git add -A; git commit -qm base; ` +
     `node ${validator} ${dir} ${edits}; ` +
     `git diff > /tmp/canonical.patch; echo ${CANONICAL_MARKER} $(sha256sum /tmp/canonical.patch | cut -d' ' -f1) $(wc -c < /tmp/canonical.patch); ` +
+    `echo ${SOURCE_REF_MARKER} ${shQuote(expected.ref ?? "")}; echo ${SOURCE_SHA_MARKER} ${shQuote(expected.sha ?? "")}; ` +
     `git diff --check; ` +
     `git stash -q; git apply --check /tmp/canonical.patch; git stash pop -q; ` +
     `echo PATCH_OK; ` +
@@ -213,6 +234,39 @@ export interface StructuredRunOutcome {
   verifyBegin: boolean;
   canonicalSha: string | null;
   canonicalBytes: number | null;
+}
+
+export interface StructuredSourceMarkers {
+  ref: string | null;
+  sha: string | null;
+}
+
+// Parse the echoed source-revision markers. A present-but-empty marker
+// yields "" (legacy jobs genuinely have no ref); an ABSENT marker yields
+// null (never fabricated). The match check below is fail-closed on nulls.
+export function parseSourceMarkers(stdout: string): StructuredSourceMarkers {
+  const refMatch = stdout.match(new RegExp(`^${SOURCE_REF_MARKER} (.*)$`, "m"));
+  const shaMatch = stdout.match(new RegExp(`^${SOURCE_SHA_MARKER} (.*)$`, "m"));
+  return {
+    ref: refMatch ? refMatch[1].trim() : null,
+    sha: shaMatch ? shaMatch[1].trim() : null,
+  };
+}
+
+// The sandbox executed the intended revision command when the echoed
+// markers equal the server-resolved expectation. Fail-closed: absent
+// markers never match, even when both sides are empty.
+export function sourceMarkersMatch(
+  stdout: string,
+  expectedRef: string | null,
+  expectedSha: string | null
+): boolean {
+  if (!stdout.includes(`${SOURCE_REF_MARKER} `) || !stdout.includes(`${SOURCE_SHA_MARKER} `)) {
+    return false;
+  }
+  const got = parseSourceMarkers(stdout);
+  if (got.ref === null || got.sha === null) return false;
+  return got.ref === (expectedRef ?? "") && got.sha === (expectedSha ?? "");
 }
 
 // Markers only: PATCH_OK prints after the canonical checks pass, before

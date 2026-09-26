@@ -66,7 +66,10 @@ import {
   buildStructuredScript,
   EditPlanSchema,
   isSupportedEditPath,
+  parseSourceMarkers,
   parseStructuredRun,
+  resolveJobRef,
+  sourceMarkersMatch,
   STRUCTURED_UPLOAD_EDITS,
   STRUCTURED_UPLOAD_VALIDATOR,
   VALIDATOR_JS,
@@ -826,6 +829,7 @@ app.post("/api/checkout", async (c: Context) => {
 
   const limits = limitsFromEnv();
   const execLimits = executionLimitsFromEnv();
+  const timing = testTimingFromEnv();
   const ref = parsed.data.ref;
   const tmp = await fs.promises.mkdtemp(path.join(os.tmpdir(), "hubris-checkout-"));
   try {
@@ -2119,7 +2123,18 @@ app.post("/api/forge-structured", async (c: Context) => {
   const limits = limitsFromEnv();
   const execLimits = executionLimitsFromEnv();
   const timing = testTimingFromEnv();
-  const ref = parsed.data.ref;
+  // Revision consistency: an explicit caller ref wins (same allow-list as
+  // analysis); otherwise the job's persisted analyzed ref is authoritative
+  // — never a silent default-branch fallback for a ref-pinned job. Legacy
+  // jobs without any ref keep the previous default-branch behavior, and
+  // the evidence says so explicitly.
+  const jobRef = resolveJobRef(job.result);
+  const ref = parsed.data.ref ?? jobRef ?? undefined;
+  const refSource = parsed.data.ref
+    ? ("requested" as const)
+    : jobRef
+      ? ("job" as const)
+      : ("default" as const);
   const image = parsed.data.image ?? "tag:node:20-slim";
   const runId = crypto.randomUUID();
   const startedAt = new Date().toISOString();
@@ -2159,6 +2174,16 @@ app.post("/api/forge-structured", async (c: Context) => {
       return c.json({ error: `Repository ${step} failed`, status: 500 }, 500);
     }
     const { src, tarPath, tracked } = staged;
+    // Exact analyzed revision, bound locally: the ref resolved above plus
+    // the commit it resolved to. Both land on every persisted entry below.
+    const commitSha = staged.commitSha ?? null;
+    const sourceEvidence = {
+      repoUrl: cloneUrl,
+      ref: ref ?? null,
+      refSource,
+      commitSha,
+      tarballSha256: null as string | null,
+    };
     const excluded = tracked.filter(isTransferExcluded);
     const expected = tracked.length - excluded.length;
     if (expected <= 0) {
@@ -2295,6 +2320,8 @@ app.post("/api/forge-structured", async (c: Context) => {
         status,
         history,
         generation,
+        source: { ...sourceEvidence, tarballSha256: localSha },
+        sandboxSource: null,
         canonicalPatch: null,
         validation: null,
         apply: { applied: false },
@@ -2376,7 +2403,10 @@ app.post("/api/forge-structured", async (c: Context) => {
     let result;
     try {
       result = await runCommand(sandbox, {
-        command: buildStructuredScript(manager, excluded, verifyInvoke),
+        command: buildStructuredScript(manager, excluded, verifyInvoke, {
+          ref: ref ?? null,
+          sha: commitSha,
+        }),
         image,
         files: {
           [CHECKOUT_UPLOAD_PATH]: { uuid: uploaded.uuid },
@@ -2399,8 +2429,19 @@ app.post("/api/forge-structured", async (c: Context) => {
     // sandbox run; edit/apply/verify states follow their markers.
     const outcome = parseStructuredRun(result.stdout);
     history.push({ state: "PATCH_VALIDATING", at: stamp() });
+    // Source-revision gate: the sandbox must echo the exact revision the
+    // server resolved. A mismatch (or missing markers) stops the lifecycle
+    // BEFORE patch attribution — nothing is applied to the wrong revision.
+    const echoed = parseSourceMarkers(result.stdout);
+    const sandboxSource = {
+      ref: echoed.ref,
+      sha: echoed.sha,
+      matched: sourceMarkersMatch(result.stdout, ref ?? null, commitSha),
+    };
     let status: string;
-    if (!outcome.editOk) {
+    if (!sandboxSource.matched) {
+      status = "SOURCE_MISMATCH";
+    } else if (!outcome.editOk) {
       status =
         outcome.editCategory === "ambiguous"
           ? "AMBIGUOUS_EDIT"
@@ -2424,11 +2465,17 @@ app.post("/api/forge-structured", async (c: Context) => {
       });
     }
     history.push({ state: status, at: stamp() });
+    // A revision mismatch voids all patch attribution: the workspace cannot
+    // be proven to be the analyzed revision, so no apply/verify outcome
+    // from it is admissible as evidence.
+    const revisionOk = status !== "SOURCE_MISMATCH";
     const entry = {
       id: runId,
       status,
       history,
       generation,
+      source: { ...sourceEvidence, tarballSha256: localSha },
+      sandboxSource,
       canonicalPatch:
         outcome.canonicalSha === null
           ? null
@@ -2441,11 +2488,11 @@ app.post("/api/forge-structured", async (c: Context) => {
         canonicalPresent: outcome.canonicalSha !== null,
         patchValidated: outcome.patchOk,
       },
-      apply: { applied: outcome.patchOk },
+      apply: { applied: revisionOk && outcome.patchOk },
       // Verification evidence exists only when the verify command actually
       // started (marker seen). An install failure ends FAILED with null
       // verification rather than attributing install output to the command.
-      verification: outcome.verifyBegin
+      verification: revisionOk && outcome.verifyBegin
         ? {
             command: verifyInvoke,
             commandSource,

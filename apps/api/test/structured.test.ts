@@ -9,9 +9,14 @@ import {
   isSupportedEditPath,
   buildSourceExcerpts,
   buildStructuredScript,
+  parseSourceMarkers,
   parseStructuredRun,
+  resolveJobRef,
+  sourceMarkersMatch,
   EDIT_OK_MARKER,
   CANONICAL_MARKER,
+  SOURCE_REF_MARKER,
+  SOURCE_SHA_MARKER,
 } from "../src/structured";
 
 const exec = promisify(execFile);
@@ -172,5 +177,61 @@ describe("buildSourceExcerpts", () => {
     } finally {
       await fs.promises.rm(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("resolveJobRef", () => {
+  it("returns the persisted analyzed ref", () => {
+    expect(resolveJobRef({ ref: "hubris/buggy-idempotency" })).toBe(
+      "hubris/buggy-idempotency"
+    );
+  });
+
+  it.each([[null], [undefined], [{}], [{ ref: null }], [{ ref: "" }], [{ ref: 42 }]])(
+    "returns null for legacy/missing ref: %s",
+    (result) => {
+      expect(resolveJobRef(result)).toBeNull();
+    }
+  );
+
+  it.each([["a;b"], ["--upload-pack=x"], ["../escape"], ["a".repeat(101)]])(
+    "rejects unsafe ref %s",
+    (ref) => {
+      expect(resolveJobRef({ ref })).toBeNull();
+    }
+  );
+});
+
+describe("source revision markers", () => {
+  const REF = "hubris/buggy-idempotency";
+  const SHA = "2".repeat(40);
+
+  it("script echoes the expected revision as markers", () => {
+    const cmd = buildStructuredScript("pnpm", [], "pnpm test", { ref: REF, sha: SHA });
+    expect(cmd).toContain(`${SOURCE_REF_MARKER} '${REF}'`);
+    expect(cmd).toContain(`${SOURCE_SHA_MARKER} '${SHA}'`);
+  });
+
+  it("matching markers prove the sandbox ran the intended command", () => {
+    const out = [`${SOURCE_REF_MARKER} ${REF}`, `${SOURCE_SHA_MARKER} ${SHA}`].join("\n");
+    expect(parseSourceMarkers(out)).toEqual({ ref: REF, sha: SHA });
+    expect(sourceMarkersMatch(out, REF, SHA)).toBe(true);
+  });
+
+  it("wrong ref or sha never matches", () => {
+    const out = [`${SOURCE_REF_MARKER} main`, `${SOURCE_SHA_MARKER} ${SHA}`].join("\n");
+    expect(sourceMarkersMatch(out, REF, SHA)).toBe(false);
+    const out2 = [`${SOURCE_REF_MARKER} ${REF}`, `${SOURCE_SHA_MARKER} ${"3".repeat(40)}`].join("\n");
+    expect(sourceMarkersMatch(out2, REF, SHA)).toBe(false);
+  });
+
+  it("missing markers fail closed, even for legacy empty expectations", () => {
+    expect(sourceMarkersMatch("EDIT_OK 1", null, null)).toBe(false);
+    expect(sourceMarkersMatch("", REF, SHA)).toBe(false);
+  });
+
+  it("legacy empty expectations match empty echoes", () => {
+    const out = [`${SOURCE_REF_MARKER} `, `${SOURCE_SHA_MARKER} `].join("\n");
+    expect(sourceMarkersMatch(out, null, null)).toBe(true);
   });
 });

@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, afterEach, beforeAll, afterAll } from "vitest";
+import { describe, it, expect, vi, afterEach, beforeAll, afterAll, beforeEach } from "vitest";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
@@ -13,6 +13,8 @@ const exec = promisify(execFile);
 // everything else hermetic.
 const store = vi.hoisted(() => ({
   draftPlan: "",
+  jobRef: undefined as string | undefined,
+  cloneCalls: [] as Array<{ url: string; ref: string | undefined }>,
   updates: [] as Array<{
     result?: {
       forgeRuns?: Array<Record<string, unknown>>;
@@ -39,6 +41,7 @@ vi.mock("@hubris/db", async (importOriginal) => {
     status: "complete",
     result: {
       repository: { name: "kaiser1x/ts-js-dummy" },
+      ...(store.jobRef ? { ref: store.jobRef } : {}),
       stats: { functions: 1, classes: 0, endpoints: 0, tests: 0, relationships: 0 },
       full: { functions: [{ name: "x", path: "src/a.ts", line: 1 }] },
     },
@@ -71,11 +74,15 @@ vi.mock("../src/checkout", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../src/checkout")>();
   return {
     ...actual,
-    cloneAndArchive: async () => ({
-      src: FIXTURE.dir,
-      tarPath: FIXTURE.tar,
-      tracked: ["src/a.ts", "package.json"],
-    }),
+    cloneAndArchive: async (url: string, ref: string | undefined) => {
+      store.cloneCalls.push({ url, ref });
+      return {
+        src: FIXTURE.dir,
+        tarPath: FIXTURE.tar,
+        tracked: ["src/a.ts", "package.json"],
+        commitSha: "2".repeat(40),
+      };
+    },
   };
 });
 
@@ -221,5 +228,123 @@ describe("POST /api/forge-structured (mocked model, fixture repo)", () => {
     // local gate (schema, paths, exact match) and reached staging.
     expect(res.status).toBe(502);
     expect(uploadFile).toHaveBeenCalled();
+  });
+});
+
+describe("POST /api/forge-structured source revision (mocked clone/sandbox)", () => {
+  const JOB_REF = "hubris/buggy-idempotency";
+  const COMMIT = "2".repeat(40);
+  const CANON = "a".repeat(64);
+  const MATCHING_PLAN = plan([
+    { path: "src/a.ts", oldText: "foo();\nfoo();", newText: "bar();\nbar();" },
+  ]);
+  const MISSING_PLAN = plan([
+    { path: "src/a.ts", oldText: "missing();", newText: "y();" },
+  ]);
+
+  async function tarSha(): Promise<string> {
+    const { createHash } = await import("crypto");
+    return createHash("sha256").update("dummy-tarball-bytes").digest("hex");
+  }
+
+  function sandboxSuccess(stdout: string) {
+    return vi.mocked(runCommand).mockResolvedValueOnce({
+      exitCode: 0,
+      stdout,
+      stderr: "",
+      timedOut: false,
+    });
+  }
+
+  // Reset hooks for this block: hermetic per test, no leakage into the
+  // shared boom defaults relied upon by earlier describes.
+  beforeEach(async () => {
+    store.jobRef = undefined;
+    store.cloneCalls = [];
+    store.updates = [];
+    vi.mocked(runCommand).mockReset();
+    vi.mocked(uploadFile).mockReset();
+    const sha = await tarSha();
+    vi.mocked(uploadFile).mockImplementation(async () => ({ uuid: "u", sha256: sha }));
+  });
+
+  it("1. job ref flows to checkout when the caller omits ref", async () => {
+    stubCreds();
+    store.jobRef = JOB_REF;
+    store.draftPlan = MISSING_PLAN;
+    const res = await postStructured({ focus: "do things" });
+    expect(res.status).toBe(200);
+    expect(store.cloneCalls.at(-1)).toEqual({
+      url: "https://github.com/kaiser1x/ts-js-dummy.git",
+      ref: JOB_REF,
+    });
+    expect(lastRun().status).toBe("EDIT_CONTEXT_MISMATCH");
+  });
+
+  it("2. explicit caller ref overrides the job ref", async () => {
+    stubCreds();
+    store.jobRef = JOB_REF;
+    store.draftPlan = MISSING_PLAN;
+    const res = await postStructured({ focus: "do things", ref: "main" });
+    expect(res.status).toBe(200);
+    expect(store.cloneCalls.at(-1)?.ref).toBe("main");
+  });
+
+  it("3. legacy job without ref keeps default-branch checkout + explicit evidence", async () => {
+    stubCreds();
+    store.draftPlan = MISSING_PLAN;
+    const res = await postStructured({ focus: "do things" });
+    expect(res.status).toBe(200);
+    expect(store.cloneCalls.at(-1)?.ref).toBeUndefined();
+    const run = lastRun();
+    expect(run.status).toBe("EDIT_CONTEXT_MISMATCH");
+    expect(run.source).toMatchObject({ ref: null, commitSha: COMMIT });
+  });
+
+  it("4. sandbox revision mismatch stops before patch attribution", async () => {
+    stubCreds();
+    store.jobRef = JOB_REF;
+    store.draftPlan = MATCHING_PLAN;
+    sandboxSuccess(
+      ["EDIT_OK 1", `CANONICAL_SHA ${CANON} 10`, `SOURCE_REF main`, `SOURCE_SHA ${COMMIT}`, "PATCH_OK", "VERIFY_BEGIN"].join("\n")
+    );
+    const res = await postStructured({ focus: "do things" });
+    expect(res.status).toBe(200);
+    const run = lastRun();
+    expect(run.status).toBe("SOURCE_MISMATCH");
+    expect(run.apply).toEqual({ applied: false });
+    expect(run.verification).toBeNull();
+    expect(run.sandboxSource).toMatchObject({ ref: "main", matched: false });
+    expect(run.verified).toBe(false);
+  });
+
+  it("5. matching revision carries full source evidence on success", async () => {
+    stubCreds();
+    store.jobRef = JOB_REF;
+    store.draftPlan = MATCHING_PLAN;
+    sandboxSuccess(
+      ["EDIT_OK 1", `CANONICAL_SHA ${CANON} 10`, `SOURCE_REF ${JOB_REF}`, `SOURCE_SHA ${COMMIT}`, "PATCH_OK", "VERIFY_BEGIN"].join("\n")
+    );
+    const res = await postStructured({ focus: "do things" });
+    expect(res.status).toBe(200);
+    const run = lastRun();
+    expect(run.status).toBe("VERIFIED");
+    expect(run.source).toMatchObject({ ref: JOB_REF, refSource: "job", commitSha: COMMIT });
+    expect(run.sandboxSource).toMatchObject({ ref: JOB_REF, sha: COMMIT, matched: true });
+  });
+
+  it("6. each run keeps its own revision", async () => {
+    stubCreds();
+    store.draftPlan = MISSING_PLAN;
+    store.jobRef = "hubris/buggy-idempotency";
+    await postStructured({ focus: "first" });
+    store.jobRef = "main";
+    await postStructured({ focus: "second" });
+    const runs = store.updates.flatMap((u) => u.result?.forgeRuns ?? []);
+    expect(runs).toHaveLength(2);
+    expect((runs[0] as Record<string, unknown>).source).toMatchObject({
+      ref: "hubris/buggy-idempotency",
+    });
+    expect((runs[1] as Record<string, unknown>).source).toMatchObject({ ref: "main" });
   });
 });

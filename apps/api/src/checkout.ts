@@ -97,6 +97,10 @@ export interface StagedRepo {
   src: string;
   tarPath: string;
   tracked: string[];
+  // Commit the checked-out ref resolved to (git rev-parse HEAD in the
+  // clone). Binds ref → exact revision for downstream evidence. Null when
+  // unresolvable — never fabricated.
+  commitSha: string | null;
 }
 
 // Clone + list + archive under tmp. Never executes repo code — pure git
@@ -143,5 +147,15 @@ export async function cloneAndArchive(
   } catch {
     throw new Error("archive");
   }
-  return { src, tarPath, tracked };
+  let commitSha: string | null = null;
+  try {
+    const rev = await execFileAsync("git", ["-C", src, "rev-parse", "HEAD"], {
+      timeout: 30000,
+    });
+    const sha = rev.stdout.trim();
+    if (/^[a-f0-9]{40}$/.test(sha)) commitSha = sha;
+  } catch {
+    commitSha = null;
+  }
+  return { src, tarPath, tracked, commitSha };
 }

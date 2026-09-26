@@ -15,6 +15,7 @@ export type ForgeOutcome =
   | "VERIFICATION_TIMEOUT"
   | "APPLY_FAILED"
   | "VALIDATION_FAILED"
+  | "SOURCE_MISMATCH"
   | "UNKNOWN";
 
 export interface ForgeStep {
@@ -57,6 +58,16 @@ export interface ForgeRunView {
   patchBytes: number | null;
   patchShaShort: string | null;
   applyApplied: boolean;
+  // Source-revision provenance. Nulls mean legacy evidence that predates
+  // revision tracking — rendered as "—", never backfilled.
+  source: {
+    ref: string | null;
+    refSource: string | null;
+    commitSha: string | null;
+    sandboxRef: string | null;
+    sandboxSha: string | null;
+    sandboxMatched: boolean | null;
+  };
   sandbox: {
     image: string | null;
     manager: string | null;
@@ -119,6 +130,21 @@ function shortSha(sha: unknown): string | null {
   return `${sha.slice(0, 12)}…`;
 }
 
+export function shortCommit(sha: unknown): string | null {
+  if (typeof sha !== "string" || !/^[a-f0-9]{40}$/.test(sha)) return null;
+  return `${sha.slice(0, 12)}…`;
+}
+
+// The analyzed revision of a job, for display. Reads the persisted
+// result.ref written by POST /api/analyze — the same value the backend
+// resolves for checkout. Null for legacy/default-branch jobs.
+export function jobSourceRef(job: unknown): string | null {
+  if (!isRecord(job)) return null;
+  const result = isRecord(job.result) ? job.result : null;
+  const ref = result ? asString(result.ref) : null;
+  return ref && ref.length <= 200 ? ref : null;
+}
+
 function verifyResult(timedOut: boolean, exitCode: number | null, passed: boolean): VerifyResult {
   if (timedOut) return "FAIL";
   if (exitCode === null) return "NOT RUN";
@@ -140,6 +166,8 @@ function outcomeFor(status: string, timedOut: boolean): ForgeOutcome {
     case "PATH_REJECTED":
     case "PATCH_VALIDATION_FAILED":
       return "VALIDATION_FAILED";
+    case "SOURCE_MISMATCH":
+      return "SOURCE_MISMATCH";
     default:
       return "UNKNOWN";
   }
@@ -230,6 +258,12 @@ export function toForgeRunView(raw: unknown, number: number): ForgeRunView | nul
   const exitCode = asNumber(ver?.exitCode);
   const passed = ver?.passed === true;
   const verified = status === "VERIFIED";
+  // Source-revision provenance (Phase K). Absent on legacy entries —
+  // preserved as nulls, never backfilled.
+  const source = isRecord(raw.source) ? raw.source : null;
+  const sandboxSource = isRecord(raw.sandboxSource) ? raw.sandboxSource : null;
+  const sandboxMatched =
+    typeof sandboxSource?.matched === "boolean" ? sandboxSource.matched : null;
   // Started means the verification command itself began. A diff-run exit
   // code without VERIFYING in the trail belongs to an earlier phase (apply
   // or install) — it must not be presented as a verification result.
@@ -278,6 +312,14 @@ export function toForgeRunView(raw: unknown, number: number): ForgeRunView | nul
     patchBytes,
     patchShaShort,
     applyApplied: applied,
+    source: {
+      ref: asString(source?.ref),
+      refSource: asString(source?.refSource),
+      commitSha: asString(source?.commitSha),
+      sandboxRef: asString(sandboxSource?.ref),
+      sandboxSha: asString(sandboxSource?.sha),
+      sandboxMatched,
+    },
     sandbox: {
       image: asString(raw.image),
       manager: asString(raw.manager),
@@ -423,6 +465,8 @@ export function describeRunStatus(status: string): string {
       return "Path rejected";
     case "PATCH_VALIDATION_FAILED":
       return "Patch validation failed";
+    case "SOURCE_MISMATCH":
+      return "Source revision mismatch";
     default:
       return status;
   }

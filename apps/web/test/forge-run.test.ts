@@ -10,6 +10,7 @@ import {
   toForgeRunView,
   buildVerifyBody,
   describeRunStatus,
+  jobSourceRef,
   toLiveVerification,
   toVerifyError,
   findRunView,
@@ -437,5 +438,87 @@ describe("current vs history separation (no live model)", () => {
     expect(found?.id).toBe("run-old");
     expect(findRunView(views, "no-such-run")).toBeNull();
     expect(findRunView([], "run-old")).toBeNull();
+  });
+});
+
+describe("source revision evidence (no live backend)", () => {
+  const REF = "hubris/buggy-idempotency";
+  const SHA40 = "2".repeat(40);
+
+  function revisionedRun(over: Record<string, unknown> = {}) {
+    return structuredRun({
+      source: { repoUrl: "https://github.com/kaiser1x/ts-js-dummy.git", ref: REF, refSource: "job", commitSha: SHA40, tarballSha256: "t".repeat(64) },
+      sandboxSource: { ref: REF, sha: SHA40, matched: true },
+      ...over,
+    });
+  }
+
+  it("8. run view persists analysis ref", () => {
+    const v = toForgeRunView(revisionedRun(), 1)!;
+    expect(v.source.ref).toBe(REF);
+    expect(v.source.refSource).toBe("job");
+    expect(v.source.commitSha).toBe(SHA40);
+  });
+
+  it("9. run view persists sandbox ref and match", () => {
+    const v = toForgeRunView(revisionedRun(), 1)!;
+    expect(v.source.sandboxRef).toBe(REF);
+    expect(v.source.sandboxSha).toBe(SHA40);
+    expect(v.source.sandboxMatched).toBe(true);
+  });
+
+  it("10. panel displays the actual ref and commit", () => {
+    const html = renderToStaticMarkup(
+      ForgeRunPanel({ run: toForgeRunView(revisionedRun(), 1)! })
+    );
+    expect(html).toContain(REF);
+    expect(html).toContain(`${SHA40.slice(0, 12)}…`);
+    expect(html).toContain("Revision match");
+  });
+
+  it("11. current verification shares the proposal source revision", () => {
+    const v = toForgeRunView(revisionedRun(), 4)!;
+    expect(v.outcome).toBe("VERIFIED");
+    expect(v.source.ref).toBe(REF);
+    expect(v.source.sandboxRef).toBe(REF);
+    expect(v.source.sandboxMatched).toBe(true);
+    expect(v.verification?.result).toBe("PASS");
+  });
+
+  it("12. historical runs retain their own revisions", () => {
+    const views = [
+      toForgeRunView(revisionedRun({ id: "a" }), 1)!,
+      toForgeRunView(
+        revisionedRun({ id: "b", source: { ref: "main", refSource: "requested", commitSha: "3".repeat(40) }, sandboxSource: { ref: "main", sha: "3".repeat(40), matched: true } }),
+        2
+      )!,
+    ];
+    expect(views[0]?.source.ref).toBe(REF);
+    expect(views[1]?.source.ref).toBe("main");
+  });
+
+  it("legacy runs without source evidence render fallbacks, never fabrications", () => {
+    const v = toForgeRunView(structuredRun(), 1)!;
+    expect(v.source.ref).toBeNull();
+    expect(v.source.sandboxMatched).toBeNull();
+    const html = renderToStaticMarkup(ForgeRunPanel({ run: v }));
+    expect(html).toContain("Analysis ref");
+    expect(html).not.toContain("hubris/buggy-idempotency");
+  });
+
+  it("jobSourceRef reads the analyzed ref, null for legacy jobs", () => {
+    expect(jobSourceRef({ result: { ref: REF } })).toBe(REF);
+    expect(jobSourceRef({ result: {} })).toBeNull();
+    expect(jobSourceRef({ result: null })).toBeNull();
+    expect(jobSourceRef(null)).toBeNull();
+  });
+
+  it("SOURCE_MISMATCH maps to an explicit outcome and banner", () => {
+    const v = toForgeRunView(structuredRun({ status: "SOURCE_MISMATCH" }), 1)!;
+    expect(v.outcome).toBe("SOURCE_MISMATCH");
+    expect(describeRunStatus("SOURCE_MISMATCH")).toBe("Source revision mismatch");
+    const html = renderToStaticMarkup(ForgeRunPanel({ run: v }));
+    expect(html).toContain("SOURCE REVISION MISMATCH");
+    expect(html).toContain("NOT RUN");
   });
 });

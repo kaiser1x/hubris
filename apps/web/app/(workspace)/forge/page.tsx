@@ -10,6 +10,7 @@ import {
 import {
   buildVerifyBody,
   findRunView,
+  jobSourceRef,
   resolveForgeRuns,
   selectForgeEvidenceJob,
   STRUCTURED_VERIFY_PATH,
@@ -45,7 +46,10 @@ export default function ForgePage() {
       } else {
         const job = evidence as LiveJob;
         setRuns(resolveForgeRuns(evidence).slice().reverse());
-        setRunsJob(`${liveRepoName(job)} · ${job.id.slice(0, 8)}`);
+        const source = jobSourceRef(evidence);
+        setRunsJob(
+          `${liveRepoName(job)} · ${job.id.slice(0, 8)} · src: ${source ?? "default branch"}`
+        );
       }
     } catch {
       setRuns([]);

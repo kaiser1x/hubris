@@ -1,4 +1,5 @@
 import type { ForgeRunView, VerifyResult } from "../lib/forge-run";
+import { shortCommit } from "../lib/forge-run";
 
 function CheckRow({ label, ok }: { label: string; ok: boolean }) {
   return (
@@ -35,10 +36,13 @@ function OutcomeBanner({ run }: { run: ForgeRunView }) {
     VERIFICATION_TIMEOUT: "VERIFICATION TIMED OUT",
     APPLY_FAILED: "PATCH APPLY FAILED",
     VALIDATION_FAILED: "PATCH VALIDATION FAILED",
+    SOURCE_MISMATCH: "SOURCE REVISION MISMATCH",
     UNKNOWN: "UNKNOWN STATE",
   };
   const detail =
-    run.outcome === "APPLY_FAILED"
+    run.outcome === "SOURCE_MISMATCH"
+      ? "sandbox revision did not match the analyzed revision · patching stopped before apply · Verification: NOT RUN"
+      : run.outcome === "APPLY_FAILED"
       ? v
         ? `verification runner exited ${v.exitCode ?? "—"}`
         : "patch rejected before verification · Verification: NOT RUN"
@@ -148,6 +152,32 @@ export default function ForgeRunPanel({ run }: { run: ForgeRunView }) {
           <div className="flex justify-between py-1.5 last:border-b-0">
             <dt className="text-[#7A7171]">SHA-256</dt>
             <dd>{run.patchShaShort ?? "—"}</dd>
+          </div>
+        </dl>
+      </div>
+
+      <div className="px-5 pb-4">
+        <p className="kicker mb-2">Source revision</p>
+        <dl className="font-mono text-xs">
+          <div className="flex justify-between py-1.5 border-b border-[#dedada]">
+            <dt className="text-[#7A7171]">Analysis ref</dt>
+            <dd className="truncate max-w-[60%] text-right">{run.source.ref ?? "—"}</dd>
+          </div>
+          <div className="flex justify-between py-1.5 border-b border-[#dedada]">
+            <dt className="text-[#7A7171]">Analysis commit</dt>
+            <dd>{shortCommit(run.source.commitSha) ?? "—"}</dd>
+          </div>
+          <div className="flex justify-between py-1.5 border-b border-[#dedada]">
+            <dt className="text-[#7A7171]">Sandbox reported ref</dt>
+            <dd className="truncate max-w-[60%] text-right">{run.source.sandboxRef ?? "—"}</dd>
+          </div>
+          <div className="flex justify-between py-1.5 border-b border-[#dedada]">
+            <dt className="text-[#7A7171]">Sandbox reported commit</dt>
+            <dd>{shortCommit(run.source.sandboxSha) ?? "—"}</dd>
+          </div>
+          <div className="flex justify-between py-1.5 last:border-b-0">
+            <dt className="text-[#7A7171]">Revision match</dt>
+            <dd>{run.source.sandboxMatched === null ? "—" : run.source.sandboxMatched ? "✓" : "✕"}</dd>
           </div>
         </dl>
       </div>
