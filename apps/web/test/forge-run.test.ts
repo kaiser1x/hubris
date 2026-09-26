@@ -12,6 +12,7 @@ import {
   describeRunStatus,
   toLiveVerification,
   toVerifyError,
+  findRunView,
   STRUCTURED_VERIFY_PATH,
   LEGACY_VERIFY_PATH,
 } from "../app/lib/forge-run";
@@ -341,5 +342,100 @@ describe("VERIFY IN SANDBOX structured routing (no live model)", () => {
     expect(good).not.toBeInstanceOf(Promise);
     expect(bad).not.toBeInstanceOf(Promise);
     expect(bad.ok).toBe(false);
+  });
+});
+
+describe("current vs history separation (no live model)", () => {
+  const historyViews = () => [
+    toForgeRunView(diffRun({ id: "run-old", status: "VERIFIED" }), 1)!,
+    toForgeRunView(structuredRun({ id: "run-new" }), 2)!,
+  ];
+
+  it("1. regenerate request includes the current jobId", () => {
+    const r = buildVerifyBody("job-current", "guard missing");
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.body.jobId).toBe("job-current");
+  });
+
+  it("2. verify request includes the current jobId", () => {
+    const r = buildVerifyBody("job-current", "duplicate keys rejected");
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.body).toEqual({ jobId: "job-current", focus: "duplicate keys rejected" });
+  });
+
+  it("3. success adopts the run as the current proposal", () => {
+    const current = findRunView(historyViews(), "run-new");
+    expect(current?.edits).toEqual([{ path: "src/payments.ts", function: "createPayment" }]);
+    expect(current?.outcome).toBe("VERIFIED");
+  });
+
+  it("4. cleared identity renders NOT RUN, never a stale state", () => {
+    expect(findRunView(historyViews(), null)).toBeNull();
+  });
+
+  it("5. old VERIFIED run remains in history", () => {
+    const views = historyViews();
+    expect(views).toHaveLength(2);
+    expect(views[0]?.outcome).toBe("VERIFIED");
+    expect(views[0]?.id).toBe("run-old");
+  });
+
+  it("6. old VERIFIED run is not displayed as current", () => {
+    const views = historyViews();
+    // No adopted id (fresh regenerate click, failed generation, fresh
+    // page): current is null although history holds a VERIFIED run.
+    expect(findRunView(views, null)).toBeNull();
+    expect(views.some((v) => v.outcome === "VERIFIED")).toBe(true);
+  });
+
+  it("7. proposal path comes from the actual current edit", () => {
+    const current = findRunView(historyViews(), "run-new");
+    const paths = [...new Set((current?.edits ?? []).map((e) => e.path))];
+    expect(paths).toEqual(["src/payments.ts"]);
+    expect(paths).not.toContain("src/services/transactions.ts");
+  });
+
+  it("8. src/payments.ts renders when it is the actual target", () => {
+    const html = renderToStaticMarkup(
+      ForgeRunPanel({ run: findRunView(historyViews(), "run-new")! })
+    );
+    expect(html).toContain("src/payments.ts");
+    expect(html).not.toContain("transactions.ts");
+  });
+
+  it("9. missing active job produces a controlled error", () => {
+    expect(buildVerifyBody("", "guard missing")).toEqual({
+      ok: false,
+      error: "No analysis job selected.",
+    });
+    expect(buildVerifyBody("  ", "guard missing").ok).toBe(false);
+  });
+
+  it("10. errors never mutate historical evidence", () => {
+    const before = historyViews();
+    const snapshot = JSON.parse(JSON.stringify(before));
+    findRunView(before, null);
+    toVerifyError(502, { error: "Model request failed" });
+    expect(before).toEqual(snapshot);
+    expect(before).toHaveLength(2);
+  });
+
+  it("11. verify uses the current proposal only, never historical edits", () => {
+    const r = buildVerifyBody("job-current", "guard missing");
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(Object.keys(r.body).sort()).toEqual(["focus", "jobId"]);
+      expect("runId" in r.body).toBe(false);
+      expect("diff" in r.body).toBe(false);
+    }
+  });
+
+  it("12. selectors settle synchronously", () => {
+    const views = historyViews();
+    const found = findRunView(views, "run-old");
+    expect(found).not.toBeInstanceOf(Promise);
+    expect(found?.id).toBe("run-old");
+    expect(findRunView(views, "no-such-run")).toBeNull();
+    expect(findRunView([], "run-old")).toBeNull();
   });
 });

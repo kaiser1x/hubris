@@ -325,6 +325,15 @@ export function selectForgeEvidenceJob(jobs: unknown): unknown | null {
   return null;
 }
 
+// Find one run view by backend run id. The page derives its CURRENT
+// proposal/verification from this alone — never by position, never by
+// jobId match — so historical evidence can never masquerade as current.
+// Returns null for missing ids: the page renders NOT RUN. Never throws.
+export function findRunView(views: ForgeRunView[], id: string | null): ForgeRunView | null {
+  if (!id || !Array.isArray(views)) return null;
+  return views.find((v) => v !== null && typeof v === "object" && v.id === id) ?? null;
+}
+
 // ---- VERIFY IN SANDBOX request contract (Phase J fix) ----
 
 // The button must use the proven structured pipeline — never the legacy

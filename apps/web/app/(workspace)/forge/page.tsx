@@ -1,9 +1,6 @@
 "use client";
-
-import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
 import ForgeRunPanel from "../../components/ForgeRunPanel";
-import { FORGE } from "../../lib/casefile";
 import {
   fetchLatestJob,
   fetchRecentJobs,
@@ -12,30 +9,27 @@ import {
 } from "../../lib/live-twin";
 import {
   buildVerifyBody,
-  describeRunStatus,
+  findRunView,
   resolveForgeRuns,
   selectForgeEvidenceJob,
   STRUCTURED_VERIFY_PATH,
-  toLiveVerification,
   toVerifyError,
   type ForgeRunView,
-  type LiveVerification,
 } from "../../lib/forge-run";
 
-interface LiveProposal {
-  repo: string;
-  suggestion: string;
-}
-
 export default function ForgePage() {
+  // Single canonical job: every action (regenerate, verify, evidence)
+  // resolves its jobId from this state. No handler guesses or defaults it,
+  // so a jobId-less request cannot be constructed.
   const [jobId, setJobId] = useState<string | null>(null);
-  const [proposal, setProposal] = useState<LiveProposal | null>(null);
+  const [repo, setRepo] = useState<string | null>(null);
   const [focus, setFocus] = useState("");
-  const [forging, setForging] = useState(false);
-  const [forgeError, setForgeError] = useState<string | null>(null);
-  const [verifying, setVerifying] = useState(false);
-  const [verification, setVerification] = useState<LiveVerification | null>(null);
-  const [verifyError, setVerifyError] = useState<string | null>(null);
+  // Current proposal identity: the backend run id adopted by the latest
+  // successful action. Null means no current proposal — the page renders
+  // NOT RUN even when history holds older VERIFIED runs.
+  const [currentRunId, setCurrentRunId] = useState<string | null>(null);
+  const [acting, setActing] = useState<null | "regenerate" | "verify">(null);
+  const [actionError, setActionError] = useState<string | null>(null);
   const [runs, setRuns] = useState<ForgeRunView[] | null>(null);
   const [runsJob, setRunsJob] = useState<string | null>(null);
   const [runsChecked, setRunsChecked] = useState(false);
@@ -61,62 +55,36 @@ export default function ForgePage() {
     }
   }, []);
 
-  const forge = useCallback(async (id: string, repo: string, focusValue: string) => {
-    setForging(true);
-    setForgeError(null);
-    try {
-      const res = await fetch("/api/forge", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(
-          focusValue.trim() ? { jobId: id, focus: focusValue.trim() } : { jobId: id }
-        ),
-      });
-      const data = await res.json();
-      if (!res.ok || typeof data.suggestion !== "string") {
-        setForgeError(data.error ?? "Forge request failed.");
-        setProposal(null);
-      } else {
-        setProposal({ repo, suggestion: data.suggestion });
-      }
-    } catch {
-      setForgeError("Analysis service unreachable. Is the API running?");
-      setProposal(null);
-    } finally {
-      setForging(false);
-    }
-  }, []);
-
   useEffect(() => {
     let cancelled = false;
     (async () => {
       await loadRuns();
       const job = await fetchLatestJob();
-      if (!job || cancelled) return;
-      const repo = liveRepoName(job);
-      setJobId(job.id);
-      setProposal({ repo, suggestion: "" });
-      await forge(job.id, repo, "");
-      if (cancelled) return;
+      if (!cancelled && job) {
+        setJobId(job.id);
+        setRepo(liveRepoName(job));
+      }
     })();
     return () => {
       cancelled = true;
     };
-  }, [forge, loadRuns]);
+  }, [loadRuns]);
 
-  // Structured Forge pipeline: the model drafts a JSON edit plan
-  // (response_format json_object); HUBRIS validates, applies, and verifies.
-  // The legacy direct-diff branch is never used here by construction.
-  async function verifyInSandbox() {
-    if (!jobId || verifying) return;
+  // Both actions run the proven structured pipeline for the canonical job
+  // + current focus, then adopt the resulting run as current. Clearing the
+  // current id FIRST guarantees a stale VERIFIED can never appear as the
+  // outcome of the new proposal — not even while loading. No request is
+  // ever sent without the canonical jobId (buildVerifyBody enforces it).
+  async function runStructured(kind: "regenerate" | "verify") {
+    if (!jobId || acting) return;
     const prepared = buildVerifyBody(jobId, focus);
     if (!prepared.ok) {
-      setVerifyError(prepared.error);
+      setActionError(prepared.error);
       return;
     }
-    setVerifying(true);
-    setVerifyError(null);
-    setVerification(null);
+    setActing(kind);
+    setActionError(null);
+    setCurrentRunId(null);
     try {
       const res = await fetch(STRUCTURED_VERIFY_PATH, {
         method: "POST",
@@ -124,133 +92,120 @@ export default function ForgePage() {
         body: JSON.stringify(prepared.body),
       });
       const data = await res.json();
-      const mapped = res.ok ? toLiveVerification(data.forgeRun) : null;
-      if (!mapped) {
-        setVerifyError(toVerifyError(res.status, data));
-      } else {
-        setVerification(mapped);
-        // Explicit refresh only — the new run is now persisted evidence.
-        await loadRuns();
+      const runId =
+        res.ok && data && typeof data.forgeRun === "object" && data.forgeRun !== null
+          ? (data.forgeRun as { id?: unknown }).id
+          : null;
+      if (typeof runId !== "string" || runId.length === 0) {
+        // Generation failed: history untouched, current stays empty
+        // (NOT RUN) — an old VERIFIED is never shown as current.
+        setActionError(toVerifyError(res.status, data));
+        return;
       }
+      // Explicit refresh only — the new run is now persisted evidence.
+      await loadRuns();
+      setCurrentRunId(runId);
     } catch {
-      setVerifyError("Analysis service unreachable. Is the API running?");
+      setActionError("Analysis service unreachable. Is the API running?");
     } finally {
-      setVerifying(false);
+      setActing(null);
     }
   }
+
+  // Current proposal/verification derive from the adopted run id alone —
+  // never from list position or jobId match — so history can never leak
+  // into the current section.
+  const current = currentRunId ? findRunView(runs ?? [], currentRunId) : null;
+  const currentPaths = current
+    ? [...new Set(current.edits.map((e) => e.path))]
+    : [];
 
   return (
     <div className="max-w-[1440px] mx-auto px-5 lg:px-[52px] pt-10 lg:pt-[50px] pb-12">
       <p className="kicker">
-        Repository / Forge{proposal ? ` · live · ${proposal.repo}` : " · case-031"}
+        Repository / Forge{repo ? ` · live · ${repo}` : ""}
       </p>
       <h1 className="font-display text-[clamp(32px,4vw,46px)] leading-[1.05] mt-4">
         Proposed patch
       </h1>
       <p className="font-mono text-[13px] text-[#7A7171] mt-3">
-        src/services/transactions.ts · minimal diff · awaiting approval
+        {current && currentPaths.length > 0
+          ? `${currentPaths.join(", ")} · structured edit · run ${current.id.slice(0, 8)}`
+          : "no proposal yet · describe the bug below and regenerate"}
       </p>
 
       {jobId && (
         <section className="mt-10 border border-[#dedada] bg-white/60 px-5 py-5">
           <div className="flex flex-col sm:flex-row sm:items-center gap-3">
             <p className="kicker">
-              Live proposal · {proposal?.repo} · <span className="underline underline-offset-4">UNVERIFIED</span>
+              Current proposal{focus.trim() ? ` · ${focus.trim().slice(0, 60)}` : ""}
             </p>
             <form
-              className="flex gap-2 sm:ml-auto"
+              className="flex flex-col sm:flex-row gap-2 sm:ml-auto"
               onSubmit={(e) => {
                 e.preventDefault();
-                if (jobId && !forging) void forge(jobId, proposal?.repo ?? "", focus);
+                if (jobId && !acting) void runStructured("regenerate");
               }}
             >
               <input
                 type="text"
-                aria-label="Focus area, e.g. a function or file name"
-                placeholder="focus: function or file (optional)"
+                aria-label="Bug description (required): what should the fix change"
+                placeholder="bug: what should the fix change (required)"
                 value={focus}
                 onChange={(e) => setFocus(e.target.value)}
-                disabled={forging}
+                disabled={acting !== null}
                 spellCheck={false}
-                className="w-56 bg-white border border-[#dedada] px-2.5 py-2.5 font-mono text-[13px] placeholder:text-[#7A7171] focus:outline-none focus:border-[#0A0A0A] disabled:opacity-50"
+                className="w-64 bg-white border border-[#dedada] px-2.5 py-2.5 font-mono text-[13px] placeholder:text-[#7A7171] focus:outline-none focus:border-[#0A0A0A] disabled:opacity-50"
               />
-              <button
-                type="submit"
-                disabled={forging}
-                className="bg-[#0A0A0A] text-white font-mono text-[11px] tracking-[0.08em] px-4 py-2.5 hover:bg-black active:scale-[0.98] disabled:opacity-40 disabled:cursor-not-allowed transition-all"
-              >
-                {forging ? "FORGING…" : "REGENERATE ↗"}
-              </button>
+              <div className="flex gap-2">
+                <button
+                  type="submit"
+                  disabled={acting !== null}
+                  className="bg-[#0A0A0A] text-white font-mono text-[11px] tracking-[0.08em] px-4 py-2.5 hover:bg-black active:scale-[0.98] disabled:opacity-40 disabled:cursor-not-allowed transition-all"
+                >
+                  {acting === "regenerate" ? "FORGING…" : "REGENERATE ↗"}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void runStructured("verify")}
+                  disabled={acting !== null}
+                  className="bg-white border border-[#0A0A0A] font-mono text-[11px] tracking-[0.08em] px-4 py-2.5 hover:bg-white/60 active:scale-[0.98] disabled:opacity-40 disabled:cursor-not-allowed transition-all"
+                >
+                  {acting === "verify" ? "VERIFYING…" : "VERIFY IN SANDBOX ↗"}
+                </button>
+              </div>
             </form>
           </div>
-          {forging && !proposal?.suggestion ? (
+          {acting ? (
             <p className="font-mono text-[13px] text-[#7A7171] mt-4">
-              Asking the model for a minimal patch…
+              {acting === "regenerate"
+                ? "Drafting a structured edit and running it in a disposable sandbox…"
+                : "Applying the structured pipeline in a disposable sandbox…"}
             </p>
-          ) : forgeError ? (
+          ) : actionError ? (
             <p role="alert" className="font-mono text-xs mt-4 underline underline-offset-4 decoration-[#dedada]">
-              {forgeError}
+              {actionError}
             </p>
-          ) : proposal?.suggestion ? (
-            <pre className="font-mono text-[12px] leading-[1.9] mt-4 whitespace-pre-wrap break-words max-w-4xl">
-              {proposal.suggestion}
-            </pre>
-          ) : null}
-          <p className="font-mono text-[10px] text-[#7A7171] mt-4">
-            Proposal only — nothing applied. Sandbox verification pending.
-          </p>
-
-          <div className="border-t border-[#dedada] mt-5 pt-4">
-            <div className="flex flex-col sm:flex-row sm:items-center gap-3">
-              <p className="kicker">
-                Sandbox verification ·{" "}
-                {verification ? describeRunStatus(verification.status) : "not run"}
-              </p>
-              <button
-                type="button"
-                onClick={() => void verifyInSandbox()}
-                disabled={verifying}
-                className="sm:ml-auto shrink-0 bg-[#0A0A0A] text-white font-mono text-[11px] tracking-[0.08em] px-4 py-2.5 hover:bg-black active:scale-[0.98] disabled:opacity-40 disabled:cursor-not-allowed transition-all"
-              >
-                {verifying ? "VERIFYING…" : "VERIFY IN SANDBOX ↗"}
-              </button>
+          ) : current ? (
+            <div className="mt-4">
+              <ForgeRunPanel run={current} />
             </div>
-            {verifying && !verification ? (
-              <p className="font-mono text-[13px] text-[#7A7171] mt-4">
-                Applying patch and running verification in a disposable sandbox…
+          ) : (
+            <div className="border border-[#dedada] px-5 py-5 mt-4">
+              <p className="kicker">Current verification · NOT RUN</p>
+              <p className="font-mono text-[12px] mt-3 leading-6 text-[#7A7171]">
+                No current proposal. Earlier runs below under history do not
+                belong to a new proposal.
               </p>
-            ) : verifyError ? (
-              <p role="alert" className="font-mono text-xs mt-4 underline underline-offset-4 decoration-[#dedada]">
-                {verifyError}
-              </p>
-            ) : verification ? (
-              <dl className="mt-4 font-mono text-xs">
-                <div className="flex justify-between py-1.5 border-b border-[#dedada]">
-                  <dt className="text-[#7A7171]">Patch</dt>
-                  <dd>{verification.applied ? "✓ Applied" : "✕ Rejected"}</dd>
-                </div>
-                <div className="flex justify-between py-1.5 border-b border-[#dedada]">
-                  <dt className="text-[#7A7171]">Verify</dt>
-                  <dd className="truncate max-w-[60%] text-right">{verification.command || "—"}</dd>
-                </div>
-                <div className="flex justify-between py-1.5 border-b border-[#dedada]">
-                  <dt className="text-[#7A7171]">Exit</dt>
-                  <dd>{verification.exitCode ?? "—"}</dd>
-                </div>
-                <div className="flex justify-between py-1.5">
-                  <dt className="text-[#7A7171]">State</dt>
-                  <dd>{verification.passed ? "VERIFIED" : describeRunStatus(verification.status)}</dd>
-                </div>
-              </dl>
-            ) : null}
-          </div>
+            </div>
+          )}
         </section>
       )}
 
       <section className="mt-10">
         <div className="flex flex-col sm:flex-row sm:items-center gap-3">
           <p className="kicker">
-            Persisted Forge runs{runsJob ? ` · ${runsJob}` : ""}
+            History · persisted Forge runs{runsJob ? ` · ${runsJob}` : ""}
           </p>
           <button
             type="button"
@@ -288,85 +243,6 @@ export default function ForgePage() {
           </div>
         )}
       </section>
-
-      <div className="grid gap-10 mt-10 lg:grid-cols-2">
-        <div>
-          <p className="kicker mb-2">Current</p>
-          <div className="bg-[#111] text-[#d8d4d4] font-mono text-[12px] leading-[2] pb-4 overflow-x-auto">
-            <div className="flex justify-between border-b border-[#393535] px-4 py-2.5 text-[10px] text-[#938c8c]">
-              <span>transactions.ts</span>
-              <span>before</span>
-            </div>
-            {FORGE.current.map((line, i) => (
-              <div key={line} className="grid grid-cols-[44px_1fr] px-4">
-                <i className="text-[#686363] not-italic">{85 + i}</i>
-                <span>{line}</span>
-              </div>
-            ))}
-          </div>
-        </div>
-        <div>
-          <p className="kicker mb-2">Proposed</p>
-          <div className="bg-[#111] text-white font-mono text-[12px] leading-[2] pb-4 overflow-x-auto">
-            <div className="flex justify-between border-b border-[#393535] px-4 py-2.5 text-[10px] text-[#938c8c]">
-              <span>transactions.ts</span>
-              <span>after</span>
-            </div>
-            {FORGE.proposed.map((line, i) => (
-              <div
-                key={line}
-                className={`grid grid-cols-[44px_1fr] px-4 ${i === 1 ? "bg-[#2e2b2b]" : ""}`}
-              >
-                <i className="text-[#938c8c] not-italic">{85 + i}</i>
-                <span>{line}</span>
-              </div>
-            ))}
-          </div>
-        </div>
-      </div>
-
-      <div className="grid gap-10 mt-10 lg:grid-cols-3">
-        <div>
-          <h2 className="kicker">Why this patch</h2>
-          <p className="text-sm text-[#7A7171] leading-7 mt-3">{FORGE.why}</p>
-        </div>
-        <div>
-          <h2 className="kicker">Affected files</h2>
-          <div className="mt-3">
-            {FORGE.files.map((f) => (
-              <p key={f} className="font-mono text-[13px] py-1">
-                {f}
-              </p>
-            ))}
-          </div>
-        </div>
-        <div>
-          <h2 className="kicker">Expected impact</h2>
-          <dl className="mt-3 font-mono text-xs">
-            {FORGE.impact.map(([k, v]) => (
-              <div
-                key={k}
-                className="flex justify-between py-1.5 border-b border-[#dedada]"
-              >
-                <dt className="text-[#7A7171]">{k}</dt>
-                <dd>{v}</dd>
-              </div>
-            ))}
-          </dl>
-        </div>
-      </div>
-
-      <div className="flex items-center gap-4 mt-10">
-        <Link
-          href="/verify"
-          className="inline-flex h-10 items-center bg-[#0A0A0A] px-4 font-mono text-[11px] tracking-[0.08em] text-white hover:bg-black active:scale-[0.98] transition-all"
-        >
-          APPROVE AND VERIFY
-        </Link>
-        <span className="font-mono text-[11px] text-[#7A7171]">
-          Human approval required before anything persists.
-        </span>
-      </div>
     </div>
   );
 }
