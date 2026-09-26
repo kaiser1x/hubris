@@ -5,6 +5,7 @@ import {
   chatComplete,
   INVESTIGATE_SYSTEM,
   llmConfigFromEnv,
+  ModelError,
 } from "../src/index";
 
 afterEach(() => {
@@ -147,5 +148,83 @@ describe("chatComplete", () => {
         { role: "user", content: "hi" },
       ])
     ).rejects.toThrow("no content");
+  });
+});
+
+describe("chatComplete error taxonomy", () => {
+  const cfg = { baseUrl: "https://example.test/v1", apiKey: "k", model: "m" };
+  const msgs = [{ role: "user", content: "hi" }] as Parameters<typeof chatComplete>[1];
+
+  it("1. success returns content", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response(JSON.stringify({ choices: [{ message: { content: "ok" } }] }), { status: 200 }))
+    );
+    await expect(chatComplete(cfg, msgs)).resolves.toBe("ok");
+  });
+
+  it("2. HTTP 502 maps to http with status", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("bad gateway", { status: 502 })));
+    const err = await chatComplete(cfg, msgs).catch((e) => e);
+    expect(err).toBeInstanceOf(ModelError);
+    expect(err.kind).toBe("http");
+    expect(err.status).toBe(502);
+  });
+
+  it("3. HTTP 200 with empty content maps to empty", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response(JSON.stringify({ choices: [{}] }), { status: 200 }))
+    );
+    const err = await chatComplete(cfg, msgs).catch((e) => e);
+    expect(err).toBeInstanceOf(ModelError);
+    expect(err.kind).toBe("empty");
+  });
+
+  it("4. malformed JSON maps to parse", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("{not json", { status: 200 })));
+    const err = await chatComplete(cfg, msgs).catch((e) => e);
+    expect(err).toBeInstanceOf(ModelError);
+    expect(err.kind).toBe("parse");
+  });
+
+  it("5. aborted signal maps to timeout and settles fast", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (...args: unknown[]) => {
+        const signal = (args[1] as { signal?: AbortSignal } | undefined)?.signal;
+        await new Promise<never>((_, reject) => {
+          if (!signal) return;
+          if (signal.aborted) {
+            reject(new DOMException("signal timed out", "AbortError"));
+            return;
+          }
+          signal.addEventListener(
+            "abort",
+            () => reject(new DOMException("signal timed out", "AbortError")),
+            { once: true }
+          );
+        });
+      })
+    );
+    const ctl = new AbortController();
+    setTimeout(() => ctl.abort(), 10);
+    const t0 = Date.now();
+    const err = await chatComplete(cfg, msgs, { signal: ctl.signal }).catch((e) => e);
+    expect(Date.now() - t0).toBeLessThan(5000);
+    expect(err).toBeInstanceOf(ModelError);
+    expect(err.kind).toBe("timeout");
+  });
+
+  it("6. transport failure maps to transport", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        throw new Error("socket hang up");
+      })
+    );
+    const err = await chatComplete(cfg, msgs).catch((e) => e);
+    expect(err).toBeInstanceOf(ModelError);
+    expect(err.kind).toBe("transport");
   });
 });

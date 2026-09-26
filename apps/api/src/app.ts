@@ -13,6 +13,7 @@ import { getDb, schema } from "@hubris/db";
 import {
   FORGE_SYSTEM,
   INVESTIGATE_SYSTEM,
+  ModelError,
   REGRESSION_SYSTEM,
   buildForgePrompt,
   buildInvestigatePrompt,
@@ -1659,7 +1660,7 @@ app.post("/api/forge-verify", async (c: Context) => {
         { maxTokens: 1200, signal: AbortSignal.timeout(90000) }
       );
     } catch (error: any) {
-      console.error("Forge-verify draft error:", error?.message);
+      console.error("Forge-verify draft error:", error instanceof ModelError ? error.kind : "unknown", error?.message);
       return c.json({ error: "Model request failed", status: 502 }, 502);
     }
     const extracted = extractForgePatch(suggestion);

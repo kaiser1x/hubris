@@ -1,4 +1,4 @@
-export { chatComplete, llmConfigFromEnv, type LlmConfig } from "./client";
+export { chatComplete, llmConfigFromEnv, ModelError, type LlmConfig, type ModelErrorKind } from "./client";
 export {
   buildForgePrompt,
   buildInvestigatePrompt,

@@ -67,7 +67,7 @@ vi.mock("@hubris/sandbox", async (importOriginal) => {
 });
 
 import { app } from "../src/app";
-import { chatComplete } from "@hubris/llm";
+import { chatComplete, ModelError } from "@hubris/llm";
 import { runCommand, uploadFile } from "@hubris/sandbox";
 
 const MALFORMED_DIFF = "diff --git a/x b/x\n(no hunks here)";
@@ -168,5 +168,19 @@ describe("POST /api/forge-verify draft rejection (mocked model)", () => {
     expect(preview).toContain("Bearer <redacted>");
     expect(preview).not.toContain("abc123");
     expect(preview).not.toContain("xyz-token-9");
+  });
+
+  it("6. model empty response → deterministic 502 + no sandbox calls", async () => {
+    stubCreds();
+    vi.mocked(chatComplete).mockRejectedValueOnce(
+      new ModelError("empty", "Model API returned no content")
+    );
+    const res = await postVerify({});
+    expect(res.status).toBe(502);
+    expect(await res.json()).toEqual({ error: "Model request failed", status: 502 });
+    expect(runCommand).not.toHaveBeenCalled();
+    expect(uploadFile).not.toHaveBeenCalled();
+    // Nothing to persist: no draft, no execution.
+    expect(rejections()).toHaveLength(0);
   });
 });
