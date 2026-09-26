@@ -11,23 +11,20 @@ import {
   type LiveJob,
 } from "../../lib/live-twin";
 import {
+  buildVerifyBody,
+  describeRunStatus,
   resolveForgeRuns,
   selectForgeEvidenceJob,
+  STRUCTURED_VERIFY_PATH,
+  toLiveVerification,
+  toVerifyError,
   type ForgeRunView,
+  type LiveVerification,
 } from "../../lib/forge-run";
 
 interface LiveProposal {
   repo: string;
   suggestion: string;
-}
-
-interface LiveVerification {
-  status: string;
-  history: string[];
-  applied: boolean;
-  command: string;
-  exitCode: number | null;
-  passed: boolean;
 }
 
 export default function ForgePage() {
@@ -107,32 +104,31 @@ export default function ForgePage() {
     };
   }, [forge, loadRuns]);
 
+  // Structured Forge pipeline: the model drafts a JSON edit plan
+  // (response_format json_object); HUBRIS validates, applies, and verifies.
+  // The legacy direct-diff branch is never used here by construction.
   async function verifyInSandbox() {
     if (!jobId || verifying) return;
+    const prepared = buildVerifyBody(jobId, focus);
+    if (!prepared.ok) {
+      setVerifyError(prepared.error);
+      return;
+    }
     setVerifying(true);
     setVerifyError(null);
     setVerification(null);
     try {
-      const res = await fetch("/api/forge-verify", {
+      const res = await fetch(STRUCTURED_VERIFY_PATH, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(
-          focus.trim() ? { jobId, focus: focus.trim() } : { jobId }
-        ),
+        body: JSON.stringify(prepared.body),
       });
       const data = await res.json();
-      if (!res.ok || !data.forgeRun) {
-        setVerifyError(data.error ?? "Verification request failed.");
+      const mapped = res.ok ? toLiveVerification(data.forgeRun) : null;
+      if (!mapped) {
+        setVerifyError(toVerifyError(res.status, data));
       } else {
-        const run = data.forgeRun;
-        setVerification({
-          status: run.status,
-          history: Array.isArray(run.history) ? run.history.map((h: { state: string }) => h.state) : [],
-          applied: Boolean(run.apply?.applied),
-          command: String(run.verification?.command ?? ""),
-          exitCode: typeof run.verification?.exitCode === "number" ? run.verification.exitCode : null,
-          passed: Boolean(run.verified),
-        });
+        setVerification(mapped);
         // Explicit refresh only — the new run is now persisted evidence.
         await loadRuns();
       }
@@ -208,7 +204,7 @@ export default function ForgePage() {
             <div className="flex flex-col sm:flex-row sm:items-center gap-3">
               <p className="kicker">
                 Sandbox verification ·{" "}
-                {verification ? verification.status : "not run"}
+                {verification ? describeRunStatus(verification.status) : "not run"}
               </p>
               <button
                 type="button"
@@ -243,7 +239,7 @@ export default function ForgePage() {
                 </div>
                 <div className="flex justify-between py-1.5">
                   <dt className="text-[#7A7171]">State</dt>
-                  <dd>{verification.passed ? "VERIFIED" : verification.status}</dd>
+                  <dd>{verification.passed ? "VERIFIED" : describeRunStatus(verification.status)}</dd>
                 </div>
               </dl>
             ) : null}

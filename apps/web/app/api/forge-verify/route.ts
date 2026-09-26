@@ -21,7 +21,16 @@ export async function POST(request: Request) {
       body: JSON.stringify(body),
     });
 
-    const data = await response.json();
+    // Read as text first: an upstream error page (e.g. a stale API without
+    // this route) is not JSON, and must be forwarded honestly — never
+    // misreported as "Failed to connect".
+    const text = await response.text();
+    let data: unknown;
+    try {
+      data = text ? (JSON.parse(text) as unknown) : null;
+    } catch {
+      data = { error: "Analysis service error", details: text.slice(0, 200) };
+    }
     return NextResponse.json(data, { status: response.status });
   } catch (error: unknown) {
     console.error("Proxy error:", error);

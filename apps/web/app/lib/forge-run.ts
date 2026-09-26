@@ -324,3 +324,109 @@ export function selectForgeEvidenceJob(jobs: unknown): unknown | null {
   }
   return null;
 }
+
+// ---- VERIFY IN SANDBOX request contract (Phase J fix) ----
+
+// The button must use the proven structured pipeline — never the legacy
+// direct-diff draft branch. The legacy path is keyed off the endpoint, so
+// the route constant IS the branch selection.
+export const STRUCTURED_VERIFY_PATH = "/api/forge-structured";
+export const LEGACY_VERIFY_PATH = "/api/forge-verify";
+
+export interface VerifyRequestBody {
+  jobId: string;
+  focus: string;
+}
+
+export type VerifyBodyResult =
+  | { ok: true; body: VerifyRequestBody }
+  | { ok: false; error: string };
+
+// Build the structured-verify body. Focus is required: the backend uses it
+// to select source excerpts and ground the edit, and rejects empty focus
+// with 400 — so the UI validates first instead of wasting a request. The
+// body carries no `diff` field: the model drafts the structured plan, git
+// authors the patch. Never throws.
+export function buildVerifyBody(jobId: string, focus: string): VerifyBodyResult {
+  if (!jobId || jobId.trim().length === 0) {
+    return { ok: false, error: "No analysis job selected." };
+  }
+  const trimmed = focus.trim();
+  if (trimmed.length === 0) {
+    return { ok: false, error: "Describe the bug in the focus field first." };
+  }
+  if (trimmed.length > 500) {
+    return { ok: false, error: "Focus must be 500 characters or fewer." };
+  }
+  return { ok: true, body: { jobId, focus: trimmed } };
+}
+
+export interface LiveVerification {
+  status: string;
+  history: string[];
+  applied: boolean;
+  command: string;
+  exitCode: number | null;
+  passed: boolean;
+}
+
+// Map a structured forgeRun to the verification display. Returns null when
+// the payload carries no usable run — the page shows the error state, never
+// a fabricated verification. Never throws.
+export function toLiveVerification(forgeRun: unknown): LiveVerification | null {
+  if (!isRecord(forgeRun)) return null;
+  const status = asString(forgeRun.status);
+  if (!status) return null;
+  const history = Array.isArray(forgeRun.history)
+    ? forgeRun.history
+        .map((h) => (isRecord(h) ? h.state : null))
+        .filter((s): s is string => typeof s === "string")
+    : [];
+  const apply = isRecord(forgeRun.apply) ? forgeRun.apply : null;
+  const verification = isRecord(forgeRun.verification) ? forgeRun.verification : null;
+  return {
+    status,
+    history,
+    applied: apply?.applied === true,
+    command: asString(verification?.command) ?? "",
+    exitCode: asNumber(verification?.exitCode),
+    passed: Boolean(forgeRun.verified),
+  };
+}
+
+// Friendly label for a terminal run state. Shown alongside the raw status;
+// never invents success.
+export function describeRunStatus(status: string): string {
+  switch (status) {
+    case "VERIFIED":
+      return "VERIFIED";
+    case "FAILED":
+      return "Verification failed";
+    case "TIMEOUT":
+      return "Verification timed out";
+    case "APPLY_FAILED":
+      return "Patch apply failed";
+    case "EDIT_CONTEXT_MISMATCH":
+      return "Edit context mismatch";
+    case "AMBIGUOUS_EDIT":
+      return "Ambiguous edit";
+    case "PATH_REJECTED":
+      return "Path rejected";
+    case "PATCH_VALIDATION_FAILED":
+      return "Patch validation failed";
+    default:
+      return status;
+  }
+}
+
+// Controlled error message for a non-ok structured-verify response. Keeps
+// the backend text (no secret-bearing fields exist on these errors) while
+// distinguishing the model-empty case, where no sandbox run started.
+export function toVerifyError(status: number, data: unknown): string {
+  const err = isRecord(data) ? asString(data.error) : null;
+  if (status === 502 && err === "Model request failed") {
+    return "Model request failed (empty or invalid model response) — no sandbox run started.";
+  }
+  if (err) return err;
+  return "Verification request failed.";
+}

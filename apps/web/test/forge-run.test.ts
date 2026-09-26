@@ -8,6 +8,12 @@ import {
   resolveForgeRuns,
   selectForgeEvidenceJob,
   toForgeRunView,
+  buildVerifyBody,
+  describeRunStatus,
+  toLiveVerification,
+  toVerifyError,
+  STRUCTURED_VERIFY_PATH,
+  LEGACY_VERIFY_PATH,
 } from "../app/lib/forge-run";
 import ForgeRunPanel from "../app/components/ForgeRunPanel";
 
@@ -268,5 +274,72 @@ describe("ForgeRunPanel", () => {
       ForgeRunPanel({ run: toForgeRunView(structuredRun(), 1)! })
     );
     expect(html).not.toMatch(/NEBIUS_API_KEY|NEBIUS_PROJECT_ID|GITHUB_TOKEN|DATABASE_URL|Bearer /);
+  });
+});
+
+describe("VERIFY IN SANDBOX structured routing (no live model)", () => {
+  it("1. the button targets the structured route, not the legacy diff route", () => {
+    expect(STRUCTURED_VERIFY_PATH).toBe("/api/forge-structured");
+    expect(LEGACY_VERIFY_PATH).toBe("/api/forge-verify");
+    expect(STRUCTURED_VERIFY_PATH).not.toBe(LEGACY_VERIFY_PATH);
+  });
+
+  it("2. request body carries exactly job/focus for the structured contract", () => {
+    const r = buildVerifyBody("job-1", "  duplicate guard missing  ");
+    expect(r).toEqual({ ok: true, body: { jobId: "job-1", focus: "duplicate guard missing" } });
+    // No `diff` field: the model drafts the plan, HUBRIS authors the patch.
+    // The legacy direct-diff branch is therefore unreachable from this body.
+    if (r.ok) expect(Object.keys(r.body).sort()).toEqual(["focus", "jobId"]);
+  });
+
+  it("3. structured endpoint receives job/focus; invalid input settles locally", () => {
+    expect(buildVerifyBody("", "x").ok).toBe(false);
+    expect(buildVerifyBody("job-1", "   ").ok).toBe(false);
+    expect(buildVerifyBody("job-1", "x".repeat(501)).ok).toBe(false);
+  });
+
+  it("4. the body cannot trigger the old direct-diff branch", () => {
+    const r = buildVerifyBody("job-1", "guard missing");
+    expect(r.ok).toBe(true);
+    if (r.ok) expect("diff" in r.body).toBe(false);
+  });
+
+  it("5. model empty response becomes a controlled error", () => {
+    const msg = toVerifyError(502, { error: "Model request failed", status: 502 });
+    expect(msg).toContain("Model request failed");
+    expect(msg).toContain("no sandbox run started");
+    expect(msg).not.toMatch(/NEBIUS_API_KEY|Bearer /);
+  });
+
+  it("6. structured schema failure becomes a controlled error", () => {
+    expect(toVerifyError(400, { error: "Invalid edit plan", status: 400 })).toBe("Invalid edit plan");
+    expect(toVerifyError(400, { error: "Malformed edit plan", status: 400 })).toBe("Malformed edit plan");
+    expect(toVerifyError(500, {})).toBe("Verification request failed.");
+  });
+
+  it("7. successful structured result renders verification state", () => {
+    const v = toLiveVerification({
+      status: "VERIFIED",
+      history: [{ state: "PROPOSED" }, { state: "VERIFIED" }],
+      apply: { applied: true },
+      verification: { command: "pnpm test", exitCode: 0, timedOut: false, passed: true },
+      verified: true,
+    });
+    expect(v).toMatchObject({ status: "VERIFIED", applied: true, command: "pnpm test", exitCode: 0, passed: true });
+    expect(v?.history).toEqual(["PROPOSED", "VERIFIED"]);
+    expect(toLiveVerification(null)).toBeNull();
+    expect(toLiveVerification({})).toBeNull();
+    expect(describeRunStatus("EDIT_CONTEXT_MISMATCH")).toBe("Edit context mismatch");
+    expect(describeRunStatus("APPLY_FAILED")).toBe("Patch apply failed");
+    expect(describeRunStatus("TIMEOUT")).toBe("Verification timed out");
+    expect(describeRunStatus("VERIFIED")).toBe("VERIFIED");
+  });
+
+  it("8. loading state always settles: builders are synchronous", () => {
+    const good = buildVerifyBody("job-1", "x");
+    const bad = buildVerifyBody("job-1", "");
+    expect(good).not.toBeInstanceOf(Promise);
+    expect(bad).not.toBeInstanceOf(Promise);
+    expect(bad.ok).toBe(false);
   });
 });
