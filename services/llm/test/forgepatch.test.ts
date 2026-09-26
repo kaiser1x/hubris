@@ -67,4 +67,38 @@ describe("extractForgePatch", () => {
     ].join("\n");
     expect(extractForgePatch(diagnosed)).toBeNull();
   });
+
+  // Contract split, proven deterministically: the parser accepts
+  // structurally-shaped diffs (headers + @@ present) while git remains the
+  // final arbiter for hunk-count consistency. The parser never repairs.
+  it("parser accepts shape but git rejects wrong hunk counts", async () => {
+    const { execFile } = await import("child_process");
+    const { promisify } = await import("util");
+    const fs = await import("fs");
+    const os = await import("os");
+    const path = await import("path");
+    const exec = promisify(execFile);
+    // Claims 1 old line but carries 1 removal + 1 context = 2.
+    const wrongCounts = [
+      "diff --git a/a.ts b/a.ts",
+      "--- a/a.ts",
+      "+++ b/a.ts",
+      "@@ -1 +1,2 @@",
+      "-export const x = 1;",
+      " export const x = 1;",
+      "+// probe",
+      "",
+    ].join("\n");
+    expect(extractForgePatch(wrongCounts)).not.toBeNull();
+    const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "hubris-hunk-"));
+    try {
+      fs.writeFileSync(path.join(dir, "a.ts"), "export const x = 1;\n");
+      fs.writeFileSync(path.join(dir, "w.diff"), wrongCounts);
+      await expect(
+        exec("git", ["apply", "--check", "w.diff"], { cwd: dir })
+      ).rejects.toThrow();
+    } finally {
+      await fs.promises.rm(dir, { recursive: true, force: true });
+    }
+  });
 });

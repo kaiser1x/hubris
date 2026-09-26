@@ -183,4 +183,18 @@ describe("POST /api/forge-verify draft rejection (mocked model)", () => {
     // Nothing to persist: no draft, no execution.
     expect(rejections()).toHaveLength(0);
   });
+
+  it("7. model timeout settles the request (502, no hang, no sandbox)", async () => {
+    stubCreds();
+    vi.mocked(chatComplete).mockRejectedValueOnce(
+      new ModelError("timeout", "Model request timed out")
+    );
+    const t0 = Date.now();
+    const res = await postVerify({});
+    expect(Date.now() - t0).toBeLessThan(30000);
+    expect(res.status).toBe(502);
+    expect(runCommand).not.toHaveBeenCalled();
+    expect(uploadFile).not.toHaveBeenCalled();
+    expect(rejections()).toHaveLength(0);
+  });
 });
