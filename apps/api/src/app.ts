@@ -49,6 +49,12 @@ import {
   isSafeTestPath,
   REGRESSION_STAGING_PATH,
 } from "./regression";
+import {
+  buildApplyScript,
+  DIFF_STAGING_PATH,
+  isPlausibleDiff,
+  PATCH_OK_MARKER,
+} from "./apply";
 
 const execFileAsync = promisify(execFile);
 
@@ -141,6 +147,16 @@ const RegressionBody = z.object({
   generate: z.boolean().optional(),
   focus: z.string().min(1).max(500).optional(),
   instruction: z.string().max(2000).optional(),
+});
+
+const ApplyBody = z.object({
+  jobId: z.string().min(1, "jobId is required"),
+  ref: GitRef.optional(),
+  image: z.string().max(200).optional(),
+  manager: z.enum(["pnpm", "npm"]).optional(),
+  // Unified diff to apply in the sandbox workspace (validated for
+  // plausibility here, truly validated by git apply over there).
+  diff: z.string().min(10).max(20000),
 });
 
 function shortPath(p: string): string {
@@ -1389,6 +1405,173 @@ app.post("/api/regression", async (c: Context) => {
       })
       .where(eq(schema.jobs.id, job.id));
     return c.json({ jobId: job.id, regression: entry });
+  } finally {
+    await fs.promises.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+// POST /api/apply - Apply a unified diff in a sandbox workspace and run
+// the suite against it.
+// Body: { jobId, diff, ref?, image?, manager? }. Stages the repo
+// (clone/archive/upload, same guards), uploads the diff as a second file,
+// extracts, `git apply`s it, installs with --ignore-scripts, and runs the
+// repo's own tests. applied = the patch went on (PATCH_OK seen);
+// passed = exit 0 without timeout (tests green WITH the patch).
+// The real repository is never modified. Evidence on job.result.applies[].
+app.post("/api/apply", async (c: Context) => {
+  let rawBody: unknown;
+  try {
+    rawBody = await c.req.json();
+  } catch {
+    return c.json({ error: "Invalid JSON body", status: 400 }, 400);
+  }
+
+  const parsed = ApplyBody.safeParse(rawBody);
+  if (!parsed.success) {
+    return c.json({ error: "jobId and diff are required", status: 400 }, 400);
+  }
+  if (!isPlausibleDiff(parsed.data.diff)) {
+    return c.json({ error: "diff is not a plausible unified diff", status: 400 }, 400);
+  }
+
+  const db = getDb();
+  if (!db) {
+    return c.json({ error: "Job store unavailable", status: 503 }, 503);
+  }
+
+  const rows = await db.select().from(schema.jobs).where(eq(schema.jobs.id, parsed.data.jobId));
+  const job = rows[0];
+  if (!job) {
+    return c.json({ error: "Job not found", status: 404 }, 404);
+  }
+
+  const cloneUrl = toSafeCloneUrl(job.repoUrl);
+  if (!cloneUrl) {
+    return c.json({ error: "Job has unsupported repo URL", status: 400 }, 400);
+  }
+
+  const sandbox = sandboxConfigFromEnv();
+  if (!sandbox) {
+    return c.json({ error: "Sandbox not configured", status: 503 }, 503);
+  }
+
+  const limits = limitsFromEnv();
+  const execLimits = executionLimitsFromEnv();
+  const timing = testTimingFromEnv();
+  const ref = parsed.data.ref;
+  const tmp = await fs.promises.mkdtemp(path.join(os.tmpdir(), "hubris-apply-"));
+  try {
+    let staged;
+    try {
+      staged = await cloneAndArchive(cloneUrl, ref, tmp);
+    } catch (error: any) {
+      const step =
+        error?.message === "clone"
+          ? "clone"
+          : error?.message === "ls-files"
+            ? "listing"
+            : "archive";
+      return c.json({ error: `Repository ${step} failed`, status: 500 }, 500);
+    }
+    const { tarPath, tracked } = staged;
+    const excluded = tracked.filter(isTransferExcluded);
+    const expected = tracked.length - excluded.length;
+    if (expected <= 0) {
+      return c.json({ error: "Repository has no transferable files", status: 400 }, 400);
+    }
+    if (tracked.length > limits.maxFiles) {
+      return c.json(
+        { error: `Repository exceeds transfer limits (${tracked.length} files > ${limits.maxFiles})`, status: 413 },
+        413
+      );
+    }
+
+    const tarBytes = await fs.promises.readFile(tarPath);
+    if (tarBytes.length > limits.maxBytes) {
+      return c.json(
+        { error: `Repository exceeds transfer limits (${tarBytes.length} bytes > ${limits.maxBytes})`, status: 413 },
+        413
+      );
+    }
+    const localSha = createHash("sha256").update(tarBytes).digest("hex");
+
+    let uploaded;
+    let diffUpload;
+    try {
+      uploaded = await uploadFile(sandbox, tarBytes, { timeoutMs: 60000 });
+      diffUpload = await uploadFile(sandbox, new TextEncoder().encode(parsed.data.diff), {
+        timeoutMs: 60000,
+      });
+    } catch (error: any) {
+      console.error("Apply upload error:", error?.message);
+      return c.json({ error: "Sandbox upload failed", status: 502 }, 502);
+    }
+    if (uploaded.sha256 !== localSha) {
+      return c.json({ error: "Transfer integrity mismatch", status: 502 }, 502);
+    }
+
+    const detected = detectManager(tracked);
+    const manager: PackageManager = parsed.data.manager ?? detected ?? "pnpm";
+    const started = Date.now();
+    let result;
+    try {
+      result = await runCommand(sandbox, {
+        command: buildApplyScript(manager, excluded),
+        image: parsed.data.image ?? "tag:node:20-slim",
+        files: {
+          [CHECKOUT_UPLOAD_PATH]: { uuid: uploaded.uuid },
+          [DIFF_STAGING_PATH]: { uuid: diffUpload.uuid },
+        },
+        shell: true,
+        disposable: true,
+        timeout: timing.timeoutS,
+        truncateOutputAt: execLimits.maxOutputBytes,
+        waitMs: timing.waitMs,
+      });
+    } catch (error: any) {
+      console.error("Apply run error:", error?.message);
+      return c.json({ error: "Sandbox run failed", status: 502 }, 502);
+    }
+    const durationMs = Date.now() - started;
+
+    const applied = result.stdout.includes(PATCH_OK_MARKER);
+    const phase = !applied
+      ? "patch"
+      : result.stdout.includes(TEST_BEGIN_MARKER)
+        ? "test"
+        : "install";
+    const passed = result.exitCode === 0 && !result.timedOut;
+    const entry = {
+      repoUrl: job.repoUrl,
+      ...(ref ? { ref } : {}),
+      manager,
+      testCommand: `${manager} test`,
+      diffBytes: new TextEncoder().encode(parsed.data.diff).length,
+      diffSha256: createHash("sha256").update(parsed.data.diff).digest("hex"),
+      applied,
+      phase,
+      image: parsed.data.image ?? "tag:node:20-slim",
+      workspace: REPO_WORKDIR,
+      files: expected,
+      bytes: tarBytes.length,
+      sha256: localSha,
+      exitCode: result.exitCode,
+      timedOut: result.timedOut,
+      passed,
+      durationMs,
+      stdout: result.stdout.slice(0, 4000),
+      stderr: result.stderr.slice(0, 4000),
+      at: new Date().toISOString(),
+    };
+    const prior = (job.result as { applies?: unknown[] } | null)?.applies ?? [];
+    await db
+      .update(schema.jobs)
+      .set({
+        result: { ...(job.result as object), applies: [...prior, entry] },
+        updatedAt: new Date(),
+      })
+      .where(eq(schema.jobs.id, job.id));
+    return c.json({ jobId: job.id, apply: entry });
   } finally {
     await fs.promises.rm(tmp, { recursive: true, force: true });
   }

@@ -102,6 +102,13 @@ export interface StagedRepo {
 // Clone + list + archive under tmp. Never executes repo code — pure git
 // plumbing. Throws Error("clone" | "ls-files" | "archive") so handlers can
 // map to responses without leaking subprocess details.
+//
+// Line-ending pin: `git archive` honors the host's core.autocrlf, so a
+// Windows host would silently rewrite LF blobs to CRLF in the tarball and
+// stock-Debian `git apply` would then reject LF-context patches. The
+// `-c core.autocrlf=false` override forces raw blob bytes regardless of
+// host config. Permissive apply (--ignore-whitespace) is deliberately NOT
+// used: the tarball must be byte-faithful, not fuzz-matched.
 export async function cloneAndArchive(
   cloneUrl: string,
   ref: string | undefined,
@@ -128,9 +135,11 @@ export async function cloneAndArchive(
     throw new Error("ls-files");
   }
   try {
-    await execFileAsync("git", ["-C", src, "archive", "HEAD", "-o", tarPath], {
-      timeout: 60000,
-    });
+    await execFileAsync(
+      "git",
+      ["-c", "core.autocrlf=false", "-C", src, "archive", "HEAD", "-o", tarPath],
+      { timeout: 60000 }
+    );
   } catch {
     throw new Error("archive");
   }
