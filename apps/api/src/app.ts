@@ -46,6 +46,7 @@ import {
 } from "./testrun";
 import {
   buildForgeVerifyScript,
+  buildRejectedDraftPreview,
   getForgeContext,
   resolveForgeStatus,
   VERIFY_BEGIN_MARKER,
@@ -1663,6 +1664,25 @@ app.post("/api/forge-verify", async (c: Context) => {
     }
     const extracted = extractForgePatch(suggestion);
     if (!extracted || !isPlausibleDiff(extracted)) {
+      // Diagnostic evidence only: bounded, scrubbed, marked rejected. The
+      // 400 stands even if this write fails; no forgeRuns[] entry because
+      // nothing executed.
+      try {
+        const prior =
+          (job.result as { draftRejections?: unknown[] } | null)?.draftRejections ?? [];
+        await db
+          .update(schema.jobs)
+          .set({
+            result: {
+              ...(job.result as object),
+              draftRejections: [...prior, { ...buildRejectedDraftPreview(suggestion), at: new Date().toISOString() }],
+            },
+            updatedAt: new Date(),
+          })
+          .where(eq(schema.jobs.id, job.id));
+      } catch {
+        // best-effort; rejection stands regardless
+      }
       return c.json({ error: "Forge produced no usable patch", status: 400 }, 400);
     }
     diff = extracted;

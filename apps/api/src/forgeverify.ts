@@ -70,6 +70,38 @@ export function buildForgeVerifyScript(
 
 export const VERIFY_BEGIN_MARKER = "VERIFY_BEGIN";
 
+// Rejected-draft diagnostics (Phase I instrumentation). When a Forge draft
+// carries no usable patch, the endpoint persists a SMALL, scrubbed preview
+// so the next classification is evidence-based instead of inferential.
+// Bounded (never the full output), secrets scrubbed, marked rejected.
+// No forgeRuns[] entry: nothing executed, nothing to associate.
+export const DRAFT_PREVIEW_CHARS = 2000;
+
+export interface RejectedDraft {
+  draftRejected: true;
+  draftPreview: string;
+  reason: string;
+}
+
+function scrubSecrets(text: string): string {
+  // No leading word boundary: keys often arrive prefixed (NEBIUS_API_KEY).
+  // Over-redaction in a diagnostic preview is acceptable; leakage is not.
+  return text
+    .replace(/Bearer\s+[A-Za-z0-9._~+/-]+/g, "Bearer <redacted>")
+    .replace(
+      /(api[_-]?key|api[_-]?token|access[_-]?token|auth[_-]?token|secret|password|passwd)\b\s*[:=]\s*("[^"]*"|'[^']*'|\S+)/gi,
+      "$1=<redacted>"
+    );
+}
+
+export function buildRejectedDraftPreview(draft: string): RejectedDraft {
+  return {
+    draftRejected: true,
+    draftPreview: scrubSecrets(draft).slice(0, DRAFT_PREVIEW_CHARS),
+    reason: "no usable patch",
+  };
+}
+
 // Twin shape shared by /api/forge and /api/forge-verify so the proposal
 // and the verified run always ground on the same prompt. Behavior of the
 // existing forge handler is unchanged; it now delegates here.
