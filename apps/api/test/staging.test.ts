@@ -74,6 +74,23 @@ describe("staging line endings (Phase G root cause)", () => {
     }
   });
 
+  it("checks out the analyzed commit instead of a moving branch", async () => {
+    const repo = await mkTmp("hubris-revision-repo-");
+    const work = await mkTmp("hubris-revision-work-");
+    const badWork = await mkTmp("hubris-revision-bad-");
+    try {
+      await initLfRepo(repo);
+      const rev = (await exec("git", ["-C", repo, "rev-parse", "HEAD"], { timeout: 30000 })).stdout.trim();
+      const staged = await cloneAndArchive(repo, undefined, work, rev);
+      expect(staged.commitSha).toBe(rev);
+      await expect(cloneAndArchive(repo, undefined, badWork, "f".repeat(40))).rejects.toThrow("revision-mismatch");
+    } finally {
+      await fs.promises.rm(repo, { recursive: true, force: true });
+      await fs.promises.rm(work, { recursive: true, force: true });
+      await fs.promises.rm(badWork, { recursive: true, force: true });
+    }
+  });
+
   it("LF patch applies to the staged tree under Debian-strict settings", async () => {
     stubHostileWindowsHost();
     const repo = await mkTmp("hubris-eol-repo-");

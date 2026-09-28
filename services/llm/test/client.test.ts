@@ -229,6 +229,78 @@ describe("chatComplete error taxonomy", () => {
   });
 });
 
+describe("chatComplete reasoning-model budget recovery", () => {
+  const cfg = { baseUrl: "https://example.test/v1", apiKey: "k", model: "m" };
+  const msgs = [{ role: "user", content: "hi" }] as Parameters<typeof chatComplete>[1];
+
+  it("retries a budget-starved reasoning response with a doubled budget", async () => {
+    const calls: Array<{ max_tokens: number }> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: unknown, init?: { body?: string }) => {
+        calls.push(JSON.parse(init?.body ?? "{}"));
+        if (calls.length === 1) {
+          return new Response(
+            JSON.stringify({
+              choices: [
+                { finish_reason: "length", message: { reasoning_content: "thinking…", content: null } },
+              ],
+            }),
+            { status: 200 }
+          );
+        }
+        return new Response(
+          JSON.stringify({ choices: [{ finish_reason: "stop", message: { content: "the fix" } }] }),
+          { status: 200 }
+        );
+      })
+    );
+    const out = await chatComplete(cfg, msgs, { maxTokens: 8192 });
+    expect(out).toBe("the fix");
+    expect(calls[0].max_tokens).toBe(8192);
+    expect(calls[1].max_tokens).toBe(16384);
+  });
+
+  it("does not retry when the empty response is not a length cut", async () => {
+    const fetchMock = vi.fn(async () =>
+      new Response(
+        JSON.stringify({
+          choices: [{ finish_reason: "stop", message: { reasoning_content: "t", content: null } }],
+        }),
+        { status: 200 }
+      )
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const err = await chatComplete(cfg, msgs).catch((e) => e);
+    expect(err).toBeInstanceOf(ModelError);
+    expect(err.kind).toBe("empty");
+    expect(fetchMock.mock.calls.length).toBe(1);
+  });
+
+  it("fails empty after bounded retries when the model keeps starving", async () => {
+    let calls = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        calls++;
+        return new Response(
+          JSON.stringify({
+            choices: [
+              { finish_reason: "length", message: { reasoning_content: "t".repeat(200), content: null } },
+            ],
+          }),
+          { status: 200 }
+        );
+      })
+    );
+    const err = await chatComplete(cfg, msgs, { maxTokens: 4096 }).catch((e) => e);
+    expect(err).toBeInstanceOf(ModelError);
+    expect(err.kind).toBe("empty");
+    // 4096 -> 8192 -> 16384, then the ceiling stops further retries.
+    expect(calls).toBeLessThanOrEqual(3);
+  });
+});
+
 describe("chatComplete response_format", () => {
   it("sends response_format only when requested", async () => {
     const fetchMock = vi.fn(async () =>

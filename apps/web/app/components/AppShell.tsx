@@ -4,13 +4,16 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useState } from "react";
 import HubrisLogo from "./HubrisLogo";
-import { REPO } from "../lib/casefile";
+import { useWorkspace } from "./WorkspaceProvider";
+import WorkspaceSwitcher from "./WorkspaceSwitcher";
+import { workspaceHref } from "../lib/workspace";
 
 const WORKSPACE_LINKS = [
   { href: "/overview", label: "Overview" },
   { href: "/codebase", label: "Codebase" },
   { href: "/trace", label: "Trace" },
-  { href: "/investigate", label: "Investigate", count: "03" },
+  { href: "/investigate", label: "Investigate" },
+  { href: "/reproduce", label: "Reproduce" },
   { href: "/forge", label: "Forge" },
   { href: "/verify", label: "Verify" },
 ];
@@ -34,6 +37,8 @@ const STAGE_BY_ROUTE: Record<string, string> = {
   "/forge": "FORGE",
   "/verify": "VERIFY",
   "/ship": "SHIP",
+  "/history": "HISTORY",
+  "/settings": "SETTINGS",
 };
 
 const CRUMB: Record<string, string> = {
@@ -50,10 +55,27 @@ const CRUMB: Record<string, string> = {
 export default function AppShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
   const [open, setOpen] = useState(false);
+  const { status, job, repo } = useWorkspace();
   const active =
     WORKSPACE_LINKS.find((l) => l.href === pathname) ?? WORKSPACE_LINKS[0];
+  const activeHref = pathname === "/history" ? "/history" : active.href;
   const crumb = CRUMB[pathname] ?? "OVERVIEW";
-  const activeStage = STAGE_BY_ROUTE[pathname] ?? "UNDERSTAND";
+  const activeStage = STAGE_BY_ROUTE[pathname] ?? "";
+
+  const investigationCount =
+    job?.result && "investigationRuns" in job.result
+      ? Array.isArray(job.result.investigationRuns)
+        ? job.result.investigationRuns.length
+        : 0
+      : 0;
+  const repoLabel =
+    status === "loading" ? "Loading workspace…" : repo.label;
+  const repoDetail =
+    status === "ready" && repo.hasContext
+      ? `${repo.ref ?? "default branch"} / ${repo.commitSha?.slice(0, 12) ?? "commit unavailable"}`
+      : status === "loading"
+        ? "…"
+        : "no active analysis";
 
   return (
     <div className="min-h-screen flex bg-[#f8f7f6] text-[#0A0A0A]">
@@ -86,19 +108,20 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
           </button>
         </div>
 
-        <div className="border border-[#393737] px-2.5 py-3 flex items-center gap-2.5 mb-9">
+        <div className="border border-[#393737] px-2.5 py-3 flex items-center gap-2.5 mb-4">
           <span className="grid place-items-center w-6 h-6 bg-white text-[#0A0A0A] font-mono text-xs font-bold shrink-0">
-            {REPO.name.charAt(0).toUpperCase()}
+            {repoLabel.charAt(0).toUpperCase()}
           </span>
           <span className="min-w-0">
             <strong className="block text-xs font-semibold truncate">
-              {REPO.name}
+              {repoLabel}
             </strong>
-            <small className="block text-[#8b8585] font-mono text-[10px] mt-1">
-              {REPO.branch} / {REPO.context}
+            <small className="block text-[#8b8585] font-mono text-[10px] mt-1 truncate">
+              {repoDetail}
             </small>
           </span>
         </div>
+        <WorkspaceSwitcher />
 
         <nav aria-label="Workspace">
           <p className="font-mono text-[10px] tracking-[0.13em] text-[#686262] px-2.5 mb-2">
@@ -106,11 +129,11 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
           </p>
           <div className="flex flex-col gap-[3px]">
             {WORKSPACE_LINKS.map((l) => {
-              const isActive = l.href === active.href;
+              const isActive = l.href === activeHref;
               return (
                 <Link
                   key={l.href}
-                  href={l.href}
+                  href={workspaceHref(l.href, { jobId: job?.id })}
                   aria-current={isActive ? "page" : undefined}
                   onClick={() => setOpen(false)}
                   className={`flex items-center gap-3 px-2.5 py-[11px] text-[13px] transition-colors border-l-2 ${
@@ -120,9 +143,9 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
                   }`}
                 >
                   <span>{l.label}</span>
-                  {l.count && (
+                  {l.label === "Investigate" && investigationCount > 0 && (
                     <em className="ml-auto font-mono text-[10px] text-[#908989] not-italic">
-                      {l.count}
+                      {String(investigationCount).padStart(2, "0")}
                     </em>
                   )}
                 </Link>
@@ -133,16 +156,30 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
             SYSTEM
           </p>
           <div className="flex flex-col gap-[3px]">
-            {["History", "Settings"].map((label) => (
-              <span
-                key={label}
-                title="Coming soon"
-                aria-disabled="true"
-                className="px-2.5 py-[11px] text-[13px] text-[#4a4848] cursor-not-allowed border-l-2 border-transparent"
-              >
-                {label}
-              </span>
-            ))}
+            <Link
+              href={workspaceHref("/history", { jobId: job?.id })}
+              aria-current={pathname === "/history" ? "page" : undefined}
+              onClick={() => setOpen(false)}
+              className={`flex items-center px-2.5 py-[11px] text-[13px] border-l-2 transition-colors ${
+                pathname === "/history"
+                  ? "bg-[#242323] text-white border-white"
+                  : "text-[#979090] hover:text-white hover:bg-[#242323] border-transparent"
+              }`}
+            >
+              History
+            </Link>
+            <Link
+              href={workspaceHref("/settings", { jobId: job?.id })}
+              aria-current={pathname === "/settings" ? "page" : undefined}
+              onClick={() => setOpen(false)}
+              className={`flex items-center px-2.5 py-[11px] text-[13px] border-l-2 transition-colors ${
+                pathname === "/settings"
+                  ? "bg-[#242323] text-white border-white"
+                  : "text-[#979090] hover:text-white hover:bg-[#242323] border-transparent"
+              }`}
+            >
+              Settings
+            </Link>
           </div>
         </nav>
 
@@ -153,7 +190,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
         </div>
       </aside>
 
-      <div className="flex-1 min-w-0 flex flex-col">
+      <div className="hubris-shell-content flex-1 min-w-0 flex flex-col">
         <header className="h-[64px] border-b border-[#dedada] flex items-center gap-3 px-5 lg:px-11 sticky top-0 bg-[#f8f7f6] z-10">
           <button
             onClick={() => setOpen(true)}
@@ -169,10 +206,10 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
           <div className="ml-auto flex items-center gap-5">
             <span className="hidden sm:flex items-center gap-2 font-mono text-[10px] tracking-[0.08em] text-[#7A7171]">
               <span className="inline-block w-1.5 h-1.5 rounded-full bg-[#0A0A0A] breathe-dot" />
-              ANALYSIS COMPLETE
+              {status === "ready" && job ? "ANALYSIS COMPLETE" : "NO ACTIVE ANALYSIS"}
             </span>
             <span className="hidden md:inline font-mono text-[10px] text-[#7A7171]">
-              {REPO.branch}
+              {status === "ready" && repo.hasContext ? (repo.ref ?? "default branch") : "—"}
             </span>
             <span
               aria-label="Account"
@@ -193,7 +230,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
               return (
                 <li key={stage} className="pb-2 -mb-[11px]">
                   <Link
-                    href={href}
+                     href={workspaceHref(href, { jobId: job?.id })}
                     aria-current={isActive ? "step" : undefined}
                     className={`inline-block border-b-2 pb-2 transition-colors focus:outline-none focus-visible:border-[#0A0A0A] ${
                       isActive

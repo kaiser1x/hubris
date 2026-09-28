@@ -117,7 +117,7 @@ describe("POST /api/forge-verify draft rejection (mocked model)", () => {
     expect(chatComplete).toHaveBeenCalledWith(
       expect.anything(),
       expect.anything(),
-      expect.objectContaining({ maxTokens: 4096 })
+      expect.objectContaining({ maxTokens: 8192 })
     );
     expect(runCommand).not.toHaveBeenCalled();
     expect(uploadFile).not.toHaveBeenCalled();

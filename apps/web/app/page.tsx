@@ -2,6 +2,7 @@ import Link from "next/link";
 import HubrisLogo from "./components/HubrisLogo";
 import LivingTwin from "./components/LivingTwin";
 import SidePanels from "./components/SidePanels";
+import { LandingStats, LandingSyncLine } from "./components/LandingWorkspaceStatus";
 
 const LOOP = [
   ["Understand", "Twin maps the repo into a dependency graph."],
@@ -11,16 +12,9 @@ const LOOP = [
   ["Verify", "Re-run everything. Ship the evidence, not a claim."],
 ];
 
-const STATS: [string, string, string][] = [
-  ["Components mapped", "06", "across 5 layers"],
-  ["Execution paths", "06", "traced end to end"],
-  ["Regression tests", "428", "unit, all passing"],
-  ["Integration tests", "62", "all passing"],
-];
-
 export default function Home() {
   return (
-    <div className="bg-[#f8f7f6] text-[#0A0A0A]">
+    <div className="hubris-landing bg-[#f8f7f6] text-[#0A0A0A]">
       <SidePanels />
       <header className="relative border-b border-[#dedada] bg-[#f8f7f6]">
         <div className="max-w-6xl mx-auto px-5 h-16 flex items-center gap-3">
@@ -70,46 +64,31 @@ export default function Home() {
                 →
               </span>
             </Link>
-          <Link
-            href="/api/analyze?repo=octocat/Hello-World"
-            className="group/api inline-flex items-center font-mono text-[11px] tracking-[0.08em] text-[#7A7171] hover:text-[#0A0A0A] transition-colors underline underline-offset-4 decoration-[#dedada]"
-          >
-            TRY THE API
+            <Link
+              href="/codebase"
+              className="group/api inline-flex items-center font-mono text-[11px] tracking-[0.08em] text-[#7A7171] hover:text-[#0A0A0A] transition-colors underline underline-offset-4 decoration-[#dedada]"
+            >
+              ANALYZE A REPOSITORY
+              <span
+                aria-hidden="true"
+                className="ml-1.5 inline-block transition-transform duration-200 group-hover/api:translate-x-[2px]"
+              >
+                ↗
+              </span>
+            </Link>
+          </div>
+          <p className="flex items-center gap-2 font-mono text-[11px] text-[#7A7171] mt-7">
             <span
               aria-hidden="true"
-              className="ml-1.5 inline-block transition-transform duration-200 group-hover/api:translate-x-[2px]"
-            >
-              ↗
-            </span>
-          </Link>
+              className="inline-block w-1.5 h-1.5 rounded-full bg-[#0A0A0A] breathe-dot"
+            />
+            <LandingSyncLine />
+          </p>
         </div>
-        <p className="flex items-center gap-2 font-mono text-[11px] text-[#7A7171] mt-7">
-          <span
-            aria-hidden="true"
-            className="inline-block w-1.5 h-1.5 rounded-full bg-[#0A0A0A] breathe-dot"
-          />
-          TWIN SYNCED · hubris-demo-ledger · main
-        </p>
-      </div>
-    </section>
+      </section>
 
       <section className="max-w-6xl mx-auto px-5 pb-12">
-        <div className="border-y border-[#dedada] grid grid-cols-2 md:grid-cols-4">
-          {STATS.map(([label, value, sub], i) => (
-            <div
-              key={label}
-              className={`py-5 pr-5 ${i > 0 ? "md:pl-5 md:border-l md:border-[#dedada]" : ""} ${i === 2 ? "max-md:border-l max-md:pl-5" : ""}`}
-            >
-              <p className="kicker">{label}</p>
-              <p className="font-display text-[34px] leading-none mt-3">
-                {value}
-              </p>
-              <p className="font-mono text-[11px] text-[#7A7171] mt-2">
-                {sub}
-              </p>
-            </div>
-          ))}
-        </div>
+        <LandingStats />
       </section>
 
       <section className="max-w-6xl mx-auto px-5 pb-12">
@@ -135,32 +114,29 @@ export default function Home() {
 
       <section className="max-w-6xl mx-auto px-5 pb-12 grid gap-10 lg:grid-cols-[1fr_320px] lg:gap-16">
         <div>
-          <h2 className="kicker">The demo ledger</h2>
+          <h2 className="kicker">One codebase, one thread of truth</h2>
           <p className="font-mono text-[13px] mt-3 leading-7">
-            POST /api/transactions
+            The CodeTwin maps your repository into a dependency graph.
             <span className="text-[#7A7171]"> → </span>
-            TransactionController
+            Investigation grounds a suspected bug in that graph.
             <span className="text-[#7A7171]"> → </span>
-            TransactionService
+            Reproduction stages the analyzed revision in a sandbox.
             <span className="text-[#7A7171]"> → </span>
-            Queue
+            Forge generates a minimal patch.
             <span className="text-[#7A7171]"> → </span>
-            Worker
-            <span className="text-[#7A7171]"> → </span>
-            PostgreSQL
+            Verify re-runs everything against the same revision.
           </p>
           <p className="text-sm text-[#7A7171] mt-3 max-w-xl leading-7">
-            Two concurrent requests for the same logical transaction created
-            two rows. The twin traced the path, the sandbox reproduced it,
-            and the patch added the missing pre-write idempotency guard,
-            verified against 428 unit and 62 integration tests.
+            Every stage derives its context from the analyzed job — the same
+            repository, the same source revision — so evidence never drifts
+            between screens.
           </p>
         </div>
         <div className="font-mono text-xs leading-6 text-[#7A7171] lg:pt-8">
-          <p>428 / 428 unit pass</p>
-          <p>62 / 62 integration pass</p>
-          <p>Typecheck pass</p>
-          <p className="text-[#0A0A0A] font-medium mt-2">Verified.</p>
+          <p>Repository-aware by design</p>
+          <p>Source revision pinned per job</p>
+          <p>Sandbox-isolated reproduction</p>
+          <p className="text-[#0A0A0A] font-medium mt-2">Evidence, not confidence.</p>
         </div>
       </section>
 

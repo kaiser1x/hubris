@@ -22,7 +22,7 @@ interface ChatMessage {
 
 // Deterministic model-call failure taxonomy. Every chatComplete failure
 // throws ModelError (never a bare fetch/SyntaxError), so callers log one
-// stable category and endpoints map deliberately. No retries here.
+// stable category and endpoints map deliberately.
 export type ModelErrorKind =
   | "http"
   | "empty"
@@ -152,21 +152,31 @@ export function diagnoseResponse(data: unknown): ResponseDiagnosis {
   return { ...meta, class: "CONTENT", contentState };
 }
 
-export async function chatComplete(
+// Cap for the budget-starvation retry. Reasoning models spend tokens
+// thinking before answering; a 4096 budget can be exhausted mid-reasoning
+// (finish_reason:length, content:null). The retry doubles the budget up to
+// this ceiling so the final content always has room to exist. Two retries
+// max in practice (default forge budget 8192 -> 16384).
+export const MAX_RETRY_BUDGET = 16384;
+
+// A response with no usable content whose finish_reason is "length" means
+// the token budget ran out before the model produced output (mid-reasoning
+// for reasoning models, mid-generation otherwise). Retrying with a larger
+// budget is the correct recovery; every other empty shape is terminal.
+export function isBudgetStarvation(diagnosis: ResponseDiagnosis): boolean {
+  return diagnosis.contentState !== "present" && diagnosis.finishReason === "length";
+}
+
+async function postCompletion(
   config: LlmConfig,
   messages: ChatMessage[],
-  options?: {
-    maxTokens?: number;
+  options: {
+    budget: number;
     temperature?: number;
     signal?: AbortSignal;
-    // Verified against the Token Factory OpenAPI contract
-    // (ResponseFormat: text | json_object | json_schema). Unset by
-    // default: the field is omitted and server behavior is unchanged.
-    // Use json_object only for JSON consumers (structured edits) —
-    // never for diff/prose generation.
     responseFormat?: "text" | "json_object";
   }
-): Promise<string> {
+): Promise<{ data: unknown; requestId: string | null }> {
   let response: Response;
   try {
     response = await fetch(`${config.baseUrl.replace(/\/$/, "")}/chat/completions`, {
@@ -178,13 +188,13 @@ export async function chatComplete(
       body: JSON.stringify({
         model: config.model,
         messages,
-        max_tokens: options?.maxTokens ?? 500,
-        temperature: options?.temperature ?? 0.2,
-        ...(options?.responseFormat !== undefined
+        max_tokens: options.budget,
+        temperature: options.temperature ?? 0.2,
+        ...(options.responseFormat !== undefined
           ? { response_format: { type: options.responseFormat } }
           : {}),
       }),
-      signal: options?.signal,
+      signal: options.signal,
     });
   } catch (e: unknown) {
     if (e instanceof DOMException && e.name === "AbortError") {
@@ -209,21 +219,69 @@ export async function chatComplete(
   } catch {
     throw new ModelError("parse", "Model API returned malformed JSON");
   }
-  const diagnosis = diagnoseResponse(data);
-  diagnosis.requestId =
+  const requestId =
     response.headers?.get("x-request-id") ??
     response.headers?.get("request-id") ??
     response.headers?.get("x-correlation-id") ??
     null;
-  const content =
-    diagnosis.contentState === "present"
-      ? (
-          data as {
-            choices: Array<{ message: { content: string } }>;
-          }
-        ).choices[0].message.content
-      : undefined;
-  if (!content)
+  return { data, requestId };
+}
+
+export async function chatComplete(
+  config: LlmConfig,
+  messages: ChatMessage[],
+  options?: {
+    maxTokens?: number;
+    temperature?: number;
+    signal?: AbortSignal;
+    // Verified against the Token Factory OpenAPI contract
+    // (ResponseFormat: text | json_object | json_schema). Unset by
+    // default: the field is omitted and server behavior is unchanged.
+    // Use json_object only for JSON consumers (structured edits) —
+    // never for diff/prose generation.
+    responseFormat?: "text" | "json_object";
+  }
+): Promise<string> {
+  let budget = options?.maxTokens ?? 500;
+  let diagnosis: ResponseDiagnosis = {
+    class: "H_malformed",
+    choicesCount: null,
+    choiceKeys: [],
+    messageKeys: [],
+    role: undefined,
+    contentState: "absent",
+    finishReason: undefined,
+    refusalPresent: false,
+    toolCallsPresent: false,
+    toolCallsCount: null,
+    reasoningPresent: false,
+    requestId: null,
+  };
+  while (true) {
+    const { data, requestId } = await postCompletion(config, messages, {
+      budget,
+      temperature: options?.temperature,
+      signal: options?.signal,
+      responseFormat: options?.responseFormat,
+    });
+    diagnosis = diagnoseResponse(data);
+    diagnosis.requestId = requestId;
+    const content =
+      diagnosis.contentState === "present"
+        ? (
+            data as {
+              choices: Array<{ message: { content: string } }>;
+            }
+          ).choices[0].message.content
+        : undefined;
+    if (content) return content;
+    // Budget starvation (reasoning models, or a long generation cut off at
+    // the cap): give the model room to finish, up to the retry ceiling.
+    // Every other empty shape (refusal, malformed, genuine empty) is final.
+    if (isBudgetStarvation(diagnosis) && budget < MAX_RETRY_BUDGET) {
+      budget = Math.min(MAX_RETRY_BUDGET, budget * 2);
+      continue;
+    }
     throw new ModelError("empty", "Model API returned no content", undefined, diagnosis);
-  return content;
+  }
 }

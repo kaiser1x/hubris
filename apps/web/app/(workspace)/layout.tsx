@@ -1,3 +1,4 @@
+import WorkspaceProvider from "../components/WorkspaceProvider";
 import AppShell from "../components/AppShell";
 
 export default function WorkspaceLayout({
@@ -5,5 +6,9 @@ export default function WorkspaceLayout({
 }: {
   children: React.ReactNode;
 }) {
-  return <AppShell>{children}</AppShell>;
+  return (
+    <WorkspaceProvider>
+      <AppShell>{children}</AppShell>
+    </WorkspaceProvider>
+  );
 }

@@ -16,7 +16,7 @@ import { z } from "zod";
 import { isSafeGitRef, REPO_WORKDIR } from "@hubris/sandbox";
 import { CHECKOUT_UPLOAD_PATH } from "./checkout";
 import { INSTALL_COMMANDS, type PackageManager } from "./install";
-import { VERIFY_BEGIN_MARKER } from "./forgeverify";
+import { TARGET_VERIFY_DONE_MARKER, VERIFY_BEGIN_MARKER } from "./forgeverify";
 
 const execFileAsync = promisify(execFile);
 
@@ -70,7 +70,31 @@ export interface SourceExcerpt {
   function: string;
   lines: string;
   text: string;
+  // Anchor metadata (safe, bounded): which function the window anchors on,
+  // whether it is the investigation's explicit target, and whether the
+  // function body extends past the excerpt window.
+  anchorLine: number;
+  targetIncluded: boolean;
+  truncated: boolean;
 }
+
+// Window shape for source excerpts. The window anchors on the target
+// function's real location and is extended (up to a bound) so the function
+// body is normally included in full. Lead lines give context before the
+// signature; the body-extension bound caps how far a very large function can
+// grow the window. Never unbounded.
+export const EXCERPT_LEAD_LINES = 3;
+export const EXCERPT_BODY_EXTEND_LINES = 60;
+
+export type TwinFunctionLocation = {
+  name?: string;
+  path?: string;
+  line?: number;
+  // 1-based end line of the function body. Absent on legacy twins analyzed
+  // before end-line tracking — the caller then uses the plain 60-line window
+  // and treats the body as unknown.
+  endLine?: number;
+};
 
 // Resolve the revision a Forge run must check out: the job's persisted
 // analyzed ref (result.ref, written by POST /api/analyze when it cloned
@@ -82,6 +106,14 @@ export function resolveJobRef(result: unknown): string | null {
   const ref = (result as { ref?: unknown }).ref;
   if (typeof ref !== "string" || ref.length === 0 || ref.length > 100) return null;
   return isSafeGitRef(ref) ? ref : null;
+}
+
+export function resolveJobCommitSha(result: unknown): string | null {
+  if (typeof result !== "object" || result === null) return null;
+  const commitSha = (result as { commitSha?: unknown }).commitSha;
+  return typeof commitSha === "string" && /^[a-f0-9]{40}$/.test(commitSha)
+    ? commitSha
+    : null;
 }
 
 async function blobLines(src: string, filePath: string): Promise<string[] | null> {
@@ -100,17 +132,46 @@ async function blobLines(src: string, filePath: string): Promise<string[] | null
 // Bounded excerpts for focus-relevant twin functions, read from blob bytes
 // (identical to what the tarball carries). Focus substring match on
 // name/path first, twin order as fallback so the prompt is never empty.
+//
+// Target-aware anchoring: when the focus names a Target (the repair
+// contract), the excerpt window for that file is anchored on the target
+// function's real source line and extended (bounded) to include the whole
+// function body. Non-target files keep the previous behavior anchored on
+// their best-matching function. Deterministic ordering is preserved.
 export async function buildSourceExcerpts(
   src: string,
-  functions: Array<{ name?: string; path?: string; line?: number }>,
+  functions: TwinFunctionLocation[],
   focus: string
 ): Promise<{ blocks: SourceExcerpt[]; totalChars: number; truncated: boolean }> {
   const needle = focus.toLowerCase();
+  const targetMatch = focus.match(/Target:\s*([^\s(]+)\s*\(([^)]+)\)/i);
+  const targetFunction = targetMatch?.[1]?.toLowerCase() ?? "";
+  const targetPath = targetMatch?.[2]?.toLowerCase() ?? "";
+  const focusTerms = focus
+    .split(/[^a-z0-9_./-]+/i)
+    .map((term) => term.toLowerCase())
+    .filter((term) => term.length >= 3);
   const ranked = [...functions].sort((a, b) => {
-    const score = (f: { name?: string; path?: string }) =>
-      `${f.name ?? ""} ${f.path ?? ""}`.toLowerCase().includes(needle) ? 0 : 1;
+    const score = (f: { name?: string; path?: string }) => {
+      const name = (f.name ?? "").toLowerCase();
+      const path = (f.path ?? "").toLowerCase();
+      if ((targetFunction && name === targetFunction) || (targetPath && path === targetPath)) return 0;
+      if (`${name} ${path}`.includes(needle)) return 1;
+      return 2 - Math.min(1, focusTerms.filter((term) => name.includes(term) || path.includes(term)).length);
+    };
     return score(a) - score(b);
   });
+
+  // The explicit target function in the target file, if present.
+  const targetFn =
+    targetFunction && targetPath
+      ? functions.find(
+          (f) =>
+            (f.path ?? "").toLowerCase() === targetPath &&
+            (f.name ?? "").toLowerCase() === targetFunction
+        )
+      : undefined;
+
   const blocks: SourceExcerpt[] = [];
   let totalChars = 0;
   let truncated = false;
@@ -120,17 +181,45 @@ export async function buildSourceExcerpts(
     const filePath = fn.path;
     if (!filePath || seen.has(filePath)) continue;
     seen.add(filePath);
+
+    // Anchor on the explicit target when this is the target file; otherwise
+    // on the best-ranked function in this file (first in ranked order).
+    const anchor =
+      targetFn && (targetFn.path ?? "").toLowerCase() === filePath.toLowerCase()
+        ? targetFn
+        : fn;
+    const anchorLine = anchor.line && anchor.line > 0 ? anchor.line : 1;
+    const fnEndLine =
+      typeof anchor.endLine === "number" && anchor.endLine >= anchorLine
+        ? anchor.endLine
+        : undefined;
+
     const lines = await blobLines(src, filePath);
     if (!lines) continue;
-    const start = Math.max(1, (fn.line ?? 1) - 3);
-    const slice = lines.slice(start - 1, start - 1 + EXCERPT_MAX_LINES);
-    const end = start + slice.length - 1;
+
+    const startLine = Math.max(1, anchorLine - EXCERPT_LEAD_LINES);
+    const defaultEnd = startLine + EXCERPT_MAX_LINES - 1;
+    const extendedCap = startLine + EXCERPT_MAX_LINES + EXCERPT_BODY_EXTEND_LINES - 1;
+    // Include the whole body when it fits within the extended cap; otherwise
+    // keep the bounded window and report truncation rather than pretending
+    // the entire function was provided.
+    const desiredEnd = fnEndLine !== undefined ? Math.max(defaultEnd, fnEndLine) : defaultEnd;
+    const endLine = Math.min(desiredEnd, extendedCap, lines.length);
+    const bodyTruncated = fnEndLine !== undefined && fnEndLine > endLine;
+
+    const slice = lines.slice(startLine - 1, endLine);
     const text = slice.join("\n");
     const block: SourceExcerpt = {
       path: filePath,
-      function: fn.name ?? "(anonymous)",
-      lines: `${start}-${end}`,
+      function: anchor.name ?? "(anonymous)",
+      lines: `${startLine}-${endLine}`,
       text: text.slice(0, 4000),
+      anchorLine,
+      targetIncluded:
+        targetFn !== undefined &&
+        (anchor.name ?? "").toLowerCase() === targetFunction &&
+        (anchor.path ?? "").toLowerCase() === targetPath,
+      truncated: bodyTruncated,
     };
     const size = block.path.length + block.function.length + block.text.length;
     if (totalChars + size > EXCERPT_MAX_CHARS) {
@@ -192,7 +281,8 @@ export const SOURCE_REF_MARKER = "SOURCE_REF";
 export const SOURCE_SHA_MARKER = "SOURCE_SHA";
 
 // Full structured run: extract, baseline-commit, mechanical apply,
-// canonical diff + both git checks, install, verification command.
+// canonical diff + both git checks, install, targeted verification of the
+// investigated scenario (when provided), then the full suite.
 // Canonical diff is machine-generated (git diff), never model-written.
 // The expected source revision (resolved server-side from the job) is
 // echoed back as markers so the outcome can prove the sandbox executed
@@ -203,7 +293,11 @@ export function buildStructuredScript(
   manager: PackageManager,
   excluded: string[],
   verifyInvoke: string,
-  expected: { ref: string | null; sha: string | null } = { ref: null, sha: null }
+  expected: { ref: string | null; sha: string | null } = { ref: null, sha: null },
+  // Targeted command for the exact investigated scenario. Null when the
+  // investigation supplied no scenario or the runner is unsupported — the
+  // verification phase then runs the full suite only.
+  targetCommand: string | null = null
 ): string {
   const dir = shQuote(REPO_WORKDIR);
   const tar = shQuote(CHECKOUT_UPLOAD_PATH);
@@ -223,7 +317,14 @@ export function buildStructuredScript(
     `git diff --check; ` +
     `git stash -q; git apply --check /tmp/canonical.patch; git stash pop -q; ` +
     `echo PATCH_OK; ` +
-    `${INSTALL_COMMANDS[manager]}; echo VERIFY_BEGIN; ${invoke}`
+    `${INSTALL_COMMANDS[manager]}; echo VERIFY_BEGIN; ` +
+    // Verification runs WITHOUT `set -e` so a failing target or a failing full
+    // suite is captured as evidence instead of aborting the script.
+    `set +e; ` +
+    (targetCommand
+      ? `${targetCommand}; TARGET_EXIT=$?; echo ${TARGET_VERIFY_DONE_MARKER} $TARGET_EXIT; `
+      : "") +
+    `${invoke}; FULL_EXIT=$?; exit $FULL_EXIT`
   );
 }
 

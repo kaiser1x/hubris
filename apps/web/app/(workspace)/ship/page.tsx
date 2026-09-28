@@ -1,16 +1,9 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useState } from "react";
-import { fetchLatestJob, liveRepoName } from "../../lib/live-twin";
-
-const CHECKLIST: [string, string][] = [
-  ["Patch", "1 file · +1 −2 · src/services/transactions.ts"],
-  ["Regression test", "concurrent-requests.test.ts · passes"],
-  ["Full suite", "428 unit · 62 integration · green"],
-  ["Typecheck and lint", "pass"],
-  ["Production writes", "none · sandbox only"],
-];
+import { useState } from "react";
+import { useWorkspace } from "../../components/WorkspaceProvider";
+import { workspaceHref } from "../../lib/workspace";
 
 interface BundleRow {
   label: string;
@@ -55,30 +48,52 @@ function buildBundle(job: {
 }
 
 export default function ShipPage() {
+  const { status, job, jobId, repo } = useWorkspace();
   const [reviewed, setReviewed] = useState(false);
-  const [bundle, setBundle] = useState<BundleRow[] | null>(null);
-  const [ready, setReady] = useState(false);
-  const [repo, setRepo] = useState<string | null>(null);
+  const bundle = job ? buildBundle(job) : null;
+  const ready = bundle?.ready ?? false;
+  const rows = bundle?.rows ?? null;
 
-  useEffect(() => {
-    let cancelled = false;
-    fetchLatestJob().then((job) => {
-      if (cancelled || !job) return;
-      const built = buildBundle(job);
-      setBundle(built.rows);
-      setReady(built.ready);
-      setRepo(liveRepoName(job));
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+  if (status === "loading") {
+    return (
+      <div className="max-w-[1440px] mx-auto px-5 lg:px-[52px] pt-10 lg:pt-[50px] pb-12">
+        <p className="kicker">Repository / Ship</p>
+        <p className="font-mono text-[13px] text-[#7A7171] mt-4">
+          Loading workspace…
+        </p>
+      </div>
+    );
+  }
+
+  if (!bundle) {
+    return (
+      <div className="max-w-[1440px] mx-auto px-5 lg:px-[52px] pt-10 lg:pt-[50px] pb-12">
+        <p className="kicker">Repository / Ship</p>
+        <h1 className="font-display text-[clamp(32px,4vw,46px)] leading-[1.05] mt-4">
+          No analyzed repository
+        </h1>
+        <p className="text-[15px] text-[#7A7171] mt-4 max-w-2xl leading-7">
+          The ship record summarizes the evidence gathered against the
+          analyzed repository. Analyze a repository and run the workflow to
+          build a reviewable change bundle here.
+        </p>
+        <Link
+          href={workspaceHref("/codebase", { jobId })}
+          className="inline-flex mt-7 bg-[#0A0A0A] text-white font-mono text-[11px] tracking-[0.08em] px-4 py-3 hover:bg-black active:scale-[0.98] transition-all"
+        >
+          ANALYZE REPOSITORY ↗
+        </Link>
+      </div>
+    );
+  }
 
   return (
     <div className="max-w-[1440px] mx-auto px-5 lg:px-[52px] pt-10 lg:pt-[50px] pb-12">
-      <p className="kicker">Repository / Ship{bundle ? ` · live · ${repo}` : " · case-031"}</p>
+      <p className="kicker">
+        Repository / Ship{repo.hasContext ? ` · live · ${repo.repoName}` : ""}
+      </p>
       <h1 className="font-display text-[clamp(32px,4vw,46px)] leading-[1.05] mt-4">
-        {bundle ? (ready ? "Ready to ship" : "Evidence incomplete") : "Ready to ship"}
+        {ready ? "Ready to ship" : "Evidence incomplete"}
       </h1>
       <p className="text-[15px] text-[#7A7171] mt-4 max-w-2xl leading-7">
         The verified change is ready for final review. Nothing below merges
@@ -94,9 +109,9 @@ export default function ShipPage() {
           {reviewed ? "HIDE REVIEW" : "REVIEW CHANGE"}
         </button>
 
-        {reviewed && (
+        {reviewed && rows && (
           <dl className="mt-6 font-mono text-xs border-t border-[#dedada]">
-            {(bundle ?? CHECKLIST.map(([label, value]) => ({ label, value }))).map((row) => (
+            {rows.map((row) => (
               <div
                 key={row.label}
                 className="flex justify-between gap-4 py-2 border-b border-[#dedada]"
@@ -110,7 +125,7 @@ export default function ShipPage() {
 
         <p className="text-sm mt-6">
           <Link
-            href="/verify"
+            href={workspaceHref("/verify", { jobId })}
             className="font-mono text-[11px] tracking-[0.08em] text-[#7A7171] hover:text-[#0A0A0A] transition-colors underline underline-offset-4 decoration-[#dedada]"
           >
             BACK TO VERIFICATION

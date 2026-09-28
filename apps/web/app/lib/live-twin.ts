@@ -47,6 +47,10 @@ export interface LiveStats {
 
 export interface LiveJobResult {
   jobId: string;
+  ref?: string;
+  commitSha?: string;
+  packageManager?: "pnpm" | "npm" | null;
+  scripts?: Record<string, string>;
   repository: { id: string; name: string; analysisStatus: string };
   stats: LiveStats;
   sample: { functions: LiveFunction[]; endpoints: LiveEndpoint[] };
@@ -56,12 +60,21 @@ export interface LiveJobResult {
     endpoints: LiveEndpoint[];
     tests: LiveTest[];
     relationships: LiveRelationship[];
+    sourceFacts?: Array<{
+      path?: string;
+      line?: number;
+      kind?: "source" | "test";
+      text?: string;
+    }>;
   };
   // Persisted Forge evidence. Unknown by design: the forge-run mapper
   // validates every entry before display, so the page never renders
   // unvalidated backend shapes.
   forgeRuns?: unknown[];
   draftRejections?: unknown[];
+  investigationRuns?: unknown[];
+  verifications?: Array<{ passed?: boolean; exitCode?: number | null; [key: string]: unknown }>;
+  reproductions?: Array<{ exitCode?: number | null; [key: string]: unknown }>;
 }
 
 export interface LiveJob {
@@ -216,8 +229,8 @@ export function liveRepoName(job: LiveJob): string {
 }
 
 async function fetchJobs(url: string): Promise<LiveJob[]> {
-  // Bound the wait: a hung API/DB must degrade to the demo narrative,
-  // never leave a page on its loading gate forever.
+  // Bound the wait: a hung API/DB must resolve to an empty list, never
+  // leave a page on its loading gate forever.
   // Dev-safe diagnostics: status + elapsed only, never bodies or secrets.
   const t0 = Date.now();
   console.log("OVERVIEW_FETCH_START", url.split("?")[0]);
@@ -262,6 +275,18 @@ export async function fetchRecentJobs(limit = 10): Promise<LiveJob[]> {
     return await fetchJobs(`/api/jobs?${params}`);
   } catch {
     return [];
+  }
+}
+
+export async function fetchJobById(jobId: string): Promise<LiveJob | null> {
+  if (!jobId) return null;
+  try {
+    const response = await fetch(`/api/jobs/${encodeURIComponent(jobId)}`);
+    if (!response.ok) return null;
+    const data = (await response.json()) as LiveJob;
+    return data && typeof data.id === "string" ? data : null;
+  } catch {
+    return null;
   }
 }
 

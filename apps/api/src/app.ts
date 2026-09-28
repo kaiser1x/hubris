@@ -29,7 +29,7 @@ import {
   STRUCTURED_SYSTEM,
 } from "@hubris/llm";
 import { createHash } from "crypto";
-import { buildRepoCheckoutCommand, executionLimitsFromEnv, isSafeGitRef, REPO_WORKDIR, runCommand, sandboxConfigFromEnv, uploadFile } from "@hubris/sandbox";
+import { executionLimitsFromEnv, isSafeGitRef, REPO_WORKDIR, runCommand, sandboxConfigFromEnv, uploadFile } from "@hubris/sandbox";
 import {
   buildCheckoutScript,
   CHECKOUT_UPLOAD_PATH,
@@ -51,14 +51,18 @@ import {
   testTimingFromEnv,
 } from "./testrun";
 import {
+  assessVerification,
   buildApplyCheckScript,
   buildForgeVerifyScript,
   buildRejectedDraftPreview,
+  buildTargetVerificationCommand,
   getForgeContext,
   parseApplyCheckResult,
+  parseTargetVerification,
   resolveForgeStatus,
   toAttemptRecord,
   VERIFY_BEGIN_MARKER,
+  type TargetVerificationInput,
   type TwinJobLike,
 } from "./forgeverify";
 import {
@@ -68,12 +72,15 @@ import {
   isSupportedEditPath,
   parseSourceMarkers,
   parseStructuredRun,
+  resolveJobCommitSha,
   resolveJobRef,
   sourceMarkersMatch,
   STRUCTURED_UPLOAD_EDITS,
   STRUCTURED_UPLOAD_VALIDATOR,
   VALIDATOR_JS,
 } from "./structured";
+import { composeForgeFocus, isGroundedRepairContract } from "./investigate";
+import { runInvestigationAgent } from "./investigate-agent";
 import {
   buildRegressionScript,
   DEFAULT_REGRESSION_TEST_PATH,
@@ -86,8 +93,44 @@ import {
   isPlausibleDiff,
   PATCH_OK_MARKER,
 } from "./apply";
+import {
+  buildVerifyScript,
+  buildReproScript,
+  classifyReproduction,
+  classifyVerification,
+  REPRO_BEGIN_MARKER,
+} from "./reproduce";
+import { describeSourceMismatch } from "./mismatch";
 
 const execFileAsync = promisify(execFile);
+
+function packageJsonScripts(repoPath: string): Record<string, string> {
+  try {
+    const raw = JSON.parse(fs.readFileSync(path.join(repoPath, "package.json"), "utf8")) as {
+      scripts?: Record<string, unknown>;
+    };
+    return Object.fromEntries(
+      Object.entries(raw.scripts ?? {}).filter(
+        (entry): entry is [string, string] => typeof entry[1] === "string"
+      )
+    );
+  } catch {
+    return {};
+  }
+}
+
+function readyInvestigation(result: unknown, investigationId: string): Record<string, unknown> | null {
+  if (typeof result !== "object" || result === null) return null;
+  const runs = (result as { investigationRuns?: unknown[] }).investigationRuns;
+  if (!Array.isArray(runs)) return null;
+  const found = runs.find(
+    (run): run is Record<string, unknown> =>
+      typeof run === "object" &&
+      run !== null &&
+      (run as Record<string, unknown>).investigationId === investigationId
+  );
+  return found && found.status === "READY" ? found : null;
+}
 
 // Only public github.com repos. Returns a normalized clone URL or null.
 export function toSafeCloneUrl(raw: string): string | null {
@@ -123,6 +166,22 @@ const AnalyzeBody = z.object({
 const InvestigateBody = z.object({
   jobId: z.string().min(1, "jobId is required"),
   question: z.string().max(2000).optional(),
+  // Structured investigation mode: a natural-language bug description
+  // grounded deterministically against the CodeTwin (no model call).
+  // When present and non-empty, the endpoint returns a strict
+  // READY | AMBIGUOUS | NO_MATCH verdict instead of a prose answer.
+  focus: z
+    .string()
+    .min(1)
+    .max(500)
+    .refine((value) => value.trim().length > 0, "focus is required")
+    .optional(),
+  // Conversational clarification: when a prior run returned
+  // CLARIFICATION_NEEDED, the client resubmits the same report plus the
+  // focused question and the user's answer. The agent resumes instead of
+  // asking the user to restate the whole bug.
+  priorQuestion: z.string().max(500).optional(),
+  clarification: z.string().max(500).optional(),
 });
 
 const ForgeBody = z.object({
@@ -133,7 +192,8 @@ const ForgeBody = z.object({
 
 const ReproduceBody = z.object({
   jobId: z.string().min(1, "jobId is required"),
-  script: z.string().min(1).max(4000),
+  investigationId: z.string().uuid().optional(),
+  script: z.string().min(1).max(4000).refine((value) => value.trim().length > 0, "script is required"),
   image: z.string().max(200).optional(),
   checkout: z.boolean().optional(),
   ref: GitRef.optional(),
@@ -141,7 +201,7 @@ const ReproduceBody = z.object({
 
 const VerifyBody = z.object({
   jobId: z.string().min(1, "jobId is required"),
-  script: z.string().min(1).max(4000),
+  script: z.string().min(1).max(4000).refine((value) => value.trim().length > 0, "script is required"),
   image: z.string().max(200).optional(),
   checkout: z.boolean().optional(),
   ref: GitRef.optional(),
@@ -211,15 +271,24 @@ const ForgeVerifyBody = z.object({
 
 const ForgeStructuredBody = z.object({
   jobId: z.string().min(1, "jobId is required"),
+  investigationId: z.string().uuid().optional(),
   ref: GitRef.optional(),
   image: z.string().max(200).optional(),
   manager: z.enum(["pnpm", "npm"]).optional(),
   // Required: selects the relevant twin functions for source excerpts and
   // states the behavior the edit must pin down.
-  focus: z.string().min(1).max(500),
+  // Carries the complete approved investigation contract, not only a short
+  // behavioral summary. The structured edit contract remains unchanged.
+  focus: z.string().min(1).max(2000),
   instruction: z.string().max(2000).optional(),
   verificationCommand: z.string().min(1).max(500).optional(),
 });
+
+function logInvestigation(event: string, details: Record<string, unknown> = {}): void {
+  if (process.env.NODE_ENV !== "production") {
+    console.info(`[investigate] ${event}`, details);
+  }
+}
 
 // Rewrite absolute clone-dir paths to repo-relative posix paths so stored
 // twins never leak the server's temp directory.
@@ -227,6 +296,56 @@ export function toRepoRelative(tmp: string, abs: string): string {
   const rel = path.relative(tmp, abs);
   if (rel === "" || rel.startsWith("..")) return abs;
   return rel.split(path.sep).join("/");
+}
+
+interface PersistedSourceFact {
+  path: string;
+  line: number;
+  kind: "source" | "test";
+  text: string;
+}
+
+// Persist only bounded, contract-shaped source facts. Investigation needs
+// assertions and guard/operation evidence, not a repository dump; this also
+// keeps arbitrary repository text out of later model prompts. The filter is
+// repository-agnostic: generic assertion/guard/duplication language only,
+// never demo-domain vocabulary.
+export function buildSourceFacts(
+  tmp: string,
+  twin: { functions: Array<{ path: string }>; tests: Array<{ path: string }> }
+): PersistedSourceFact[] {
+  const files = new Map<string, "source" | "test">();
+  for (const fn of twin.functions) files.set(fn.path, "source");
+  for (const test of twin.tests) files.set(test.path, "test");
+  const facts: PersistedSourceFact[] = [];
+  // A line is retained when it is behavior-bearing: an assertion, guard,
+  // throw, call, or a STRUCTURAL ASSIGNMENT. The assignment clause is generic
+  // (any `lhs = rhs`, `+=`, `x.y = …`, `??=` … ) and deliberately excludes
+  // comparisons (`==`, `===`, `!=`, `>=`, `<=`) and arrows (`=>`). This keeps a
+  // real defect assignment such as `total = subtotal` or
+  // `order.total = discountedTotal` available to the evidence layer without a
+  // domain-specific whitelist.
+  const BEHAVIOR_BEARING =
+    /(throw\s+new\s+Error|toThrow|rejects\.to|\.has\s*\(|\.add\s*\(|\.push\s*\(|\.set\s*\(|\.save\s*\(|\.delete\s*\(|\bit\s*\(|\bdescribe\s*\(|\btest\s*\(|\bif\s*\(|\bthrow\b|\bexpect\s*\(|error|reject|rejects|duplicate|retry|guard|expire|expired|timeout|invalid|wrong|incorrect|[A-Za-z_$][\w$]*\s*\([^)]*\)|[A-Za-z_$][\w$.]*\s*(?:\+|-|\*|\/|%|\|\||&&|\?\?)?=(?!=|>))/i;
+  for (const [absolute, kind] of files) {
+    if (facts.length >= 500) break;
+    let lines: string[];
+    try {
+      lines = fs.readFileSync(absolute, "utf8").split(/\r?\n/);
+    } catch {
+      continue;
+    }
+    lines.forEach((line, index) => {
+      if (facts.length >= 500 || line.length > 500) return;
+      if (!BEHAVIOR_BEARING.test(line)) return;
+      // Block lines that access or assign secrets. `\bpassword\b` alone would
+      // strip legitimate `resetPassword`/`requestPasswordReset` calls, so the
+      // word is only blocked when it assigns a value.
+      if (/(process\.env|api[_-]?key|secret|authorization|bearer|\bpassword\b\s*[:=])/i.test(line)) return;
+      facts.push({ path: toRepoRelative(tmp, absolute), line: index + 1, kind, text: line.trim() });
+    });
+  }
+  return facts;
 }
 
 export const app = new Hono();
@@ -339,8 +458,9 @@ app.post("/api/analyze", async (c: Context) => {
       ], {
         timeout: 90000,
       });
-      const started = Date.now();
+const started = Date.now();
       const twin = await analyzeRepository(tmp);
+      const sourceFacts = buildSourceFacts(tmp, twin);
       twin.name = cloneUrl.split("/").slice(-2).join("/").replace(/\.git$/, "");
       for (const fn of twin.functions) fn.path = toRepoRelative(tmp, fn.path);
       for (const cls of twin.classes) cls.path = toRepoRelative(tmp, cls.path);
@@ -350,9 +470,29 @@ app.post("/api/analyze", async (c: Context) => {
         t.file = toRepoRelative(tmp, t.file);
       }
       for (const r of twin.relationships) r.from = toRepoRelative(tmp, r.from);
+      // Exact analyzed revision: the commit the clone resolved to. Binds the
+      // twin to a concrete source revision for every downstream stage.
+      let commitSha: string | null = null;
+      try {
+        const rev = await execFileAsync("git", ["-C", tmp, "rev-parse", "HEAD"], {
+          timeout: 30000,
+        });
+        const sha = rev.stdout.trim();
+        if (/^[a-f0-9]{40}$/.test(sha)) commitSha = sha;
+      } catch {
+        commitSha = null;
+      }
       const payload = {
         jobId,
         ...(ref ? { ref } : {}),
+        ...(commitSha ? { commitSha } : {}),
+        packageManager: fs.existsSync(path.join(tmp, "pnpm-lock.yaml"))
+          ? "pnpm"
+          : fs.existsSync(path.join(tmp, "package-lock.json"))
+            ? "npm"
+            : null,
+        scripts:
+          packageJsonScripts(tmp),
         repository: {
           id: twin.repositoryId,
           name: twin.name,
@@ -385,6 +525,7 @@ app.post("/api/analyze", async (c: Context) => {
                 endpoints: twin.endpoints,
                 tests: twin.tests,
                 relationships: twin.relationships,
+                sourceFacts,
               },
             },
             updatedAt: new Date(),
@@ -446,6 +587,7 @@ app.get("/api/jobs/:id", async (c: Context) => {
   if (!job) {
     return c.json({ error: "Job not found", status: 404 }, 404);
   }
+
   return c.json(job);
 });
 
@@ -456,25 +598,48 @@ app.post("/api/investigate", async (c: Context) => {
   try {
     rawBody = await c.req.json();
   } catch {
+    logInvestigation("invalid-json");
     return c.json({ error: "Invalid JSON body", status: 400 }, 400);
   }
 
+  const rawJobId =
+    typeof rawBody === "object" && rawBody !== null && "jobId" in rawBody
+      ? (rawBody as { jobId?: unknown }).jobId
+      : undefined;
+  const rawFocus =
+    typeof rawBody === "object" && rawBody !== null && "focus" in rawBody
+      ? (rawBody as { focus?: unknown }).focus
+      : undefined;
+  logInvestigation("request-received", {
+    jobId: typeof rawJobId === "string" ? rawJobId : null,
+    focusLength: typeof rawFocus === "string" ? rawFocus.length : 0,
+  });
+
   const parsed = InvestigateBody.safeParse(rawBody);
   if (!parsed.success) {
+    logInvestigation("validation-failed", { issueCount: parsed.error.issues.length });
     return c.json({ error: "jobId is required", status: 400 }, 400);
   }
 
   const db = getDb();
   if (!db) {
+    logInvestigation("job-store-unavailable");
     return c.json({ error: "Job store unavailable", status: 503 }, 503);
   }
 
   const rows = await db.select().from(schema.jobs).where(eq(schema.jobs.id, parsed.data.jobId));
   const job = rows[0];
   if (!job) {
+    logInvestigation("job-not-found", { jobId: parsed.data.jobId });
     return c.json({ error: "Job not found", status: 404 }, 404);
   }
+  logInvestigation("job-loaded", {
+    jobId: job.id,
+    jobStatus: job.status,
+    hasResult: job.result !== null,
+  });
   const result = job.result as {
+    ref?: string;
     repository?: { name?: string };
     stats?: { functions: number; classes: number; endpoints: number; tests: number; relationships: number };
     sample?: { functions?: Array<{ name?: string }>; endpoints?: Array<{ method?: string; path?: string }> };
@@ -482,10 +647,124 @@ app.post("/api/investigate", async (c: Context) => {
       functions?: Array<{ name?: string; path?: string; line?: number }>;
       endpoints?: Array<{ method?: string; path?: string; file?: string }>;
       relationships?: Array<{ from?: string; to?: string; type?: string; caller?: string }>;
+      sourceFacts?: Array<{ path?: string; line?: number; kind?: "source" | "test"; text?: string }>;
     };
   } | null;
   if (job.status !== "complete" || !result?.stats) {
+    logInvestigation("analysis-incomplete", { jobId: job.id, jobStatus: job.status });
     return c.json({ error: "Job has no completed analysis", status: 400 }, 400);
+  }
+
+  // Structured investigation mode (Phase INVESTIGATE→FORGE). Pure twin
+  // retrieval: no model call, no model configuration required, and no
+  // repository writes or execution. The grounded result is persisted as a
+  // historical investigation record on the job; the legacy prose mode below
+  // is unchanged.
+  const focus = parsed.data.focus?.trim();
+  if (focus) {
+    const full = result.full;
+    const tests = (full as { tests?: unknown } | undefined)?.tests;
+    logInvestigation("structured-branch", {
+      jobId: job.id,
+      hasFullTwin: full !== undefined && full !== null,
+      functionCount: Array.isArray(full?.functions) ? full.functions.length : 0,
+      testCount: Array.isArray(tests) ? tests.length : 0,
+      relationshipCount: Array.isArray(full?.relationships) ? full.relationships.length : 0,
+    });
+    const agent = await runInvestigationAgent({
+      llm: llmConfigFromEnv(),
+      jobId: job.id,
+      repository: result.repository?.name ?? job.repoUrl,
+      ref: typeof result.ref === "string" ? result.ref : null,
+      commitSha:
+        typeof (result as { commitSha?: unknown }).commitSha === "string"
+          ? (result as { commitSha: string }).commitSha
+          : null,
+      scripts: (result as { scripts?: Record<string, string> }).scripts,
+      packageManager:
+        typeof (result as { packageManager?: unknown }).packageManager === "string"
+          ? (result as { packageManager: string }).packageManager
+          : null,
+      report: focus,
+      functions: Array.isArray(full?.functions) ? full.functions : [],
+      tests: Array.isArray(tests)
+        ? (tests as Array<{ name?: string; path?: string; file?: string }>)
+        : [],
+      relationships: Array.isArray(full?.relationships) ? full.relationships : [],
+      sourceFacts: Array.isArray(full?.sourceFacts) ? full.sourceFacts : [],
+      clarification:
+        parsed.data.clarification?.trim()
+          ? {
+              priorQuestion: parsed.data.priorQuestion?.trim() ?? "",
+              answer: parsed.data.clarification.trim(),
+            }
+          : undefined,
+    });
+    const verdict = agent.deterministic;
+    const investigationId = crypto.randomUUID();
+    const createdAt = new Date().toISOString();
+    const record = {
+      investigationId,
+      jobId: job.id,
+      focus,
+      ...verdict,
+      // Richer state model (spec §7). `status` stays READY|AMBIGUOUS|NO_MATCH
+      // for existing gating; `state` distinguishes review-from-answer.
+      state: agent.state,
+      observedBehavior: agent.observedBehavior,
+      expectedBehavior: agent.expectedBehavior,
+      modelSummary: agent.modelSummary,
+      clarification: agent.clarification,
+      retrievedEvidence: agent.retrievedEvidence,
+      relevantScenarios: agent.relevantScenarios,
+      relevantSourceFacts: agent.relevantSourceFacts,
+      relevantAssertions: agent.relevantAssertions,
+      modelUsed: agent.modelUsed,
+      createdAt,
+      source: {
+        jobId: job.id,
+        repository: result.repository?.name ?? job.repoUrl,
+        ref: typeof result.ref === "string" ? result.ref : null,
+        commitSha: typeof (result as { commitSha?: unknown }).commitSha === "string"
+          ? (result as { commitSha: string }).commitSha
+          : null,
+      },
+    };
+    const prior = (job.result as { investigationRuns?: unknown[] } | null)?.investigationRuns ?? [];
+    try {
+      await db
+        .update(schema.jobs)
+        .set({
+          result: { ...(job.result as object), investigationRuns: [...prior, record] },
+          updatedAt: new Date(),
+        })
+        .where(eq(schema.jobs.id, job.id));
+    } catch (error: any) {
+      logInvestigation("persistence-failed", { jobId: job.id, message: error?.message });
+      return c.json({ error: "Investigation could not be persisted", status: 503 }, 503);
+    }
+    logInvestigation("structured-response", {
+      jobId: job.id,
+      status: verdict.status,
+      state: agent.state,
+      investigationId,
+    });
+    return c.json({
+      jobId: job.id,
+      ...verdict,
+      investigationId,
+      createdAt,
+      state: agent.state,
+      observedBehavior: agent.observedBehavior,
+      expectedBehavior: agent.expectedBehavior,
+      modelSummary: agent.modelSummary,
+      clarification: agent.clarification,
+      retrievedEvidence: agent.retrievedEvidence,
+      relevantScenarios: agent.relevantScenarios,
+      relevantSourceFacts: agent.relevantSourceFacts,
+      relevantAssertions: agent.relevantAssertions,
+      modelUsed: agent.modelUsed,
+    });
   }
 
   const llm = llmConfigFromEnv();
@@ -619,13 +898,14 @@ app.post("/api/forge", async (c: Context) => {
   }
 });
 
-// POST /api/reproduce - Run a repro script in a disposable sandbox and
-// store the evidence (exit code, stdout, stderr) on the job.
-// Body: { jobId, script, image?, checkout?, ref? }. Script is capped at
-// 4000 chars; stored streams are truncated to protect the row.
-// checkout:true clones the job's repoUrl into the sandbox and runs the
-// script from the checkout (branch/tag via ref). Default false preserves
-// the original self-contained mode.
+// POST /api/reproduce - Stage the analyzed repository, provision the
+// detected package manager, install dependencies, then run the repro script
+// in a disposable sandbox. Evidence records whether the reported failure was
+// actually reproduced.
+// Body: { jobId, script, image?, ref? }. The script runs from the staged
+// repo root with the detected manager available (pnpm/npm), after a
+// --ignore-scripts locked install. A failing repro is evidence of the bug
+// (REPRODUCED), not an infrastructure failure.
 app.post("/api/reproduce", async (c: Context) => {
   let rawBody: unknown;
   try {
@@ -650,41 +930,195 @@ app.post("/api/reproduce", async (c: Context) => {
     return c.json({ error: "Job not found", status: 404 }, 404);
   }
 
+  const investigation = parsed.data.investigationId
+    ? readyInvestigation(job.result, parsed.data.investigationId)
+    : null;
+  if (parsed.data.investigationId && !investigation) {
+    return c.json(
+      { error: "The requested READY investigation is not attached to this job.", status: 400 },
+      400
+    );
+  }
+
+  const cloneUrl = toSafeCloneUrl(job.repoUrl);
+  if (!cloneUrl) {
+    return c.json({ error: "Job has unsupported repo URL", status: 400 }, 400);
+  }
+
   const sandbox = sandboxConfigFromEnv();
   if (!sandbox) {
     return c.json({ error: "Sandbox not configured", status: 503 }, 503);
   }
 
-  const checkout = parsed.data.checkout ?? false;
-  const ref = parsed.data.ref;
-  let command = parsed.data.script;
-  if (checkout) {
-    try {
-      command = buildRepoCheckoutCommand(job.repoUrl, parsed.data.script, ref);
-    } catch {
-      return c.json({ error: "Job has unsupported repo URL", status: 400 }, 400);
-    }
-  }
+  // Revision consistency: an explicit caller ref wins (same allow-list as
+  // analysis); otherwise the job's persisted analyzed ref is authoritative.
+  const jobRef = resolveJobRef(job.result);
+  const analyzedCommitSha = resolveJobCommitSha(job.result);
+  const ref = parsed.data.ref ?? jobRef ?? undefined;
+  const refSource = parsed.data.ref
+    ? ("requested" as const)
+    : jobRef
+      ? ("job" as const)
+      : ("default" as const);
 
+  const limits = limitsFromEnv();
+  const execLimits = executionLimitsFromEnv();
+  const timing = testTimingFromEnv();
+  const image = parsed.data.image ?? "tag:node:20-slim";
+  const tmp = await fs.promises.mkdtemp(path.join(os.tmpdir(), "hubris-reproduce-"));
   try {
-    const limits = executionLimitsFromEnv();
-    const result = await runCommand(sandbox, {
-      command,
-      image: parsed.data.image ?? "tag:busybox:latest",
-      shell: true,
-      disposable: true,
-      timeout: limits.commandTimeoutS,
-      truncateOutputAt: limits.maxOutputBytes,
-      waitMs: limits.waitMs,
-    });
-    const evidence = {
-      script: parsed.data.script,
+    let staged;
+    try {
+      staged = await cloneAndArchive(cloneUrl, ref, tmp, analyzedCommitSha ?? undefined);
+    } catch (error: any) {
+      if (error?.message === "revision-mismatch") {
+        return c.json({ error: "Staged source does not match the analyzed commit.", status: 409 }, 409);
+      }
+      const step =
+        error?.message === "clone"
+          ? "clone"
+          : error?.message === "ls-files"
+            ? "listing"
+            : "archive";
+      return c.json({ error: `Repository ${step} failed`, status: 500 }, 500);
+    }
+    const { tracked } = staged;
+    const excluded = tracked.filter(isTransferExcluded);
+    const expected = tracked.length - excluded.length;
+    if (expected <= 0) {
+      return c.json({ error: "Repository has no transferable files", status: 400 }, 400);
+    }
+    if (tracked.length > limits.maxFiles) {
+      return c.json(
+        { error: `Repository exceeds transfer limits (${tracked.length} files > ${limits.maxFiles})`, status: 413 },
+        413
+      );
+    }
+
+    const tarBytes = await fs.promises.readFile(staged.tarPath);
+    if (tarBytes.length > limits.maxBytes) {
+      return c.json(
+        { error: `Repository exceeds transfer limits (${tarBytes.length} bytes > ${limits.maxBytes})`, status: 413 },
+        413
+      );
+    }
+    const localSha = createHash("sha256").update(tarBytes).digest("hex");
+
+    const source = {
+      analysisRef: jobRef,
+      ref: ref ?? null,
+      refSource,
+      analysisCommitSha: analyzedCommitSha,
+      executionCommitSha: staged.commitSha,
+      commitSha: staged.commitSha,
+    };
+    if (analyzedCommitSha && staged.commitSha !== analyzedCommitSha) {
+      return c.json({ error: "Staged source does not match the analyzed commit.", status: 409 }, 409);
+    }
+
+    // Package-manager detection reuses the install pipeline's shared logic.
+    // Unsupported lockfiles fail closed as SETUP_FAILED instead of guessing.
+    const manager = detectManager(tracked);
+    if (!manager) {
+      const evidence = {
+        script: parsed.data.script,
+        requestedCommand: parsed.data.script,
+        command: parsed.data.script,
+        executedCommand: null,
+        setup: { status: "FAILED", reason: "No supported package manager detected." },
+        execution: { status: "NOT_STARTED", exitCode: null },
+        investigationId: parsed.data.investigationId ?? null,
+        source,
+        outcome: "SETUP_FAILED" as const,
+        reason: "No supported package manager detected (pnpm-lock.yaml or package-lock.json at repository root).",
+        exitCode: null,
+        timedOut: false,
+        stdout: "",
+        stderr: "",
+        packageManager: null,
+        installStatus: "not-run",
+        image,
+        at: new Date().toISOString(),
+      };
+      const prior = (job.result as { reproductions?: unknown[] } | null)?.reproductions ?? [];
+      await db
+        .update(schema.jobs)
+        .set({
+          result: { ...(job.result as object), reproductions: [...prior, evidence] },
+          updatedAt: new Date(),
+        })
+        .where(eq(schema.jobs.id, job.id));
+      return c.json({ jobId: job.id, evidence });
+    }
+
+    let tarUpload;
+    try {
+      tarUpload = await uploadFile(sandbox, tarBytes, { timeoutMs: 60000 });
+    } catch (error: any) {
+      console.error("Reproduce upload error:", error?.message);
+      return c.json({ error: "Sandbox upload failed", status: 502 }, 502);
+    }
+    if (tarUpload.sha256 !== localSha) {
+      return c.json({ error: "Transfer integrity mismatch", status: 502 }, 502);
+    }
+
+     const executedCommand = buildReproScript(manager, excluded, parsed.data.script);
+     const startedAt = Date.now();
+     let result;
+     try {
+       result = await runCommand(sandbox, {
+         command: executedCommand,
+        image,
+        files: { [CHECKOUT_UPLOAD_PATH]: { uuid: tarUpload.uuid } },
+        shell: true,
+        disposable: true,
+        timeout: timing.timeoutS,
+        truncateOutputAt: execLimits.maxOutputBytes,
+        waitMs: timing.waitMs,
+      });
+    } catch (error: any) {
+      console.error("Reproduce run error:", error?.message);
+      return c.json({ error: "Sandbox run failed", status: 502 }, 502);
+    }
+
+     const classification = classifyReproduction({
       exitCode: result.exitCode,
+      timedOut: result.timedOut,
+      stdout: result.stdout,
+      stderr: result.stderr,
+    });
+     const evidence = {
+       script: parsed.data.script,
+       requestedCommand: parsed.data.script,
+       command: executedCommand,
+       executedCommand,
+       setup: {
+         status: result.stdout.includes(REPRO_BEGIN_MARKER) ? "SUCCEEDED" : "FAILED",
+         packageManager: manager,
+       },
+       execution: {
+         status: result.stdout.includes(REPRO_BEGIN_MARKER)
+           ? result.timedOut
+             ? "TIMEOUT"
+             : result.exitCode === 127 || /(command )?not found/i.test(result.stderr)
+               ? "COMMAND_NOT_FOUND"
+               : "COMPLETED"
+           : "NOT_STARTED",
+         command: parsed.data.script,
+         exitCode: result.stdout.includes(REPRO_BEGIN_MARKER) ? result.exitCode : null,
+       },
+       durationMs: Date.now() - startedAt,
+       investigationId: parsed.data.investigationId ?? null,
+       outcome: classification.outcome,
+      reason: classification.reason,
+      exitCode: result.exitCode,
+      timedOut: result.timedOut,
       stdout: result.stdout.slice(0, 4000),
       stderr: result.stderr.slice(0, 4000),
-      timedOut: result.timedOut,
-      checkout,
-      ...(checkout ? { repoUrl: job.repoUrl, ...(ref ? { ref } : {}) } : {}),
+      packageManager: manager,
+      installStatus: result.stdout.includes(REPRO_BEGIN_MARKER) ? "installed" : "failed",
+      image,
+       source,
       at: new Date().toISOString(),
     };
     const prior = (job.result as { reproductions?: unknown[] } | null)?.reproductions ?? [];
@@ -696,9 +1130,8 @@ app.post("/api/reproduce", async (c: Context) => {
       })
       .where(eq(schema.jobs.id, job.id));
     return c.json({ jobId: job.id, evidence });
-  } catch (error: any) {
-    console.error("Reproduce error:", error?.message);
-    return c.json({ error: "Sandbox run failed", status: 502 }, 502);
+  } finally {
+    await fs.promises.rm(tmp, { recursive: true, force: true });
   }
 });
 
@@ -737,39 +1170,13 @@ app.post("/api/verify", async (c: Context) => {
     return c.json({ error: "Sandbox not configured", status: 503 }, 503);
   }
 
-  const checkout = parsed.data.checkout ?? false;
-  const ref = parsed.data.ref;
-  let command = parsed.data.script;
-  if (checkout) {
-    try {
-      command = buildRepoCheckoutCommand(job.repoUrl, parsed.data.script, ref);
-    } catch {
-      return c.json({ error: "Job has unsupported repo URL", status: 400 }, 400);
-    }
-  }
-
-  try {
-    const limits = executionLimitsFromEnv();
-    const result = await runCommand(sandbox, {
-      command,
-      image: parsed.data.image ?? "tag:busybox:latest",
-      shell: true,
-      disposable: true,
-      timeout: limits.commandTimeoutS,
-      truncateOutputAt: limits.maxOutputBytes,
-      waitMs: limits.waitMs,
-    });
-    const verification = {
-      script: parsed.data.script,
-      exitCode: result.exitCode,
-      passed: result.exitCode === 0 && !result.timedOut,
-      stdout: result.stdout.slice(0, 4000),
-      stderr: result.stderr.slice(0, 4000),
-      timedOut: result.timedOut,
-      checkout,
-      ...(checkout ? { repoUrl: job.repoUrl, ...(ref ? { ref } : {}) } : {}),
-      at: new Date().toISOString(),
-    };
+  const checkout = parsed.data.checkout ?? true;
+  const requestedCommand = parsed.data.script.trim();
+  const analysisRef = resolveJobRef(job.result);
+  const analysisCommitSha = resolveJobCommitSha(job.result);
+  const ref = parsed.data.ref ?? analysisRef ?? undefined;
+  const image = parsed.data.image ?? "tag:node:20-slim";
+  const persist = async (verification: Record<string, unknown>) => {
     const prior = (job.result as { verifications?: unknown[] } | null)?.verifications ?? [];
     await db
       .update(schema.jobs)
@@ -778,10 +1185,218 @@ app.post("/api/verify", async (c: Context) => {
         updatedAt: new Date(),
       })
       .where(eq(schema.jobs.id, job.id));
+  };
+  const baseEvidence = {
+    requestedCommand,
+    script: requestedCommand,
+    checkout,
+    image,
+    analysisRef,
+    analysisCommitSha,
+    at: new Date().toISOString(),
+  };
+
+  let tmp: string | null = null;
+  try {
+    let command = requestedCommand;
+    let executionCommitSha: string | null = null;
+    let setupStatus: "NOT_REQUESTED" | "SUCCEEDED" | "FAILED" = "NOT_REQUESTED";
+    let setupReason: string | null = null;
+    if (checkout) {
+      const cloneUrl = toSafeCloneUrl(job.repoUrl);
+      if (!cloneUrl) {
+        return c.json({ error: "Job has unsupported repo URL", status: 400 }, 400);
+      }
+      const checkoutLimits = limitsFromEnv();
+      tmp = await fs.promises.mkdtemp(path.join(os.tmpdir(), "hubris-verify-"));
+      let staged;
+      try {
+        staged = await cloneAndArchive(cloneUrl, ref, tmp, analysisCommitSha ?? undefined);
+      } catch (error: any) {
+        if (error?.message === "revision-mismatch") {
+          const verification = {
+            ...baseEvidence,
+            actualCommand: null,
+            setup: { status: "FAILED", reason: "Staged source does not match the analyzed commit." },
+            execution: { status: "NOT_STARTED", command: null, exitCode: null },
+            result: "SOURCE_MISMATCH",
+            passed: false,
+            exitCode: null,
+            stdout: "",
+            stderr: "",
+            timedOut: false,
+            executionCommitSha: null,
+          };
+          await persist(verification);
+          return c.json({ jobId: job.id, verification }, 409);
+        }
+        const verification = {
+          ...baseEvidence,
+          actualCommand: null,
+          setup: { status: "FAILED", reason: "Repository staging failed." },
+          execution: { status: "NOT_STARTED", command: null, exitCode: null },
+          result: "SETUP_FAILED",
+          passed: false,
+          exitCode: null,
+          stdout: "",
+          stderr: "",
+          timedOut: false,
+          executionCommitSha: null,
+        };
+        await persist(verification);
+        return c.json({ jobId: job.id, verification }, 500);
+      }
+      executionCommitSha = staged.commitSha;
+      if (analysisCommitSha && executionCommitSha !== analysisCommitSha) {
+        const verification = {
+          ...baseEvidence,
+          actualCommand: null,
+          setup: { status: "FAILED", reason: "Staged source does not match the analyzed commit." },
+          execution: { status: "NOT_STARTED", command: null, exitCode: null },
+          result: "SOURCE_MISMATCH",
+          passed: false,
+          exitCode: null,
+          stdout: "",
+          stderr: "",
+          timedOut: false,
+          executionCommitSha,
+        };
+        await persist(verification);
+        return c.json({ jobId: job.id, verification }, 409);
+      }
+      const tracked = staged.tracked;
+      const excluded = tracked.filter(isTransferExcluded);
+      if (tracked.length > checkoutLimits.maxFiles) {
+        return c.json({ error: "Repository exceeds transfer limits", status: 413 }, 413);
+      }
+      const manager = detectManager(tracked);
+      if (!manager) {
+        const verification = {
+          ...baseEvidence,
+          actualCommand: null,
+          setup: { status: "FAILED", reason: "No supported package manager detected." },
+          execution: { status: "NOT_STARTED", command: null, exitCode: null },
+          result: "SETUP_FAILED",
+          passed: false,
+          exitCode: null,
+          stdout: "",
+          stderr: "",
+          timedOut: false,
+          executionCommitSha,
+        };
+        await persist(verification);
+        return c.json({ jobId: job.id, verification });
+      }
+      const tarBytes = await fs.promises.readFile(staged.tarPath);
+      const tarUpload = await uploadFile(sandbox, tarBytes, { timeoutMs: 60000 });
+      const localSha = createHash("sha256").update(tarBytes).digest("hex");
+      if (tarUpload.sha256 !== localSha) {
+        return c.json({ error: "Transfer integrity mismatch", status: 502 }, 502);
+      }
+      command = buildVerifyScript(manager, excluded, requestedCommand);
+      setupStatus = "SUCCEEDED";
+      setupReason = `Installed dependencies with ${manager}.`;
+      const limits = executionLimitsFromEnv();
+      const startedAt = Date.now();
+      const result = await runCommand(sandbox, {
+        command,
+        image,
+        files: { [CHECKOUT_UPLOAD_PATH]: { uuid: tarUpload.uuid } },
+        shell: true,
+        disposable: true,
+        timeout: limits.commandTimeoutS,
+        truncateOutputAt: limits.maxOutputBytes,
+        waitMs: limits.waitMs,
+      });
+      const classification = classifyVerification({
+        setupRequired: true,
+        exitCode: result.exitCode,
+        timedOut: result.timedOut,
+        stdout: result.stdout,
+        stderr: result.stderr,
+      });
+      const verification = {
+        ...baseEvidence,
+        actualCommand: command,
+        setup: {
+          status: classification.setupStatus,
+          reason: classification.setupStatus === "SUCCEEDED" ? setupReason : "Dependency installation or checkout failed.",
+        },
+        execution: {
+          status: classification.executionStatus,
+          command: requestedCommand,
+          exitCode: classification.exitCode,
+        },
+        result: classification.result,
+        passed: classification.passed,
+        exitCode: classification.exitCode,
+        stdout: result.stdout.slice(0, 4000),
+        stderr: result.stderr.slice(0, 4000),
+        timedOut: result.timedOut,
+        executionCommitSha,
+        durationMs: Date.now() - startedAt,
+      };
+      await persist(verification);
+      return c.json({ jobId: job.id, verification });
+    }
+
+    const limits = executionLimitsFromEnv();
+    const startedAt = Date.now();
+    const result = await runCommand(sandbox, {
+      command,
+      image,
+      shell: true,
+      disposable: true,
+      timeout: limits.commandTimeoutS,
+      truncateOutputAt: limits.maxOutputBytes,
+      waitMs: limits.waitMs,
+    });
+    const classification = classifyVerification({
+      setupRequired: false,
+      exitCode: result.exitCode,
+      timedOut: result.timedOut,
+      stdout: result.stdout,
+      stderr: result.stderr,
+    });
+    const verification = {
+      ...baseEvidence,
+      actualCommand: command,
+      setup: { status: classification.setupStatus, reason: setupReason },
+      execution: {
+        status: classification.executionStatus,
+        command: requestedCommand,
+        exitCode: classification.exitCode,
+      },
+      result: classification.result,
+      passed: classification.passed,
+      exitCode: classification.exitCode,
+      stdout: result.stdout.slice(0, 4000),
+      stderr: result.stderr.slice(0, 4000),
+      timedOut: result.timedOut,
+      executionCommitSha,
+      durationMs: Date.now() - startedAt,
+    };
+    await persist(verification);
     return c.json({ jobId: job.id, verification });
   } catch (error: any) {
     console.error("Verify error:", error?.message);
-    return c.json({ error: "Sandbox run failed", status: 502 }, 502);
+    const verification = {
+      ...baseEvidence,
+      actualCommand: null,
+      setup: { status: "FAILED", reason: "Sandbox setup did not complete." },
+      execution: { status: "NOT_STARTED", command: null, exitCode: null },
+      result: "SETUP_FAILED",
+      passed: false,
+      exitCode: null,
+      stdout: "",
+      stderr: error?.message ? String(error.message).slice(0, 4000) : "",
+      timedOut: false,
+      executionCommitSha: null,
+    };
+    await persist(verification).catch(() => undefined);
+    return c.json({ error: "Sandbox setup failed", verification, status: 502 }, 502);
+  } finally {
+    if (tmp) await fs.promises.rm(tmp, { recursive: true, force: true });
   }
 });
 
@@ -2039,6 +2654,14 @@ app.post("/api/forge-verify", async (c: Context) => {
         exitCode: result.exitCode,
         timedOut: result.timedOut,
         passed: status === "VERIFIED",
+        assessment: assessVerification({
+          patchApplied: patchOk,
+          verificationStarted: verifyBegin,
+          exitCode: result.exitCode,
+          timedOut: result.timedOut,
+          stdout: result.stdout,
+          target: null,
+        }),
       },
       image,
       manager,
@@ -2120,6 +2743,47 @@ app.post("/api/forge-structured", async (c: Context) => {
     return c.json({ error: "Job has no completed analysis", status: 400 }, 400);
   }
 
+  // A Forge run is bound to the exact persisted investigation when one is
+  // provided. The backend loads that investigation and derives the focus
+  // from ITS plan — never from client-supplied focus text, the target name,
+  // the URL, or the most recent investigation. Missing/invalid → fail
+  // clearly. No fallback to another investigation.
+  const handoffInvestigationId = parsed.data.investigationId;
+  let effectiveFocus = parsed.data.focus;
+  // The investigated target test file/scenario, used to run an EXACT targeted
+  // verification. Null when the investigation named no reproduction.
+  let targetTestFile: string | null = null;
+  let targetScenario: string | null = null;
+  if (handoffInvestigationId) {
+    const runs = (job.result as { investigationRuns?: Array<Record<string, unknown>> } | null)
+      ?.investigationRuns;
+    const found = Array.isArray(runs)
+      ? runs.find((r) => r.investigationId === handoffInvestigationId)
+      : undefined;
+    if (!found) {
+      return c.json(
+        { error: `Investigation ${handoffInvestigationId} not found on this job`, status: 400 },
+        400
+      );
+    }
+    const status = typeof found.status === "string" ? found.status : null;
+    if (
+      status !== "READY" ||
+      typeof found.plan !== "object" ||
+      found.plan === null ||
+      !isGroundedRepairContract((found.plan as { repairContract?: unknown }).repairContract as Parameters<typeof isGroundedRepairContract>[0])
+    ) {
+      return c.json({ error: "Investigation is not READY for Forge", status: 400 }, 400);
+    }
+    effectiveFocus = composeForgeFocus(found.plan as Parameters<typeof composeForgeFocus>[0]);
+    const reproduction = (found.plan as { reproduction?: { testFile?: unknown; scenario?: unknown } })
+      .reproduction;
+    targetTestFile =
+      reproduction && typeof reproduction.testFile === "string" ? reproduction.testFile : null;
+    targetScenario =
+      reproduction && typeof reproduction.scenario === "string" ? reproduction.scenario : null;
+  }
+
   const limits = limitsFromEnv();
   const execLimits = executionLimitsFromEnv();
   const timing = testTimingFromEnv();
@@ -2129,13 +2793,14 @@ app.post("/api/forge-structured", async (c: Context) => {
   // jobs without any ref keep the previous default-branch behavior, and
   // the evidence says so explicitly.
   const jobRef = resolveJobRef(job.result);
+  const analyzedCommitSha = resolveJobCommitSha(job.result);
   const ref = parsed.data.ref ?? jobRef ?? undefined;
   const refSource = parsed.data.ref
     ? ("requested" as const)
     : jobRef
       ? ("job" as const)
       : ("default" as const);
-  const image = parsed.data.image ?? "tag:node:20-slim";
+const image = parsed.data.image ?? "tag:node:20-slim";
   const runId = crypto.randomUUID();
   const startedAt = new Date().toISOString();
   const history: Array<{ state: string; at: string }> = [
@@ -2144,15 +2809,18 @@ app.post("/api/forge-structured", async (c: Context) => {
   const stamp = () => new Date().toISOString();
 
   async function persist(entry: object) {
+    const persistedEntry = handoffInvestigationId
+      ? { ...entry, investigationId: handoffInvestigationId }
+      : entry;
     const prior = (job.result as { forgeRuns?: unknown[] } | null)?.forgeRuns ?? [];
     await db!
       .update(schema.jobs)
       .set({
-        result: { ...(job.result as object), forgeRuns: [...prior, entry] },
+        result: { ...(job.result as object), forgeRuns: [...prior, persistedEntry] },
         updatedAt: new Date(),
       })
       .where(eq(schema.jobs.id, job.id));
-    return c.json({ jobId: job.id, forgeRun: entry });
+    return c.json({ jobId: job.id, forgeRun: persistedEntry });
   }
 
   function editHash(s: string): string {
@@ -2163,8 +2831,11 @@ app.post("/api/forge-structured", async (c: Context) => {
   try {
     let staged;
     try {
-      staged = await cloneAndArchive(cloneUrl, ref, tmp);
+      staged = await cloneAndArchive(cloneUrl, ref, tmp, analyzedCommitSha ?? undefined);
     } catch (error: any) {
+      if (error?.message === "revision-mismatch") {
+        return c.json({ error: "Staged source does not match the analyzed commit.", status: 409 }, 409);
+      }
       const step =
         error?.message === "clone"
           ? "clone"
@@ -2179,11 +2850,17 @@ app.post("/api/forge-structured", async (c: Context) => {
     const commitSha = staged.commitSha ?? null;
     const sourceEvidence = {
       repoUrl: cloneUrl,
+      analysisRef: jobRef,
       ref: ref ?? null,
       refSource,
+      analysisCommitSha: analyzedCommitSha,
+      executionCommitSha: commitSha,
       commitSha,
       tarballSha256: null as string | null,
     };
+    if (analyzedCommitSha && commitSha !== analyzedCommitSha) {
+      return c.json({ error: "Staged source does not match the analyzed commit.", status: 409 }, 409);
+    }
     const excluded = tracked.filter(isTransferExcluded);
     const expected = tracked.length - excluded.length;
     if (expected <= 0) {
@@ -2206,24 +2883,47 @@ app.post("/api/forge-structured", async (c: Context) => {
     const localSha = createHash("sha256").update(tarBytes).digest("hex");
 
     const detected = detectManager(tracked);
-    const manager: PackageManager = parsed.data.manager ?? detected ?? "pnpm";
+    const manager = parsed.data.manager ?? detected;
+    if (!manager) {
+      return c.json({ error: "No supported package manager detected", status: 400 }, 400);
+    }
     const requested = parsed.data.verificationCommand;
     let verifyInvoke = requested;
     let commandSource = "requested";
+    // Read the repo's declared test script even when a verification command is
+    // supplied — it is how the targeted runner is detected.
+    const declaredTestScript = await readPackageTestScript(src);
     if (!verifyInvoke) {
-      const declared = await readPackageTestScript(src);
-      if (!declared) {
+      if (!declaredTestScript) {
         return c.json({ error: "Repository has no test command", status: 400 }, 400);
       }
       verifyInvoke = `${manager} test`;
       commandSource = "detected";
     }
+    // Targeted command for the exact investigated scenario (null when the
+    // investigation named no scenario or the runner is unsupported).
+    const targetCommand = buildTargetVerificationCommand({
+      manager,
+      testScript: declaredTestScript ?? verifyInvoke ?? null,
+      testFile: targetTestFile,
+      scenario: targetScenario,
+    });
 
     // Source excerpts from blob bytes (identical to the tarball).
-    const { blocks } = await buildSourceExcerpts(src, twinFunctions, parsed.data.focus);
+    const { blocks } = await buildSourceExcerpts(src, twinFunctions, effectiveFocus);
     if (blocks.length === 0) {
       return c.json({ error: "No source context for focus", status: 400 }, 400);
     }
+    // Bounded excerpt metadata for the persisted run (never source text):
+    // proves the model saw the target function anchored at its real line.
+    const excerptMetadata = blocks.map((b) => ({
+      path: b.path,
+      function: b.function,
+      lines: b.lines,
+      anchorLine: b.anchorLine,
+      targetIncluded: b.targetIncluded,
+      truncated: b.truncated,
+    }));
 
     const llm = llmConfigFromEnv();
     if (!llm) {
@@ -2241,7 +2941,7 @@ app.post("/api/forge-structured", async (c: Context) => {
               repoName:
                 (twin?.repository as { name?: string } | undefined)?.name ?? job.repoUrl,
               excerpts: blocks,
-              focus: parsed.data.focus,
+              focus: effectiveFocus,
               instruction: parsed.data.instruction,
             }),
           },
@@ -2316,7 +3016,8 @@ app.post("/api/forge-structured", async (c: Context) => {
     const generation = {
       source: "forge" as const,
       format: "structured-edit" as const,
-      focus: parsed.data.focus,
+      focus: effectiveFocus,
+      excerpts: excerptMetadata,
       edits: plan.edits.map((e) => ({
         path: e.path,
         function: e.function ?? null,
@@ -2382,7 +3083,13 @@ app.post("/api/forge-structured", async (c: Context) => {
       }
       const count = blob.split(e.oldText).length - 1;
       if (count === 0) {
-        return terminal("EDIT_CONTEXT_MISMATCH", { rejectedPath: e.path });
+        // Byte-exact mismatch against the authoritative analyzed revision.
+        // Fail closed; persist a bounded diagnostic (never the model's full
+        // text, never the file) so the cause is auditable.
+        return terminal("EDIT_CONTEXT_MISMATCH", {
+          rejectedPath: e.path,
+          mismatch: describeSourceMismatch(blob, e.oldText),
+        });
       }
       if (count > 1) {
         return terminal("AMBIGUOUS_EDIT", { rejectedPath: e.path });
@@ -2417,10 +3124,13 @@ app.post("/api/forge-structured", async (c: Context) => {
     let result;
     try {
       result = await runCommand(sandbox, {
-        command: buildStructuredScript(manager, excluded, verifyInvoke, {
-          ref: ref ?? null,
-          sha: commitSha,
-        }),
+        command: buildStructuredScript(
+          manager,
+          excluded,
+          verifyInvoke,
+          { ref: ref ?? null, sha: commitSha },
+          targetCommand
+        ),
         image,
         files: {
           [CHECKOUT_UPLOAD_PATH]: { uuid: uploaded.uuid },
@@ -2483,6 +3193,31 @@ app.post("/api/forge-structured", async (c: Context) => {
     // be proven to be the analyzed revision, so no apply/verify outcome
     // from it is admissible as evidence.
     const revisionOk = status !== "SOURCE_MISMATCH";
+    // Exact targeted verification of the investigated scenario, when the
+    // investigation supplied both a test file and a scenario name. A run that
+    // never executed (unsupported runner / missing marker) is fail-closed.
+    const targetRun = parseTargetVerification(result.stdout);
+    const targetVerification: TargetVerificationInput | null =
+      targetTestFile && targetScenario
+        ? {
+            testFile: targetTestFile,
+            scenario: targetScenario,
+            command: targetCommand ?? "",
+            ran: targetRun.ran,
+            exitCode: targetRun.exitCode,
+            timedOut: result.timedOut,
+          }
+        : null;
+    // User-facing verification assessment: exact target evidence + full-suite
+    // regression status. Never infers the target result from the suite.
+    const assessment = assessVerification({
+      patchApplied: revisionOk && outcome.patchOk,
+      verificationStarted: revisionOk && outcome.verifyBegin,
+      exitCode: result.exitCode,
+      timedOut: result.timedOut,
+      stdout: result.stdout,
+      target: targetVerification,
+    });
     const entry = {
       id: runId,
       status,
@@ -2503,6 +3238,9 @@ app.post("/api/forge-structured", async (c: Context) => {
         patchValidated: outcome.patchOk,
       },
       apply: { applied: revisionOk && outcome.patchOk },
+      // Bounded exact-target verification record (null when the investigation
+      // named no scenario). Additive; the full-suite record is unchanged.
+      targetVerification,
       // Verification evidence exists only when the verify command actually
       // started (marker seen). An install failure ends FAILED with null
       // verification rather than attributing install output to the command.
@@ -2513,6 +3251,7 @@ app.post("/api/forge-structured", async (c: Context) => {
             exitCode: result.exitCode,
             timedOut: result.timedOut,
             passed: status === "VERIFIED",
+            assessment,
           }
         : null,
       image,
@@ -2527,15 +3266,18 @@ app.post("/api/forge-structured", async (c: Context) => {
       stderr: result.stderr.slice(0, 4000),
       at: stamp(),
     };
+    const persistedEntry = handoffInvestigationId
+      ? { ...entry, investigationId: handoffInvestigationId }
+      : entry;
     const prior = (job.result as { forgeRuns?: unknown[] } | null)?.forgeRuns ?? [];
     await db
       .update(schema.jobs)
       .set({
-        result: { ...(job.result as object), forgeRuns: [...prior, entry] },
+        result: { ...(job.result as object), forgeRuns: [...prior, persistedEntry] },
         updatedAt: new Date(),
       })
       .where(eq(schema.jobs.id, job.id));
-    return c.json({ jobId: job.id, forgeRun: entry });
+    return c.json({ jobId: job.id, forgeRun: persistedEntry });
   } finally {
     await fs.promises.rm(tmp, { recursive: true, force: true });
   }

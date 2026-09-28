@@ -116,7 +116,8 @@ export interface StagedRepo {
 export async function cloneAndArchive(
   cloneUrl: string,
   ref: string | undefined,
-  tmp: string
+  tmp: string,
+  expectedCommitSha?: string
 ): Promise<StagedRepo> {
   const src = path.join(tmp, "src");
   const tarPath = path.join(tmp, "repo.tar");
@@ -128,6 +129,19 @@ export async function cloneAndArchive(
     );
   } catch {
     throw new Error("clone");
+  }
+  if (expectedCommitSha) {
+    if (!/^[a-f0-9]{40}$/.test(expectedCommitSha)) throw new Error("revision-mismatch");
+    try {
+      await execFileAsync("git", ["-C", src, "fetch", "--depth", "1", "origin", expectedCommitSha], {
+        timeout: 90000,
+      });
+      await execFileAsync("git", ["-C", src, "checkout", "--detach", expectedCommitSha], {
+        timeout: 30000,
+      });
+    } catch {
+      throw new Error("revision-mismatch");
+    }
   }
   let tracked: string[];
   try {
@@ -157,5 +171,23 @@ export async function cloneAndArchive(
   } catch {
     commitSha = null;
   }
-  return { src, tarPath, tracked, commitSha };
+  if (expectedCommitSha) {
+    const stagedCommit = await execFileAsync("git", ["-C", src, "rev-parse", "HEAD"], {
+      timeout: 30000,
+    });
+    if (stagedCommit.stdout.trim() !== expectedCommitSha) throw new Error("revision-mismatch");
+  }
+  return { src, tarPath, tracked, commitSha: await resolvedCommitSha(src) };
+}
+
+async function resolvedCommitSha(src: string): Promise<string | null> {
+  try {
+    const rev = await execFileAsync("git", ["-C", src, "rev-parse", "HEAD"], {
+      timeout: 30000,
+    });
+    const sha = rev.stdout.trim();
+    return /^[a-f0-9]{40}$/.test(sha) ? sha : null;
+  } catch {
+    return null;
+  }
 }

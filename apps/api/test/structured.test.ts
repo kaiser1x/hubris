@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { execFile } from "child_process";
 import { promisify } from "util";
 import * as fs from "fs";
@@ -12,6 +12,7 @@ import {
   parseSourceMarkers,
   parseStructuredRun,
   resolveJobRef,
+  resolveJobCommitSha,
   sourceMarkersMatch,
   EDIT_OK_MARKER,
   CANONICAL_MARKER,
@@ -47,6 +48,14 @@ describe("EditPlanSchema", () => {
     [{ edits: new Array(6).fill({ path: "a.ts", oldText: "x", newText: "y" }) }, "too many edits"],
   ])("rejects %s", (body) => {
     expect(EditPlanSchema.safeParse(body).success).toBe(false);
+  });
+});
+
+describe("revision metadata", () => {
+  it("accepts only a full analyzed commit SHA", () => {
+    const sha = "a".repeat(40);
+    expect(resolveJobCommitSha({ commitSha: sha })).toBe(sha);
+    expect(resolveJobCommitSha({ commitSha: "moving-branch" })).toBeNull();
   });
 });
 
@@ -180,6 +189,128 @@ describe("buildSourceExcerpts", () => {
   });
 });
 
+describe("buildSourceExcerpts target-aware anchoring", () => {
+  let dir: string;
+  const FILE = "src/payments.ts";
+  const FUNCS = [
+    { name: "first", path: FILE, line: 1, endLine: 3 },
+    { name: "second", path: FILE, line: 6, endLine: 8 },
+    { name: "big", path: FILE, line: 10, endLine: 159 },
+    { name: "refund", path: FILE, line: 161, endLine: 164 },
+  ];
+
+  beforeAll(async () => {
+    dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "hubris-excerpt-anchor-"));
+    const lines: string[] = [];
+    lines.push(
+      "export function first() {", // 1
+      "  return 1",                 // 2
+      "}",                          // 3
+      "",                           // 4
+      "",                           // 5
+      "export function second() {", // 6
+      "  return 2",                 // 7
+      "}",                          // 8
+      ""                            // 9
+    );
+    lines.push("export function big() {"); // 10
+    for (let i = 0; i < 148; i++) lines.push(`  const v${i} = ${i};`); // 11-158
+    lines.push("}"); // 159
+    lines.push(""); // 160
+    lines.push("export function refund(id) {"); // 161
+    lines.push("  const p = get(id);");          // 162
+    lines.push("  return p;");                   // 163
+    lines.push("}");                             // 164
+    const content = lines.join("\n") + "\n";     // 165 elements after split
+    fs.mkdirSync(path.join(dir, "src"), { recursive: true });
+    fs.writeFileSync(path.join(dir, FILE), content);
+    fs.writeFileSync(
+      path.join(dir, "src/other.ts"),
+      "export function helper() {\n  return 1;\n}\n"
+    );
+    const opts = { cwd: dir, timeout: 30000 };
+    await exec("git", ["init", "-q"], opts);
+    await exec("git", ["config", "user.email", "t@t"], opts);
+    await exec("git", ["config", "user.name", "t"], opts);
+    await exec("git", ["add", "-A"], opts);
+    await exec("git", ["commit", "-qm", "base"], opts);
+  });
+
+  afterAll(async () => {
+    if (dir) await fs.promises.rm(dir, { recursive: true, force: true });
+  });
+
+  it("anchors the excerpt on the target function's real line and includes its body", async () => {
+    const { blocks } = await buildSourceExcerpts(dir, FUNCS, "Target: refund (src/payments.ts)");
+    const block = blocks.find((b) => b.path === FILE);
+    expect(block).toBeDefined();
+    expect(block!.anchorLine).toBe(161);
+    expect(block!.targetIncluded).toBe(true);
+    expect(block!.truncated).toBe(false);
+    // startLine = 161 - 3 = 158; window extends to the end of the file.
+    expect(block!.lines).toBe("158-165");
+    expect(block!.text).toContain("export function refund(id)");
+    expect(block!.text).toContain("const p = get(id);");
+  });
+
+  it("caps a large target function deterministically and reports truncation", async () => {
+    const { blocks } = await buildSourceExcerpts(dir, FUNCS, "Target: big (src/payments.ts)");
+    const block = blocks.find((b) => b.path === FILE);
+    expect(block).toBeDefined();
+    expect(block!.anchorLine).toBe(10);
+    expect(block!.targetIncluded).toBe(true);
+    expect(block!.truncated).toBe(true);
+    // startLine = 7, extendedCap = 7 + 60 + 60 - 1 = 126; body ends at 159.
+    expect(block!.lines).toBe("7-126");
+    expect(block!.text).toContain("export function big() {");
+    expect(block!.text).not.toContain("const v148");
+  });
+
+  it("anchors on the focus-matched function's real line when no target is named", async () => {
+    const { blocks } = await buildSourceExcerpts(dir, FUNCS, "second");
+    const block = blocks.find((b) => b.path === FILE);
+    expect(block).toBeDefined();
+    expect(block!.anchorLine).toBe(6);
+    expect(block!.targetIncluded).toBe(false);
+    // startLine = 3, default window = 60 lines.
+    expect(block!.lines).toBe("3-62");
+    expect(block!.text).toContain("export function second() {");
+    expect(block!.text).toContain("return 2");
+  });
+
+  it("legacy functions without an end line keep the bounded window, never truncation claims", async () => {
+    const legacy = [
+      { name: "refund", path: FILE, line: 161 },
+    ];
+    const { blocks } = await buildSourceExcerpts(dir, legacy, "Target: refund (src/payments.ts)");
+    const block = blocks.find((b) => b.path === FILE);
+    expect(block).toBeDefined();
+    expect(block!.anchorLine).toBe(161);
+    expect(block!.truncated).toBe(false);
+    expect(block!.lines).toBe("158-165");
+    expect(block!.text).toContain("export function refund(id)");
+  });
+
+  it("keeps deterministic ordering and file dedup across targets", async () => {
+    const { blocks } = await buildSourceExcerpts(dir, FUNCS, "Target: second (src/payments.ts)");
+    expect(new Set(blocks.map((b) => b.path)).size).toBe(blocks.length);
+    expect(blocks[0].path).toBe(FILE);
+  });
+
+  it("marks only the explicit target file as targetIncluded", async () => {
+    const funcs = [
+      ...FUNCS,
+      { name: "helper", path: "src/other.ts", line: 1, endLine: 3 },
+    ];
+    const { blocks } = await buildSourceExcerpts(dir, funcs, "Target: refund (src/payments.ts)");
+    const target = blocks.find((b) => b.path === FILE);
+    const other = blocks.find((b) => b.path === "src/other.ts");
+    expect(target?.targetIncluded).toBe(true);
+    expect(target?.anchorLine).toBe(161);
+    expect(other?.targetIncluded).toBe(false);
+  });
+});
+
 describe("resolveJobRef", () => {
   it("returns the persisted analyzed ref", () => {
     expect(resolveJobRef({ ref: "hubris/buggy-idempotency" })).toBe(
@@ -233,5 +364,33 @@ describe("source revision markers", () => {
   it("legacy empty expectations match empty echoes", () => {
     const out = [`${SOURCE_REF_MARKER} `, `${SOURCE_SHA_MARKER} `].join("\n");
     expect(sourceMarkersMatch(out, null, null)).toBe(true);
+  });
+});
+
+describe("buildStructuredScript targeted scenario verification", () => {
+  it("runs the exact target command after VERIFY_BEGIN and before the full suite", () => {
+    const target =
+      "pnpm exec vitest run 'tests/orders.test.ts' -t 'applies a discount code to the order total'";
+    const cmd = buildStructuredScript("pnpm", [], "pnpm test", { ref: null, sha: null }, target);
+    const iVerify = cmd.indexOf("VERIFY_BEGIN");
+    const iTarget = cmd.indexOf(target);
+    const iMarker = cmd.indexOf("TARGET_VERIFY_DONE");
+    const iFull = cmd.indexOf("pnpm test", iMarker);
+    expect(iVerify).toBeGreaterThanOrEqual(0);
+    expect(iTarget).toBeGreaterThan(iVerify);
+    expect(iMarker).toBeGreaterThan(iTarget);
+    expect(iFull).toBeGreaterThan(iMarker);
+    // The verification phase drops `set -e` so a failing target is evidence.
+    const iSetPlusE = cmd.lastIndexOf("set +e");
+    expect(iSetPlusE).toBeGreaterThanOrEqual(0);
+    expect(iSetPlusE).toBeLessThan(iTarget);
+    expect(cmd).toContain("TARGET_EXIT=$?");
+    expect(cmd).toContain("exit $FULL_EXIT");
+  });
+
+  it("omits the targeted step when no target command is provided", () => {
+    const cmd = buildStructuredScript("pnpm", [], "pnpm test");
+    expect(cmd).not.toContain("TARGET_VERIFY_DONE");
+    expect(cmd).toContain("VERIFY_BEGIN");
   });
 });

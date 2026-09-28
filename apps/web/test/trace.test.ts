@@ -138,3 +138,11 @@ describe("branch/order rule", () => {
     expect(labels(steps)).not.toContain("z");
   });
 });
+
+describe("HTTP entry-point contract", () => {
+  it("keeps an endpoint-free service repository empty", async () => {
+    const job = await fixtureJob();
+    job.result!.full!.endpoints = [];
+    expect(traceFromTwin(job)).toEqual([]);
+  });
+});

@@ -14,6 +14,7 @@ const exec = promisify(execFile);
 const store = vi.hoisted(() => ({
   draftPlan: "",
   jobRef: undefined as string | undefined,
+  investigationRuns: [] as Array<Record<string, unknown>>,
   cloneCalls: [] as Array<{ url: string; ref: string | undefined }>,
   updates: [] as Array<{
     result?: {
@@ -44,6 +45,7 @@ vi.mock("@hubris/db", async (importOriginal) => {
       ...(store.jobRef ? { ref: store.jobRef } : {}),
       stats: { functions: 1, classes: 0, endpoints: 0, tests: 0, relationships: 0 },
       full: { functions: [{ name: "x", path: "src/a.ts", line: 1 }] },
+      ...(store.investigationRuns.length > 0 ? { investigationRuns: store.investigationRuns } : {}),
     },
     error: null,
   });
@@ -79,7 +81,7 @@ vi.mock("../src/checkout", async (importOriginal) => {
       return {
         src: FIXTURE.dir,
         tarPath: FIXTURE.tar,
-        tracked: ["src/a.ts", "package.json"],
+        tracked: ["src/a.ts", "package.json", "pnpm-lock.yaml"],
         commitSha: "2".repeat(40),
       };
     },
@@ -143,6 +145,40 @@ async function postStructured(body: object) {
   });
 }
 
+function readyInvestigation(id: string, targetFn: string): Record<string, unknown> {
+  return {
+    investigationId: id,
+    jobId: "00000000-0000-0000-0000-000000000000",
+    focus: `Target: ${targetFn} (src/a.ts)`,
+    status: "READY",
+    createdAt: new Date().toISOString(),
+    plan: {
+      summary: `target ${targetFn}`,
+      target: { file: "src/a.ts", function: targetFn },
+      currentBehavior: "current behavior",
+      expectedBehavior: "expected behavior",
+      repairContract: {
+        requiredOutcome: "must throw",
+        preserveBehavior: [],
+        relevantCondition: "condition",
+        relevantOperation: "operation",
+        existingErrorContract: "error",
+        minimalRepairDescription: "repair",
+        setupFacts: ["setup"],
+        actionFacts: ["action()"],
+        observedFacts: ["observed"],
+        expectedFacts: ["expect(result).toBe(expected)"],
+        sourceEvidence: ["if (condition)", "store.items.delete(id)"],
+        relevantAssertions: ["expect(result).toBe(expected)"],
+        conditionOperationAreDistinct: true,
+      },
+      constraints: [],
+      evidence: ["evidence"],
+      confidence: "high" as const,
+    },
+  };
+}
+
 describe("POST /api/forge-structured (mocked model, fixture repo)", () => {
   it("zero-match plan → EDIT_CONTEXT_MISMATCH terminal, no sandbox", async () => {
     stubCreds();
@@ -160,6 +196,34 @@ describe("POST /api/forge-structured (mocked model, fixture repo)", () => {
     expect((generation.edits as Array<Record<string, unknown>>)[0].path).toBe("src/a.ts");
     expect(runCommand).not.toHaveBeenCalled();
     expect(uploadFile).not.toHaveBeenCalled();
+    // Bounded byte-mismatch diagnostic: fixture src/a.ts is "foo();\nfoo();\n"
+    // (14 bytes).
+    const mismatch = run.mismatch as Record<string, unknown>;
+    expect(mismatch.oldTextLength).toBe("missing();".length);
+    expect(mismatch.sourceLength).toBe("foo();\nfoo();\n".length);
+    expect(mismatch.matchingPrefixChars).toBe(0);
+    expect(mismatch.sourceOffset).toBe(-1);
+    expect(typeof mismatch.oldTextSnippet).toBe("string");
+    expect(String(mismatch.oldTextSnippet).length).toBeLessThanOrEqual(240);
+  });
+
+  it("CRLF-normalized oldText against LF source still fails closed", async () => {
+    stubCreds();
+    // The authoritative fixture is LF ("foo();\nfoo();\n"). A model oldText
+    // with CRLF line endings must NOT be normalized into a match.
+    store.draftPlan = plan([
+      { path: "src/a.ts", oldText: "foo();\r\nfoo();", newText: "bar();\r\nbar();" },
+    ]);
+    const res = await postStructured({ focus: "do things" });
+    expect(res.status).toBe(200);
+    const run = lastRun();
+    expect(run.status).toBe("EDIT_CONTEXT_MISMATCH");
+    expect(runCommand).not.toHaveBeenCalled();
+    expect(uploadFile).not.toHaveBeenCalled();
+    const mismatch = run.mismatch as Record<string, unknown>;
+    // "foo();" matches; the CRLF ending diverges from the LF source.
+    expect(mismatch.matchingPrefixChars).toBe(6);
+    expect(mismatch.sourceLength).toBe("foo();\nfoo();\n".length);
   });
 
   it("ambiguous plan → AMBIGUOUS_EDIT terminal, file untouched, no sandbox", async () => {
@@ -228,6 +292,87 @@ describe("POST /api/forge-structured (mocked model, fixture repo)", () => {
     // Upload is mocked to throw: 502 proves the valid plan cleared every
     // local gate (schema, paths, exact match) and reached staging.
     expect(res.status).toBe(502);
+    expect(uploadFile).toHaveBeenCalled();
+  });
+});
+
+describe("POST /api/forge-structured investigation binding (mocked model, fixture repo)", () => {
+  const INV_A = "00000000-0000-0000-0000-00000000000a";
+  const INV_B = "00000000-0000-0000-0000-00000000000b";
+  const INV_AMB = "00000000-0000-0000-0000-00000000000c";
+  const INV_MISSING = "00000000-0000-0000-0000-0000000000ff";
+
+  beforeEach(() => {
+    store.investigationRuns = [readyInvestigation(INV_A, "alpha"), readyInvestigation(INV_B, "beta")];
+  });
+  afterEach(() => {
+    store.investigationRuns = [];
+  });
+
+  it("loads the exact READY investigation and derives focus from its plan", async () => {
+    stubCreds();
+    store.draftPlan = plan([
+      { path: "src/a.ts", function: "x", oldText: "missing();", newText: "y();" },
+    ]);
+    const res = await postStructured({ focus: "client focus text", investigationId: INV_B });
+    expect(res.status).toBe(200);
+    const run = lastRun();
+    expect(run.status).toBe("EDIT_CONTEXT_MISMATCH");
+    const gen = run.generation as Record<string, unknown>;
+    // The focus is derived from INV_B's plan (target beta), NOT the client
+    // focus text.
+    expect(String(gen.focus)).toContain("beta");
+    expect(String(gen.focus)).not.toContain("client focus");
+    expect(run.investigationId).toBe(INV_B);
+  });
+
+  it("does not accidentally load another investigation for the same job", async () => {
+    stubCreds();
+    store.draftPlan = plan([
+      { path: "src/a.ts", function: "x", oldText: "missing();", newText: "y();" },
+    ]);
+    // Request the OLDER investigation; the newest is INV_B.
+    const res = await postStructured({ focus: "x", investigationId: INV_A });
+    expect(res.status).toBe(200);
+    const run = lastRun();
+    expect(String((run.generation as Record<string, unknown>).focus)).toContain("alpha");
+    expect(run.investigationId).toBe(INV_A);
+  });
+
+  it("fails clearly when the investigation is missing", async () => {
+    stubCreds();
+    store.draftPlan = plan([]);
+    const res = await postStructured({ focus: "x", investigationId: INV_MISSING });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({
+      error: `Investigation ${INV_MISSING} not found on this job`,
+      status: 400,
+    });
+    expect(runCommand).not.toHaveBeenCalled();
+  });
+
+  it("fails clearly when the investigation is not READY", async () => {
+    stubCreds();
+    store.investigationRuns = [
+      { investigationId: INV_AMB, status: "AMBIGUOUS", plan: null, message: "no match" },
+    ];
+    const res = await postStructured({ focus: "x", investigationId: INV_AMB });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({
+      error: "Investigation is not READY for Forge",
+      status: 400,
+    });
+    expect(runCommand).not.toHaveBeenCalled();
+  });
+
+  it("requests without an investigation keep working (legacy / direct API)", async () => {
+    stubCreds();
+    store.investigationRuns = [];
+    store.draftPlan = plan([
+      { path: "src/a.ts", oldText: "foo();\nfoo();", newText: "bar();\nbar();" },
+    ]);
+    const res = await postStructured({ focus: "do things" });
+    expect(res.status).toBe(502); // cleared local gates; upload (mocked) throws
     expect(uploadFile).toHaveBeenCalled();
   });
 });

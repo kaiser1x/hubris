@@ -10,6 +10,10 @@
 export type ForgeRunKind = "structured" | "diff";
 
 export type ForgeOutcome =
+  | "FULL_SUITE_PASSED"
+  | "REPAIR_VERIFIED"
+  | "REPAIR_NOT_VERIFIED"
+  | "VERIFICATION_INCOMPLETE"
   | "VERIFIED"
   | "VERIFICATION_FAILED"
   | "VERIFICATION_TIMEOUT"
@@ -35,6 +39,25 @@ export interface ForgeCheck {
 
 export type VerifyResult = "PASS" | "FAIL" | "NOT RUN";
 
+export interface ForgeAssessmentView {
+  state: VerificationAssessmentState;
+  patchApplied: boolean;
+  targetVerificationPassed: boolean | null;
+  targetTestFile: string | null;
+  targetScenario: string | null;
+  targetCommand: string | null;
+  fullSuitePassed: boolean;
+  unrelatedTestFailures: number;
+  failedTests: string[];
+  targetFailure: string | null;
+}
+
+export type VerificationAssessmentState =
+  | "FULL_SUITE_PASSED"
+  | "REPAIR_VERIFIED"
+  | "REPAIR_NOT_VERIFIED"
+  | "VERIFICATION_INCOMPLETE";
+
 export interface ForgeVerificationView {
   command: string;
   exitCode: number | null;
@@ -42,10 +65,23 @@ export interface ForgeVerificationView {
   passed: boolean;
   started: boolean;
   result: VerifyResult;
+  // User-facing assessment separating patch/target/full-suite outcomes.
+  // Null on legacy entries (predates the assessment).
+  assessment: ForgeAssessmentView | null;
+}
+
+export interface ForgeMismatchView {
+  oldTextLength: number;
+  sourceLength: number;
+  matchingPrefixChars: number;
+  sourceOffset: number;
+  oldTextSnippet: string;
+  sourceSnippet: string;
 }
 
 export interface ForgeRunView {
   id: string;
+  investigationId: string | null;
   number: number;
   kind: ForgeRunKind;
   status: string;
@@ -58,12 +94,17 @@ export interface ForgeRunView {
   patchBytes: number | null;
   patchShaShort: string | null;
   applyApplied: boolean;
+  // Bounded byte-mismatch evidence for EDIT_CONTEXT_MISMATCH. Null when the
+  // run reached another terminal or predates this diagnostic.
+  mismatch: ForgeMismatchView | null;
   // Source-revision provenance. Nulls mean legacy evidence that predates
   // revision tracking — rendered as "—", never backfilled.
   source: {
     ref: string | null;
     refSource: string | null;
     commitSha: string | null;
+    analysisCommitSha: string | null;
+    executionCommitSha: string | null;
     sandboxRef: string | null;
     sandboxSha: string | null;
     sandboxMatched: boolean | null;
@@ -92,6 +133,58 @@ function asString(v: unknown): string | null {
 
 function asNumber(v: unknown): number | null {
   return typeof v === "number" && Number.isFinite(v) ? v : null;
+}
+
+function asMismatchView(raw: unknown): ForgeMismatchView | null {
+  if (!isRecord(raw)) return null;
+  const oldTextLength = asNumber(raw.oldTextLength);
+  const sourceLength = asNumber(raw.sourceLength);
+  const matchingPrefixChars = asNumber(raw.matchingPrefixChars);
+  if (oldTextLength === null || sourceLength === null || matchingPrefixChars === null) {
+    return null;
+  }
+  return {
+    oldTextLength,
+    sourceLength,
+    matchingPrefixChars,
+    sourceOffset: asNumber(raw.sourceOffset) ?? -1,
+    oldTextSnippet: asString(raw.oldTextSnippet) ?? "",
+    sourceSnippet: asString(raw.sourceSnippet) ?? "",
+  };
+}
+
+const ASSESSMENT_STATES: VerificationAssessmentState[] = [
+  "FULL_SUITE_PASSED",
+  "REPAIR_VERIFIED",
+  "REPAIR_NOT_VERIFIED",
+  "VERIFICATION_INCOMPLETE",
+];
+
+// Map the persisted verification assessment. Unknown/malformed shapes yield
+// null so the panel falls back to the legacy lifecycle outcome — it never
+// fabricates an assessment.
+function asAssessment(raw: unknown): ForgeAssessmentView | null {
+  if (!isRecord(raw)) return null;
+  const state =
+    typeof raw.state === "string" && (ASSESSMENT_STATES as string[]).includes(raw.state)
+      ? (raw.state as VerificationAssessmentState)
+      : null;
+  if (!state) return null;
+  return {
+    state,
+    patchApplied: raw.patchApplied === true,
+    targetVerificationPassed:
+      typeof raw.targetVerificationPassed === "boolean" ? raw.targetVerificationPassed : null,
+    targetTestFile: asString(raw.targetTestFile),
+    targetScenario: asString(raw.targetScenario),
+    targetCommand: asString(raw.targetCommand),
+    fullSuitePassed: raw.fullSuitePassed === true,
+    unrelatedTestFailures: asNumber(raw.unrelatedTestFailures) ?? 0,
+    failedTests: Array.isArray(raw.failedTests)
+      ? raw.failedTests.filter((t): t is string => typeof t === "string")
+      : [],
+    targetFailure: asString(raw.targetFailure),
+  };
 }
 
 function trailStates(run: Record<string, unknown>): string[] {
@@ -176,7 +269,7 @@ function outcomeFor(status: string, timedOut: boolean): ForgeOutcome {
 function stepsFor(
   kind: ForgeRunKind,
   trail: string[],
-  opts: { editOk: boolean; patchOk: boolean; applied: boolean; verifying: boolean; verified: boolean }
+  opts: { editOk: boolean; patchOk: boolean; applied: boolean; verifying: boolean; verified: boolean; assessed: boolean }
 ): ForgeStep[] {
   const has = (...states: string[]) => states.some((s) => trail.includes(s));
   // Validated means the patch earned its way to (or past) application.
@@ -193,7 +286,13 @@ function stepsFor(
     { label: "Patch validated", reached: patchValidated },
     { label: "Applied", reached: opts.applied },
     { label: "Verifying", reached: verifying },
-    { label: "Verified", reached: opts.verified },
+    // When an assessment exists, verification ran and was assessed — the
+    // pass/fail meaning lives in the primary outcome banner, not a bare
+    // "Verified" lifecycle tick that could read as a failure.
+    {
+      label: opts.assessed ? "Verification assessed" : "Verified",
+      reached: opts.assessed || opts.verified,
+    },
   ];
   return base;
 }
@@ -270,6 +369,7 @@ export function toForgeRunView(raw: unknown, number: number): ForgeRunView | nul
   const verifyingReached = trail.includes("VERIFYING") || trail.includes("VERIFIED");
   const started =
     verifyingReached || (kind === "structured" && ver !== null) || timedOut;
+  const assessment = ver ? asAssessment(ver.assessment) : null;
   const verification: ForgeVerificationView | null = ver
     ? {
         command: asString(ver.command) ?? "—",
@@ -278,6 +378,7 @@ export function toForgeRunView(raw: unknown, number: number): ForgeRunView | nul
         passed,
         started,
         result: !started ? "NOT RUN" : verifyResult(timedOut, exitCode, passed),
+        assessment,
       }
     : null;
   const stdout = typeof raw.stdout === "string" ? raw.stdout : "";
@@ -289,6 +390,7 @@ export function toForgeRunView(raw: unknown, number: number): ForgeRunView | nul
     applied,
     verifying: started,
     verified,
+    assessed: assessment !== null,
   });
   const editChecks = kind === "structured" ? editChecksFor(edits, editCategory, applied) : [];
   const sandboxChecks: ForgeCheck[] = [
@@ -300,10 +402,11 @@ export function toForgeRunView(raw: unknown, number: number): ForgeRunView | nul
   ];
   return {
     id: asString(raw.id) ?? `run-${number}`,
+    investigationId: asString(raw.investigationId),
     number,
     kind,
     status,
-    outcome: outcomeFor(status, timedOut),
+    outcome: assessment && !timedOut ? assessment.state : outcomeFor(status, timedOut),
     steps,
     modelSource,
     focus: asString(gen?.focus),
@@ -312,10 +415,13 @@ export function toForgeRunView(raw: unknown, number: number): ForgeRunView | nul
     patchBytes,
     patchShaShort,
     applyApplied: applied,
+    mismatch: asMismatchView(raw.mismatch),
     source: {
       ref: asString(source?.ref),
       refSource: asString(source?.refSource),
       commitSha: asString(source?.commitSha),
+      analysisCommitSha: asString(source?.analysisCommitSha),
+      executionCommitSha: asString(source?.executionCommitSha) ?? asString(source?.commitSha),
       sandboxRef: asString(sandboxSource?.ref),
       sandboxSha: asString(sandboxSource?.sha),
       sandboxMatched,
@@ -376,6 +482,76 @@ export function findRunView(views: ForgeRunView[], id: string | null): ForgeRunV
   return views.find((v) => v !== null && typeof v === "object" && v.id === id) ?? null;
 }
 
+// Find the newest persisted Forge run bound to an exact investigation id.
+// Used on Forge load to DISPLAY an already-forged run instead of launching a
+// new one. Matches only the persisted investigationId — never jobId, target,
+// position, or the URL. `views` is expected newest-first. Never throws.
+export function findRunForInvestigation(
+  views: ForgeRunView[],
+  investigationId: string | null | undefined
+): ForgeRunView | null {
+  if (!investigationId || !Array.isArray(views)) return null;
+  return views.find((v) => v !== null && typeof v === "object" && v.investigationId === investigationId) ?? null;
+}
+
+// ---- Compact Forge history presentation ----
+
+export const RECENT_RUNS_LIMIT = 3;
+
+export function formatRunTime(at: string | null): string {
+  if (!at) return "—";
+  const d = new Date(at);
+  if (Number.isNaN(d.getTime())) return "—";
+  return d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+}
+
+export function shortRunStatus(run: ForgeRunView): string {
+  switch (run.outcome) {
+    case "FULL_SUITE_PASSED":
+      return "FULL SUITE PASSED";
+    case "REPAIR_VERIFIED":
+      return "REPAIR VERIFIED";
+    case "REPAIR_NOT_VERIFIED":
+      return "REPAIR NOT VERIFIED";
+    case "VERIFICATION_INCOMPLETE":
+      return "VERIFICATION INCOMPLETE";
+    case "VERIFIED":
+      return "VERIFIED";
+    case "VERIFICATION_FAILED":
+      return "FAILED";
+    case "VERIFICATION_TIMEOUT":
+      return "TIMEOUT";
+    case "APPLY_FAILED":
+      return "APPLY FAILED";
+    case "VALIDATION_FAILED":
+      return "VALIDATION FAILED";
+    case "SOURCE_MISMATCH":
+      return "SOURCE MISMATCH";
+    default:
+      return run.status;
+  }
+}
+
+export interface ForgeHistoryRow {
+  id: string;
+  status: string;
+  target: string;
+  summary: string;
+  time: string;
+}
+
+// Compact one-line row for a historical run. Never throws; malformed runs
+// degrade to a "—" row rather than hiding the rest of history.
+export function toForgeHistoryRow(run: ForgeRunView): ForgeHistoryRow {
+  return {
+    id: run.id,
+    status: shortRunStatus(run),
+    target: run.edits[0] ? (run.edits[0].function ?? run.edits[0].path ?? "—") : "—",
+    summary: run.testSummary ? `${run.testSummary.passed}/${run.testSummary.total}` : "—",
+    time: formatRunTime(run.at),
+  };
+}
+
 // ---- VERIFY IN SANDBOX request contract (Phase J fix) ----
 
 // The button must use the proven structured pipeline — never the legacy
@@ -406,10 +582,48 @@ export function buildVerifyBody(jobId: string, focus: string): VerifyBodyResult 
   if (trimmed.length === 0) {
     return { ok: false, error: "Describe the bug in the focus field first." };
   }
-  if (trimmed.length > 500) {
-    return { ok: false, error: "Focus must be 500 characters or fewer." };
+  if (trimmed.length > 2000) {
+    return { ok: false, error: "Focus must be 2000 characters or fewer." };
   }
   return { ok: true, body: { jobId, focus: trimmed } };
+}
+
+// The Forge request is bound to the exact investigation: { jobId,
+// investigationId }. The backend loads that investigation and derives the
+// repair focus from its plan. A Forge request without an investigationId is
+// rejected here — the UI never silently re-runs investigation.
+export type ForgeStructuredBodyResult =
+  | { ok: true; body: { jobId: string; investigationId: string; focus: string } }
+  | { ok: false; error: string };
+
+export function buildForgeBody(
+  jobId: string,
+  investigationId: string | null | undefined,
+  focus: string
+): ForgeStructuredBodyResult {
+  if (!jobId || jobId.trim().length === 0) {
+    return { ok: false, error: "No analysis job selected." };
+  }
+  if (!investigationId || investigationId.trim().length === 0) {
+    return { ok: false, error: "No investigation is attached to this Forge run." };
+  }
+  const trimmed = focus.trim();
+  if (trimmed.length === 0) {
+    return { ok: false, error: "The attached investigation has no repair focus." };
+  }
+  if (trimmed.length > 2000) {
+    return { ok: false, error: "Focus must be 2000 characters or fewer." };
+  }
+  return { ok: true, body: { jobId, investigationId, focus: trimmed } };
+}
+
+// Navigation helpers that carry the exact investigation identity.
+export function forgeReviewHref(jobId: string, investigationId: string): string {
+  return `/forge?jobId=${encodeURIComponent(jobId)}&investigationId=${encodeURIComponent(investigationId)}`;
+}
+
+export function investigationReviewHref(jobId: string, investigationId: string): string {
+  return `/investigate?jobId=${encodeURIComponent(jobId)}&investigationId=${encodeURIComponent(investigationId)}`;
 }
 
 export interface LiveVerification {
@@ -482,4 +696,359 @@ export function toVerifyError(status: number, data: unknown): string {
   }
   if (err) return err;
   return "Verification request failed.";
+}
+
+// ---- INVESTIGATE → FORGE flow ----
+
+export const INVESTIGATE_PATH = "/api/investigate";
+
+export type ReproduceBodyResult =
+  | { ok: true; body: { jobId: string; investigationId?: string; script: string } }
+  | { ok: false; error: string };
+
+export function buildReproduceBody(
+  jobId: string,
+  investigationId: string | null | undefined,
+  script: string
+): ReproduceBodyResult {
+  if (!jobId.trim()) return { ok: false, error: "No analysis job selected." };
+  const command = script.trim();
+  if (!command) return { ok: false, error: "Provide a reproduction command or script." };
+  return {
+    ok: true,
+    body: {
+      jobId,
+      ...(investigationId ? { investigationId } : {}),
+      script: command,
+    },
+  };
+}
+
+export interface InvestigationTargetView {
+  file: string;
+  function: string;
+}
+
+export interface InvestigationPlanView {
+  summary: string;
+  target: InvestigationTargetView;
+  currentBehavior: string;
+  expectedBehavior: string;
+  repairContract: {
+    requiredOutcome: string;
+    preserveBehavior: string[];
+    relevantCondition: string;
+    relevantOperation: string;
+    existingErrorContract: string;
+    minimalRepairDescription: string;
+    setupFacts: string[];
+    actionFacts: string[];
+    observedFacts: string[];
+    expectedFacts: string[];
+    sourceEvidence: string[];
+    relevantAssertions: string[];
+    conditionOperationAreDistinct: boolean;
+  };
+  constraints: string[];
+  evidence: string[];
+  reproduction: {
+    scenario: string;
+    testFile: string;
+  } | null;
+  confidence: "low" | "medium" | "high";
+}
+
+export type InvestigationStatus = "READY" | "AMBIGUOUS" | "NO_MATCH";
+
+// Richer investigation state (spec §7). `status` remains the coarse
+// READY|AMBIGUOUS|NO_MATCH gate; `state` distinguishes a reviewable result
+// from one still asking the user a focused question.
+export type InvestigationState =
+  | "DRAFT"
+  | "RETRIEVING"
+  | "ANALYZING"
+  | "CLARIFICATION_NEEDED"
+  | "READY_FOR_REVIEW"
+  | "READY"
+  | "AMBIGUOUS"
+  | "NO_MATCH";
+
+export interface InvestigationClarificationView {
+  question: string;
+  options: string[];
+}
+
+export interface InvestigationView {
+  investigationId: string | null;
+  jobId: string | null;
+  focus: string | null;
+  createdAt: string | null;
+  status: InvestigationStatus;
+  plan: InvestigationPlanView | null;
+  message: string | null;
+  // Additive agent fields — absent on legacy persisted runs.
+  state?: InvestigationState | null;
+  observedBehavior?: string | null;
+  expectedBehavior?: string | null;
+  clarification?: InvestigationClarificationView | null;
+}
+
+export type ReadyInvestigationView = InvestigationView & {
+  investigationId: string;
+  jobId: string;
+  status: "READY";
+  plan: InvestigationPlanView;
+};
+
+function asStringArray(v: unknown): string[] {
+  if (!Array.isArray(v)) return [];
+  return v.filter((e): e is string => typeof e === "string" && e.length > 0);
+}
+
+const INVESTIGATION_STATES: InvestigationState[] = [
+  "DRAFT",
+  "RETRIEVING",
+  "ANALYZING",
+  "CLARIFICATION_NEEDED",
+  "READY_FOR_REVIEW",
+  "READY",
+  "AMBIGUOUS",
+  "NO_MATCH",
+];
+
+function asInvestigationState(v: unknown): InvestigationState | null {
+  return typeof v === "string" && (INVESTIGATION_STATES as string[]).includes(v)
+    ? (v as InvestigationState)
+    : null;
+}
+
+function asClarification(v: unknown): InvestigationClarificationView | null {
+  if (!isRecord(v)) return null;
+  const question = asString(v.question);
+  const options = asStringArray(v.options);
+  if (!question || options.length === 0) return null;
+  return { question, options };
+}
+
+// Parse the structured investigate response. Returns null when the payload
+// carries no usable verdict — the page shows the error state, never a
+// fabricated plan. Never throws.
+export function toInvestigation(data: unknown): InvestigationView | null {
+  if (!isRecord(data)) return null;
+  const status = data.status;
+  if (status !== "READY" && status !== "AMBIGUOUS" && status !== "NO_MATCH") {
+    return null;
+  }
+  let plan: InvestigationPlanView | null = null;
+  if (status === "READY" && isRecord(data.plan)) {
+    const target = isRecord(data.plan.target) ? data.plan.target : null;
+    const file = target ? asString(target.file) : null;
+    const fn = target ? asString(target.function) : null;
+    const confidence = data.plan.confidence;
+    const contract = isRecord(data.plan.repairContract) ? data.plan.repairContract : null;
+    const repairContract = contract
+      ? {
+          requiredOutcome: asString(contract.requiredOutcome),
+          preserveBehavior: asStringArray(contract.preserveBehavior),
+          relevantCondition: asString(contract.relevantCondition),
+          relevantOperation: asString(contract.relevantOperation),
+          existingErrorContract: asString(contract.existingErrorContract),
+          minimalRepairDescription: asString(contract.minimalRepairDescription),
+          setupFacts: asStringArray(contract.setupFacts),
+          actionFacts: asStringArray(contract.actionFacts),
+          observedFacts: asStringArray(contract.observedFacts),
+          expectedFacts: asStringArray(contract.expectedFacts),
+          sourceEvidence: asStringArray(contract.sourceEvidence),
+          relevantAssertions: asStringArray(contract.relevantAssertions),
+          conditionOperationAreDistinct: contract.conditionOperationAreDistinct === true,
+        }
+      : null;
+    if (
+      file &&
+      fn &&
+      repairContract?.requiredOutcome &&
+      repairContract.relevantCondition &&
+      repairContract.relevantOperation &&
+      repairContract.minimalRepairDescription &&
+      (confidence === "low" || confidence === "medium" || confidence === "high")
+    ) {
+      plan = {
+        summary: asString(data.plan.summary) ?? "",
+        target: { file, function: fn },
+        currentBehavior: asString(data.plan.currentBehavior) ?? "",
+        expectedBehavior: asString(data.plan.expectedBehavior) ?? "",
+        repairContract: {
+          requiredOutcome: repairContract.requiredOutcome,
+          preserveBehavior: repairContract.preserveBehavior,
+          relevantCondition: repairContract.relevantCondition,
+          relevantOperation: repairContract.relevantOperation,
+          existingErrorContract: repairContract.existingErrorContract ?? "",
+          minimalRepairDescription: repairContract.minimalRepairDescription,
+          setupFacts: repairContract.setupFacts,
+          actionFacts: repairContract.actionFacts,
+          observedFacts: repairContract.observedFacts,
+          expectedFacts: repairContract.expectedFacts,
+          sourceEvidence: repairContract.sourceEvidence,
+          relevantAssertions: repairContract.relevantAssertions,
+          conditionOperationAreDistinct: repairContract.conditionOperationAreDistinct,
+        },
+        constraints: asStringArray(data.plan.constraints),
+        evidence: asStringArray(data.plan.evidence),
+        reproduction:
+          isRecord(data.plan.reproduction) &&
+          asString(data.plan.reproduction.scenario) &&
+          asString(data.plan.reproduction.testFile)
+            ? {
+                scenario: asString(data.plan.reproduction.scenario)!,
+                testFile: asString(data.plan.reproduction.testFile)!,
+              }
+            : null,
+        confidence,
+      };
+    }
+  }
+  if (status === "READY" && !plan) return null;
+  return {
+    investigationId: asString(data.investigationId),
+    jobId: asString(data.jobId),
+    focus: asString(data.focus),
+    createdAt: asString(data.createdAt),
+    status,
+    plan,
+    message: asString(data.message),
+    state: asInvestigationState(data.state),
+    observedBehavior: asString(data.observedBehavior),
+    expectedBehavior: asString(data.expectedBehavior),
+    clarification: asClarification(data.clarification),
+  };
+}
+
+export function canReviewInvestigation(
+  view: InvestigationView | null
+): view is ReadyInvestigationView {
+  return Boolean(
+    view &&
+      view.status === "READY" &&
+      view.investigationId &&
+      view.jobId &&
+      view.plan
+  );
+}
+
+export function findSavedInvestigation(
+  job: unknown,
+  requestedInvestigationId?: string | null
+): InvestigationView | null {
+  if (!isRecord(job) || !isRecord(job.result)) return null;
+  const runs = job.result.investigationRuns;
+  if (!Array.isArray(runs)) return null;
+  const jobId = asString(job.id);
+  for (const run of [...runs].reverse()) {
+    if (!isRecord(run) || run.status !== "READY") continue;
+    if (requestedInvestigationId && run.investigationId !== requestedInvestigationId) continue;
+    const view = toInvestigation(run);
+    if (!canReviewInvestigation(view)) continue;
+    if (jobId && view.jobId !== jobId) continue;
+    return view;
+  }
+  return null;
+}
+
+export function describeInvestigationFailure(
+  status: number | null,
+  url: string,
+  body: unknown
+): string {
+  if (process.env.NODE_ENV === "production") {
+    return status === null
+      ? "Investigation service unreachable."
+      : "Investigation request failed.";
+  }
+  let serialized = "(empty response)";
+  if (typeof body === "string") serialized = body;
+  else if (body !== undefined) {
+    try {
+      serialized = JSON.stringify(body);
+    } catch {
+      serialized = "(response was not serializable)";
+    }
+  }
+  return `Investigation request failed:\nHTTP ${status ?? "network error"}\n${url}\n${serialized.slice(0, 2000)}`;
+}
+
+// FORGE FIX is enabled only for a verified READY plan. AMBIGUOUS and
+// NO_MATCH verdicts never reach the Forge endpoint.
+export function canForgePlan(view: InvestigationView | null): boolean {
+  return canReviewInvestigation(view) && isGroundedPlan(view.plan);
+}
+
+function isGroundedPlan(plan: InvestigationPlanView): boolean {
+  const contract = plan.repairContract;
+  // Grounding reflects the generalized investigator: an error contract is
+  // only present when the relevant test scenario asserts a throw. Value
+  // contracts (computed totals, cart state) legitimately have none.
+  return Boolean(
+    plan.evidence.length > 0 &&
+      contract.requiredOutcome &&
+      contract.relevantCondition &&
+      contract.relevantOperation &&
+      contract.minimalRepairDescription &&
+      contract.sourceEvidence.length >= 2 &&
+      contract.relevantAssertions.length > 0 &&
+      contract.conditionOperationAreDistinct
+  );
+}
+
+export type InvestigateBodyResult =
+  | {
+      ok: true;
+      body: { jobId: string; focus: string; priorQuestion?: string; clarification?: string };
+    }
+  | { ok: false; error: string };
+
+// Build the investigate request body. The description is required and
+// bounded like the Forge focus contract. An optional clarification carries the
+// focused question plus the user's answer so the agent resumes instead of
+// asking the user to restate the whole bug. Never throws.
+export function buildInvestigateBody(
+  jobId: string,
+  description: string,
+  clarification?: { priorQuestion: string; answer: string }
+): InvestigateBodyResult {
+  if (!jobId || jobId.trim().length === 0) {
+    return { ok: false, error: "No analysis job selected." };
+  }
+  const trimmed = description.trim();
+  if (trimmed.length === 0) {
+    return { ok: false, error: "Describe the bug first." };
+  }
+  if (trimmed.length > 500) {
+    return { ok: false, error: "Description must be 500 characters or fewer." };
+  }
+  const answer = clarification?.answer?.trim() ?? "";
+  return {
+    ok: true,
+    body: {
+      jobId,
+      focus: trimmed,
+      ...(answer
+        ? { priorQuestion: clarification?.priorQuestion?.trim() ?? "", clarification: answer.slice(0, 500) }
+        : {}),
+    },
+  };
+}
+
+// Compose the Forge focus from a verified plan. Mirrors the backend
+// composeForgeFocus template (apps/api/src/investigate.ts) so the plan
+// the user approved is exactly what the Forge endpoint receives. Never
+// invents content beyond the plan fields. Never throws.
+export function composeForgeFocus(plan: InvestigationPlanView): string {
+  const text = [
+    `Target: ${plan.target.function} (${plan.target.file}). Current: ${plan.currentBehavior} Expected: ${plan.expectedBehavior}`,
+    `Repair contract: Required outcome: ${plan.repairContract.requiredOutcome} Preserve: ${plan.repairContract.preserveBehavior.join(" ")} Condition: ${plan.repairContract.relevantCondition} Operation: ${plan.repairContract.relevantOperation} Error: ${plan.repairContract.existingErrorContract} Minimal repair: ${plan.repairContract.minimalRepairDescription}`,
+    `Evidence chain: Setup: ${plan.repairContract.setupFacts.join(" ")} Action: ${plan.repairContract.actionFacts.join(" ")} Observed: ${plan.repairContract.observedFacts.join(" ")} Expected: ${plan.repairContract.expectedFacts.join(" ")} Source: ${plan.repairContract.sourceEvidence.join(" ")} Assertions: ${plan.repairContract.relevantAssertions.join(" ")}`,
+    `Constraints: ${plan.constraints.join(" ")}`,
+    `Evidence: ${plan.evidence.join(" ")}`,
+  ].join(" ");
+  return text.length > 2000 ? text.slice(0, 2000) : text;
 }

@@ -45,6 +45,251 @@ export function resolveForgeStatus(s: RunSignals): ForgeStatus {
   return s.exitCode === 0 ? "VERIFIED" : "FAILED";
 }
 
+// ---- Verification assessment (user-facing) ----
+//
+// "Target test passed" is repair evidence; "full suite passed" is regression
+// evidence. The assessment never infers the first from the second. REPAIR
+// VERIFIED requires an explicit targeted run of the exact investigated
+// scenario to have passed. Anything that cannot be established is
+// VERIFICATION_INCOMPLETE, never a generic failure.
+
+export type VerificationAssessmentState =
+  | "FULL_SUITE_PASSED"
+  | "REPAIR_VERIFIED"
+  | "REPAIR_NOT_VERIFIED"
+  | "VERIFICATION_INCOMPLETE";
+
+// Result of the targeted run of the exact investigated scenario.
+export interface TargetVerificationInput {
+  testFile: string;
+  scenario: string;
+  command: string;
+  ran: boolean;
+  exitCode: number | null;
+  timedOut: boolean;
+}
+
+export interface VerificationAssessment {
+  state: VerificationAssessmentState;
+  patchApplied: boolean;
+  // null when it cannot be determined.
+  targetVerificationPassed: boolean | null;
+  // The investigated target test file / scenario, when the investigation
+  // supplied them (never invented).
+  targetTestFile: string | null;
+  targetScenario: string | null;
+  targetCommand: string | null;
+  fullSuitePassed: boolean;
+  // Failing test files that are NOT the investigated target test file.
+  unrelatedTestFailures: number;
+  // Failing test files parsed from the full-suite output (deduped).
+  failedTests: string[];
+  // The failing line for the target test, when the target run failed.
+  targetFailure: string | null;
+}
+
+export const TARGET_VERIFY_DONE_MARKER = "TARGET_VERIFY_DONE";
+
+// Parse the targeted-run completion marker. Absent marker ⇒ the targeted
+// command never executed (context missing or unsupported runner).
+export function parseTargetVerification(stdout: string): {
+  ran: boolean;
+  exitCode: number | null;
+} {
+  if (typeof stdout !== "string") return { ran: false, exitCode: null };
+  const m = stdout.match(new RegExp(`^${TARGET_VERIFY_DONE_MARKER} (-?\\d+)$`, "m"));
+  return m ? { ran: true, exitCode: Number(m[1]) } : { ran: false, exitCode: null };
+}
+
+export type TargetTestRunner = "vitest" | "jest";
+
+// Detect the repo's test runner from its own test script. No global hardcode.
+export function detectTestRunner(script: string | null | undefined): TargetTestRunner | null {
+  const s = typeof script === "string" ? script.toLowerCase() : "";
+  if (/\bvitest\b/.test(s)) return "vitest";
+  if (/\bjest\b/.test(s)) return "jest";
+  return null;
+}
+
+// Build a targeted command for the exact investigated scenario, using the
+// detected package manager and runner. The test file and scenario are DATA,
+// shell-quoted — never concatenated raw. Returns null when the runner is
+// unsupported, so callers return VERIFICATION_INCOMPLETE.
+export function buildTargetVerificationCommand(input: {
+  manager: PackageManager;
+  testScript: string | null;
+  testFile: string | null;
+  scenario: string | null;
+}): string | null {
+  if (!input.testFile || !input.scenario) return null;
+  const runner = detectTestRunner(input.testScript);
+  if (!runner) return null;
+  const exec = input.manager === "pnpm" ? "pnpm exec" : "npx";
+  const file = shQuote(input.testFile);
+  const name = shQuote(input.scenario);
+  return runner === "vitest"
+    ? `${exec} vitest run ${file} -t ${name}`
+    : `${exec} jest ${file} -t ${name}`;
+}
+
+// Normalize a test path for comparison: trim surrounding output, drop a
+// leading "./", a trailing time/count suffix, and any `::test` selector.
+export function normalizeTestPath(p: string | null | undefined): string | null {
+  if (typeof p !== "string") return null;
+  let s = p.trim().replace(/^\.\//, "").replace(/\\/g, "/");
+  s = s.replace(/::.*$/, "");
+  s = s.replace(/[),:(].*$/, "");
+  return s.length > 0 ? s : null;
+}
+
+function sameTestFile(a: string, b: string): boolean {
+  const na = normalizeTestPath(a);
+  const nb = normalizeTestPath(b);
+  if (!na || !nb) return false;
+  return na === nb || na.endsWith(`/${nb}`) || nb.endsWith(`/${na}`);
+}
+
+// Extract failing test FILES from common runner output. Never throws; an
+// unrecognized format yields [] (and therefore an unclassified verdict).
+export function parseFailingTests(stdout: string): string[] {
+  if (typeof stdout !== "string" || stdout.length === 0) return [];
+  const out = new Set<string>();
+  for (const raw of stdout.split("\n")) {
+    const line = raw.trim();
+    // vitest / jest: "FAIL  tests/cart.test.ts > …" or "❯ tests/x.test.ts (…)"
+    let m = line.match(/^(?:FAIL|❯|✕|✗)\s+(\S+\.(?:test|spec)\.[cm]?[jt]sx?)/);
+    if (m) {
+      const n = normalizeTestPath(m[1]);
+      if (n) out.add(n);
+      continue;
+    }
+    // pytest: "FAILED tests/test_x.py::test_y - …"
+    m = line.match(/^FAILED\s+([^\s:]+\.py)/);
+    if (m) {
+      const n = normalizeTestPath(m[1]);
+      if (n) out.add(n);
+    }
+  }
+  return [...out];
+}
+
+export function assessVerification(input: {
+  patchApplied: boolean;
+  verificationStarted: boolean;
+  exitCode: number | null;
+  timedOut: boolean;
+  stdout: string;
+  target?: TargetVerificationInput | null;
+}): VerificationAssessment {
+  const failedTests = parseFailingTests(input.stdout);
+  const target = input.target ?? null;
+  const targetTestFile = normalizeTestPath(target?.testFile ?? null);
+  const targetScenario = target?.scenario?.trim() ? target.scenario.trim() : null;
+  const targetCommand = target?.command ?? null;
+  const fullSuitePassed =
+    input.patchApplied &&
+    input.verificationStarted &&
+    !input.timedOut &&
+    input.exitCode === 0;
+
+  const base = {
+    patchApplied: input.patchApplied,
+    targetTestFile,
+    targetScenario,
+    targetCommand,
+    failedTests,
+  };
+
+  if (!input.patchApplied) {
+    return {
+      ...base,
+      state: "VERIFICATION_INCOMPLETE",
+      targetVerificationPassed: null,
+      fullSuitePassed: false,
+      unrelatedTestFailures: 0,
+      targetFailure: null,
+    };
+  }
+
+  // With an explicit target run: TARGET FAILURE ALWAYS WINS.
+  if (target && targetScenario) {
+    const executed =
+      target.ran && !target.timedOut && target.exitCode !== null && target.exitCode !== 127;
+    if (target.timedOut || !executed) {
+      // Fail closed: could not directly verify the investigated scenario.
+      return {
+        ...base,
+        state: "VERIFICATION_INCOMPLETE",
+        targetVerificationPassed: null,
+        fullSuitePassed,
+        unrelatedTestFailures: failedTests.filter((f) => !sameTestFile(f, targetTestFile ?? "")).length,
+        targetFailure: null,
+      };
+    }
+    if (target.exitCode !== 0) {
+      return {
+        ...base,
+        state: "REPAIR_NOT_VERIFIED",
+        targetVerificationPassed: false,
+        fullSuitePassed,
+        unrelatedTestFailures: failedTests.filter((f) => !sameTestFile(f, targetTestFile ?? "")).length,
+        targetFailure:
+          failedTests.find((f) => sameTestFile(f, targetTestFile ?? "")) ?? targetTestFile,
+      };
+    }
+    // Target passed.
+    if (fullSuitePassed) {
+      return {
+        ...base,
+        state: "FULL_SUITE_PASSED",
+        targetVerificationPassed: true,
+        fullSuitePassed: true,
+        unrelatedTestFailures: 0,
+        targetFailure: null,
+      };
+    }
+    if (input.timedOut) {
+      // Fail closed: the regression run did not finish.
+      return {
+        ...base,
+        state: "VERIFICATION_INCOMPLETE",
+        targetVerificationPassed: true,
+        fullSuitePassed: false,
+        unrelatedTestFailures: 0,
+        targetFailure: null,
+      };
+    }
+    return {
+      ...base,
+      state: "REPAIR_VERIFIED",
+      targetVerificationPassed: true,
+      fullSuitePassed: false,
+      unrelatedTestFailures: failedTests.filter((f) => !sameTestFile(f, targetTestFile ?? "")).length,
+      targetFailure: null,
+    };
+  }
+
+  // No target context (or unsupported runner): never claim REPAIR_VERIFIED.
+  if (fullSuitePassed) {
+    return {
+      ...base,
+      state: "FULL_SUITE_PASSED",
+      targetVerificationPassed: null,
+      fullSuitePassed: true,
+      unrelatedTestFailures: 0,
+      targetFailure: null,
+    };
+  }
+  return {
+    ...base,
+    state: "VERIFICATION_INCOMPLETE",
+    targetVerificationPassed: null,
+    fullSuitePassed: false,
+    unrelatedTestFailures: 0,
+    targetFailure: null,
+  };
+}
+
 function shQuote(s: string): string {
   return "'" + s.replace(/'/g, "'\\''") + "'";
 }

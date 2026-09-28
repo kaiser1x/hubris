@@ -3,16 +3,16 @@
 import { useEffect, useRef } from "react";
 
 const CODE_LABELS = [
-  "src/auth/session.ts",
-  "TransactionService",
-  "TransactionController",
+  "src/api/route.ts",
+  "Service",
+  "Controller",
   "Queue",
-  "PostgreSQL",
+  "Database",
   "middleware.ts",
   "worker.ts",
   "api/routes.ts",
   "dependency.graph",
-  "trace_0184",
+  "trace_001",
 ];
 
 const EXEC_STAGES = ["REQUEST", "SERVICE", "QUEUE", "WORKER", "DATABASE"];

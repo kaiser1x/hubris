@@ -1,60 +1,84 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useState } from "react";
-import { CASES, HEALTH, NODES, REPO, type TwinNode } from "../../lib/casefile";
-import {
-  fetchLatestJob,
-  resolveLiveOverview,
-} from "../../lib/live-twin";
+import { useMemo } from "react";
+import { useWorkspace } from "../../components/WorkspaceProvider";
+import { resolveLiveOverview } from "../../lib/live-twin";
+import { findSavedInvestigation, toInvestigation } from "../../lib/forge-run";
+import type { TwinNode } from "../../lib/casefile";
+import { workspaceHref } from "../../lib/workspace";
 
 export default function OverviewPage() {
-  const [analyzed, setAnalyzed] = useState(false);
-  const [liveNodes, setLiveNodes] = useState<TwinNode[] | null>(null);
-  const [liveName, setLiveName] = useState<string | null>(null);
-  const [liveCells, setLiveCells] = useState<[string, string, string][] | null>(null);
-  const [checked, setChecked] = useState(false);
+  const { status, job, repo } = useWorkspace();
 
-  useEffect(() => {
-    let cancelled = false;
-    fetchLatestJob()
-      .then((job) => {
-        const live = resolveLiveOverview(job);
-        if (!cancelled && live) {
-          console.log("OVERVIEW_TRANSFORM", `${live.nodes.length} nodes`);
-          setLiveNodes(live.nodes);
-          setLiveName(live.name);
-          setLiveCells(live.cells);
-        } else {
-          console.log(job ? "OVERVIEW_NO_CONTENT" : "OVERVIEW_NO_JOB");
-        }
-      })
-      .catch(() => {
-        console.log("OVERVIEW_FETCH_REJECTED");
-        // fall through to demo narrative
-      })
-      .finally(() => {
-        console.log("OVERVIEW_SET_LOADING_FALSE");
-        if (!cancelled) setChecked(true);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+  const live = useMemo(() => resolveLiveOverview(job), [job]);
 
-  if (!checked) {
+  const investigations = useMemo(() => {
+    if (!job?.result || !Array.isArray(job.result.investigationRuns)) return [];
+    const views = job.result.investigationRuns
+      .map((raw) => toInvestigation(raw))
+      .filter((v): v is NonNullable<typeof v> => v !== null);
+    return [...views].reverse();
+  }, [job]);
+
+  const latestFinding = useMemo(
+    () => (job ? findSavedInvestigation(job) : null),
+    [job]
+  );
+
+  if (status === "loading") {
     return (
       <div className="max-w-[1440px] mx-auto px-5 lg:px-[52px] pt-10 lg:pt-[50px] pb-12">
         <p className="kicker">Repository / Overview</p>
         <p className="font-mono text-[13px] text-[#7A7171] mt-4">
-          Loading twin…
+          Loading workspace…
         </p>
       </div>
     );
   }
 
-  const nodes = liveNodes ?? NODES;
-  const healthCells = liveCells ?? HEALTH.slice(0, 3);
+  if (status === "unavailable" || !job) {
+    return (
+      <div className="max-w-[1440px] mx-auto px-5 lg:px-[52px] pt-10 lg:pt-[50px] pb-12">
+        <p className="kicker">Repository / Overview</p>
+        <h1 className="font-display text-[clamp(38px,5vw,58px)] leading-[1.05] mt-4">
+          No analyzed repository
+        </h1>
+        <p className="font-mono text-[13px] text-[#7A7171] mt-3 max-w-xl leading-7">
+          The workspace has no completed analysis to render. Analyze a
+          repository to see its live CodeTwin, open cases, and findings here.
+        </p>
+        <Link
+          href={workspaceHref("/codebase", { jobId: job?.id })}
+          className="inline-flex mt-7 bg-[#0A0A0A] text-white font-mono text-[11px] tracking-[0.08em] px-4 py-3.5 hover:bg-black active:scale-[0.98] transition-all"
+        >
+          ANALYZE REPOSITORY ↗
+        </Link>
+      </div>
+    );
+  }
+
+  if (!live) {
+    return (
+      <div className="max-w-[1440px] mx-auto px-5 lg:px-[52px] pt-10 lg:pt-[50px] pb-12">
+        <p className="kicker">Repository / Overview</p>
+        <h1 className="font-display text-[clamp(38px,5vw,58px)] leading-[1.05] mt-4">
+          {repo.label}
+        </h1>
+        <p className="font-mono text-[13px] text-[#7A7171] mt-3 max-w-xl leading-7">
+          {repo.hasContext
+            ? "This job has no usable CodeTwin content. Re-analyze the repository to build the twin."
+            : "Repository context is unavailable for this job. Re-analyze to restore the workspace."}
+        </p>
+      </div>
+    );
+  }
+
+  const nodes: TwinNode[] = live.nodes;
+  const healthCells = live.cells;
+  const selectedNode = nodes[0];
+  const finding = latestFinding;
+  const findingPlan = finding?.plan ?? null;
 
   return (
     <div className="max-w-[1440px] mx-auto px-5 lg:px-[52px] pt-10 lg:pt-[50px] pb-12">
@@ -62,22 +86,18 @@ export default function OverviewPage() {
       <div className="flex flex-col sm:flex-row sm:items-end gap-4 mt-4">
         <div>
           <h1 className="font-display text-[clamp(38px,5vw,58px)] leading-[1.05]">
-            {liveName ?? REPO.name}
+            {repo.hasContext ? repo.repoName : live.name}
           </h1>
           <p className="font-mono text-[13px] text-[#7A7171] mt-3">
-            A living case file for your codebase.
+            {repo.ref ? `ref ${repo.ref} · ` : ""}A living case file for your codebase.
           </p>
         </div>
-        <button
-          onClick={() => {
-            setAnalyzed(true);
-            setTimeout(() => setAnalyzed(false), 1600);
-          }}
-          disabled={analyzed}
-          className="sm:ml-auto shrink-0 bg-[#0A0A0A] text-white font-mono text-[11px] tracking-[0.08em] px-4 py-3.5 hover:bg-black active:scale-[0.98] disabled:opacity-70 transition-all"
+        <Link
+           href={workspaceHref("/codebase", { jobId: job.id })}
+          className="sm:ml-auto shrink-0 bg-[#0A0A0A] text-white font-mono text-[11px] tracking-[0.08em] px-4 py-3.5 hover:bg-black active:scale-[0.98] transition-all"
         >
-          {analyzed ? "ANALYZING..." : "ANALYZE REPOSITORY ↗"}
-        </button>
+          ANALYZE REPOSITORY ↗
+        </Link>
       </div>
 
       <section className="mt-12">
@@ -91,17 +111,6 @@ export default function OverviewPage() {
           </span>
         </div>
         <div className="grid grid-cols-2 lg:grid-cols-4 border-b border-[#dedada]">
-          <div className="py-6 pr-5 border-r border-[#dedada]">
-            <p className="font-display text-[46px] leading-none">
-              98.4<span className="font-mono text-xs text-[#7A7171]"> / 100</span>
-            </p>
-            <p className="font-mono text-[11px] text-[#7A7171] mt-2.5">
-              Confidence in current understanding
-            </p>
-            <div className="h-[3px] bg-[#d9d4d4] w-[90%] mt-4">
-              <div className="bg-[#0A0A0A] h-full" style={{ width: "98.4%" }} />
-            </div>
-          </div>
           {healthCells.map(([label, value, sub], i) => (
             <div
               key={label}
@@ -126,46 +135,62 @@ export default function OverviewPage() {
                 Active investigations
               </h2>
             </div>
-            <Link
-              href="/investigate"
+             <Link
+               href={workspaceHref("/investigate", { jobId: job.id })}
               className="font-mono text-[10px] tracking-[0.08em] text-[#0A0A0A] hover:underline underline-offset-4"
             >
               VIEW ALL ↗
             </Link>
           </div>
           <div className="border-b border-[#dedada]">
-            {CASES.map((c) => (
-              <Link
-                key={c.id}
-                href="/investigate"
-                className="grid grid-cols-[9px_1fr_auto] gap-4 items-start py-5 border-b border-[#dedada] last:border-b-0 hover:bg-white/60 transition-colors"
-              >
-                <span
-                  aria-hidden
-                  className={`w-[7px] h-[7px] mt-1 border border-[#0A0A0A] ${
-                    c.status === "INVESTIGATING"
-                      ? "bg-[#0A0A0A]"
-                      : c.status === "VERIFIED"
-                        ? "bg-[#7A7171] border-[#7A7171]"
-                        : "bg-transparent"
-                  }`}
-                />
-                <span>
-                  <strong className="block font-display text-[15px] font-normal">
-                    {c.title}
-                  </strong>
-                  <span className="block font-mono text-[10px] text-[#7A7171] mt-1.5">
-                    {c.file} · line {c.line}
-                  </span>
-                  <small className="block font-mono text-[10px] text-[#7A7171] mt-3">
-                    {c.meta}
-                  </small>
-                </span>
-                <span className="font-mono text-[10px] text-[#7A7171]">
-                  {c.status} ›
-                </span>
-              </Link>
-            ))}
+            {investigations.length === 0 ? (
+              <p className="font-mono text-[12px] leading-6 text-[#7A7171] py-5">
+                No investigations persisted for this job yet. Describe a
+                suspected issue on the Investigate page to start one.
+              </p>
+            ) : (
+              investigations.map((c) => {
+                const target = c.plan?.target;
+                return (
+                  <Link
+                    key={c.investigationId ?? c.status}
+                    href={
+                       c.investigationId
+                         ? workspaceHref("/forge", { jobId: job.id, investigationId: c.investigationId })
+                         : workspaceHref("/investigate", { jobId: job.id })
+                    }
+                    className="grid grid-cols-[9px_1fr_auto] gap-4 items-start py-5 border-b border-[#dedada] last:border-b-0 hover:bg-white/60 transition-colors"
+                  >
+                    <span
+                      aria-hidden
+                      className={`w-[7px] h-[7px] mt-1 border border-[#0A0A0A] ${
+                        c.status === "READY"
+                          ? "bg-[#0A0A0A]"
+                          : "bg-transparent"
+                      }`}
+                    />
+                    <span>
+                      <strong className="block font-display text-[15px] font-normal">
+                        {c.focus ?? "Investigation"}
+                      </strong>
+                      <span className="block font-mono text-[10px] text-[#7A7171] mt-1.5">
+                        {target
+                          ? `${target.file} · ${target.function}()`
+                          : c.status}
+                      </span>
+                      <small className="block font-mono text-[10px] text-[#7A7171] mt-3">
+                        {c.plan
+                          ? `confidence ${c.plan.confidence} · ${c.plan.evidence.length} evidence`
+                          : c.message ?? ""}
+                      </small>
+                    </span>
+                    <span className="font-mono text-[10px] text-[#7A7171]">
+                      {c.status} ›
+                    </span>
+                  </Link>
+                );
+              })
+            )}
           </div>
         </section>
 
@@ -176,7 +201,7 @@ export default function OverviewPage() {
               <h2 className="font-display text-[25px] mt-2">Architecture</h2>
             </div>
             <Link
-              href="/codebase"
+              href={workspaceHref("/codebase", { jobId: job.id })}
               className="font-mono text-[10px] tracking-[0.08em] text-[#0A0A0A] hover:underline underline-offset-4"
             >
               OPEN ↗
@@ -204,12 +229,12 @@ export default function OverviewPage() {
           <div className="border-t border-[#dedada] mt-4 pt-3.5 flex items-center justify-between">
             <div>
               <p className="kicker">Selected node</p>
-              <p className="font-mono text-[13px] mt-1.5">
-                src/services/transactions.ts
+              <p className="font-mono text-[13px] mt-1.5 truncate">
+                {selectedNode ? `${selectedNode.file} · ${selectedNode.label}` : "—"}
               </p>
             </div>
             <span className="font-mono text-[10px] text-[#7A7171]">
-              12 dependencies ›
+              {selectedNode ? `${selectedNode.deps.length} dependencies ›` : ""}
             </span>
           </div>
         </section>
@@ -223,75 +248,77 @@ export default function OverviewPage() {
               Evidence, not guesses.
             </h2>
           </div>
-          <span className="font-mono text-[10px] text-[#0A0A0A]">
-            ■ HIGH CONFIDENCE
-          </span>
+          {findingPlan && (
+            <span className="font-mono text-[10px] text-[#0A0A0A]">
+              ■ {findingPlan.confidence.toUpperCase()} CONFIDENCE
+            </span>
+          )}
         </div>
-        <div className="grid gap-9 lg:grid-cols-3 pt-7">
-          <div>
-            <p className="kicker">Duplicate tx / case-031</p>
-            <h3 className="font-display text-[24px] leading-[1.15] mt-4">
-              Guard runs after the write it guards.
-            </h3>
-            <p className="font-mono text-xs leading-6 text-[#7A7171] mt-4">
-              The idempotency check executes after the database write. Two
-              concurrent requests both pass the guard before either row
-              exists.
-            </p>
-            <p className="border-t border-[#dedada] mt-7 pt-3 flex items-baseline gap-3">
-              <strong className="font-display text-[30px] font-normal">3</strong>
-              <span className="font-mono text-[10px] text-[#7A7171]">
-                execution traces support this hypothesis
-              </span>
-            </p>
-          </div>
-          <div className="bg-[#111] text-[#d8d4d4] font-mono text-[11px] leading-[2.1] pb-4 self-start w-full overflow-x-auto">
-            <div className="flex justify-between border-b border-[#393535] px-3.5 py-2.5 text-[10px] text-[#938c8c]">
-              <span>src/services/transactions.ts</span>
-              <span>88:16</span>
-            </div>
-            <div className="grid grid-cols-[40px_1fr] px-3.5">
-              <i className="text-[#686363] not-italic">85</i>
-              <span>await createTransaction(data)</span>
-            </div>
-            <div className="grid grid-cols-[40px_1fr] px-3.5">
-              <i className="text-[#686363] not-italic">86</i>
-              <span>await markProcessed(id)</span>
-            </div>
-            <div className="grid grid-cols-[40px_1fr] px-3.5 bg-[#2e2b2b] text-white">
-              <i className="text-[#938c8c] not-italic">88</i>
-              <span>
-                if (await seen(id)) return <b className="font-normal text-[#999] text-[10px] ml-2">← too late</b>
-              </span>
-            </div>
-            <div className="grid grid-cols-[40px_1fr] px-3.5">
-              <i className="text-[#686363] not-italic">89</i>
-              <span>return transaction</span>
-            </div>
-          </div>
-          <div className="lg:border-l lg:border-[#dedada] lg:pl-6">
-            <p className="kicker">Supporting evidence</p>
-            {[
-              ["Execution trace", "trace_1842"],
-              ["Reproduction", "repro_031 / passed"],
-              ["Dependency path", "service → repo → db"],
-            ].map(([t, s]) => (
-              <Link
-                key={t}
-                href="/investigate"
-                className="w-full flex items-center gap-3 border-b border-[#dedada] py-4 text-left hover:bg-white/60 transition-colors"
-              >
-                <span className="font-mono text-[11px]">
-                  {t}
-                  <small className="block text-[#7A7171] text-[10px] mt-1">
-                    {s}
-                  </small>
+        {findingPlan ? (
+          <div className="grid gap-9 lg:grid-cols-3 pt-7">
+            <div>
+              <p className="kicker">
+                {findingPlan.target.function} /{" "}
+                {finding?.focus?.slice(0, 80) ?? "Investigation"}
+              </p>
+              <h3 className="font-display text-[24px] leading-[1.15] mt-4">
+                {findingPlan.summary}
+              </h3>
+              <p className="font-mono text-xs leading-6 text-[#7A7171] mt-4">
+                {findingPlan.currentBehavior}
+              </p>
+              <p className="border-t border-[#dedada] mt-7 pt-3 flex items-baseline gap-3">
+                <strong className="font-display text-[30px] font-normal">
+                  {findingPlan.evidence.length}
+                </strong>
+                <span className="font-mono text-[10px] text-[#7A7171]">
+                  evidence lines support this hypothesis
                 </span>
-                <span className="ml-auto text-[#7A7171]">›</span>
-              </Link>
-            ))}
+              </p>
+            </div>
+            <div className="bg-[#111] text-[#d8d4d4] font-mono text-[11px] leading-[2.1] pb-4 self-start w-full overflow-x-auto">
+              <div className="flex justify-between border-b border-[#393535] px-3.5 py-2.5 text-[10px] text-[#938c8c]">
+                <span>{findingPlan.target.file}</span>
+                <span>{findingPlan.target.function}()</span>
+              </div>
+              <div className="px-3.5">
+                {findingPlan.evidence.slice(0, 6).map((line) => (
+                  <p key={line} className="truncate">
+                    · {line}
+                  </p>
+                ))}
+              </div>
+            </div>
+            <div className="lg:border-l lg:border-[#dedada] lg:pl-6">
+              <p className="kicker">Supporting evidence</p>
+              {findingPlan.evidence.slice(0, 3).map((t) => (
+                <Link
+                  key={t}
+                  href={
+                      finding?.investigationId
+                       ? workspaceHref("/forge", { jobId: job.id, investigationId: finding.investigationId })
+                       : workspaceHref("/investigate", { jobId: job.id })
+                  }
+                  className="w-full flex items-center gap-3 border-b border-[#dedada] py-4 text-left hover:bg-white/60 transition-colors"
+                >
+                  <span className="font-mono text-[11px]">
+                    {t}
+                    <small className="block text-[#7A7171] text-[10px] mt-1">
+                      {findingPlan.target.file}
+                    </small>
+                  </span>
+                  <span className="ml-auto text-[#7A7171]">›</span>
+                </Link>
+              ))}
+            </div>
           </div>
-        </div>
+        ) : (
+          <p className="font-mono text-[12px] leading-6 text-[#7A7171] pt-6">
+            No READY investigation exists for this repository yet. Run an
+            investigation on the Investigate page and its grounded finding
+            will appear here.
+          </p>
+        )}
       </section>
     </div>
   );

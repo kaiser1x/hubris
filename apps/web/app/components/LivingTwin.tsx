@@ -115,13 +115,16 @@ export default function LivingTwin({ className = "" }: { className?: string }) {
 
     function draw(now: number) {
       ctx!.clearRect(0, 0, w, h);
+      const ink = document.documentElement.dataset.theme === "dark"
+        ? "244,242,239"
+        : "10,10,10";
 
       // Scan sweep: a faint band crossing the left third, ~14s cycle.
       const scanX = ((now / 14000) % 1) * w * 0.45;
       const grad = ctx!.createLinearGradient(scanX - 50, 0, scanX + 50, 0);
-      grad.addColorStop(0, "rgba(10,10,10,0)");
-      grad.addColorStop(0.5, "rgba(10,10,10,0.035)");
-      grad.addColorStop(1, "rgba(10,10,10,0)");
+      grad.addColorStop(0, `rgba(${ink},0)`);
+      grad.addColorStop(0.5, `rgba(${ink},0.035)`);
+      grad.addColorStop(1, `rgba(${ink},0)`);
       ctx!.fillStyle = grad;
       ctx!.fillRect(scanX - 50, 0, 100, h);
 
@@ -134,7 +137,7 @@ export default function LivingTwin({ className = "" }: { className?: string }) {
         const nearMouse =
           Math.hypot(midX - mouse.x, midY - mouse.y) < 130 ? 0.05 : 0;
         const base = onPath.has(i) && onPath.has(j) ? 0.09 : 0.045;
-        ctx!.strokeStyle = `rgba(10,10,10,${base + nearMouse})`;
+        ctx!.strokeStyle = `rgba(${ink},${base + nearMouse})`;
         ctx!.lineWidth = 1;
         ctx!.beginPath();
         ctx!.moveTo(a.x, a.y);
@@ -144,7 +147,7 @@ export default function LivingTwin({ className = "" }: { className?: string }) {
 
       // Traveler: one request crossing the path every ~9s.
       const p = pointOnPath((now / 9000) % 1);
-      ctx!.fillStyle = "rgba(10,10,10,0.32)";
+      ctx!.fillStyle = `rgba(${ink},0.32)`;
       ctx!.beginPath();
       ctx!.arc(p.x, p.y, 2, 0, Math.PI * 2);
       ctx!.fill();
@@ -169,7 +172,7 @@ export default function LivingTwin({ className = "" }: { className?: string }) {
         const ox = d > 0.01 ? (dx / d) * push : 0;
         const oy = d > 0.01 ? (dy / d) * push : 0;
         const isPulsing = i === pulseNode ? pulseK : 0;
-        ctx!.fillStyle = `rgba(10,10,10,${Math.min(0.5, n.a + isPulsing * 0.22)})`;
+        ctx!.fillStyle = `rgba(${ink},${Math.min(0.5, n.a + isPulsing * 0.22)})`;
         ctx!.beginPath();
         ctx!.arc(n.x + ox, n.y + oy, n.r + isPulsing * 1.1, 0, Math.PI * 2);
         ctx!.fill();
@@ -201,12 +204,15 @@ export default function LivingTwin({ className = "" }: { className?: string }) {
     }
     ro.observe(canvas);
     window.addEventListener("mousemove", onMove, { passive: true });
+    const onThemeChange = () => draw(performance.now());
+    window.addEventListener("hubris-settings-changed", onThemeChange);
     document.documentElement.addEventListener("mouseleave", onLeave);
 
     return () => {
       cancelAnimationFrame(raf);
       ro.disconnect();
       window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("hubris-settings-changed", onThemeChange);
       document.documentElement.removeEventListener("mouseleave", onLeave);
     };
   }, []);

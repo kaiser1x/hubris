@@ -9,6 +9,9 @@ export interface ParsedFunction {
   path: string;
   line: number;
   column: number;
+  // 1-based line where the function body ends. Lets source-excerpt
+  // selection prove whether the whole body fits in a bounded window.
+  endLine: number;
 }
 
 export interface ParsedClass {
@@ -294,10 +297,40 @@ function parseFunctionsFromFile(filePath: string): ParsedFunction[] {
   const functions: ParsedFunction[] = [];
   const seen = new Set<string>();
 
-  function pushFn(name: string): void {
+  let source: string;
+  try {
+    source = readFileSync(filePath, "utf-8");
+  } catch {
+    return functions;
+  }
+  const file = ts.createSourceFile(filePath, source, ts.ScriptTarget.Latest, true);
+
+  // 1-based source location of a symbol, derived from the parser's own
+  // position data — never a raw-text name search.
+  function locationOf(at: ts.Node): { line: number; column: number } {
+    const pos = at.getStart(file);
+    const loc = file.getLineAndCharacterOfPosition(pos);
+    return { line: loc.line + 1, column: loc.character + 1 };
+  }
+
+  function endLineOf(extent: ts.Node): number {
+    return file.getLineAndCharacterOfPosition(extent.getEnd()).line + 1;
+  }
+
+  // `at` supplies the symbol location (the name); `extent` supplies the end
+  // of the function body so the twin can prove excerpt coverage.
+  function pushFn(name: string, at: ts.Node | null, extent: ts.Node | null): void {
     if (seen.has(name)) return;
     seen.add(name);
-    functions.push({ id: randomUUID(), name, path: filePath, line: 1, column: 1 });
+    const { line, column } = at ? locationOf(at) : { line: 1, column: 1 };
+    functions.push({
+      id: randomUUID(),
+      name,
+      path: filePath,
+      line,
+      column,
+      endLine: extent ? endLineOf(extent) : line,
+    });
   }
 
   // Arrow / function-expression variables at any depth, plus nested named
@@ -312,11 +345,11 @@ function parseFunctionsFromFile(filePath: string): ParsedFunction[] {
       (ts.isArrowFunction(node.initializer) || ts.isFunctionExpression(node.initializer))
     ) {
       const name = scope ? `${scope}.${node.name.text}` : node.name.text;
-      pushFn(name);
+      pushFn(name, node.name, node.initializer);
       childScope = name;
     } else if (ts.isFunctionDeclaration(node) && node.name && ts.isIdentifier(node.name)) {
       const name = scope ? `${scope}.${node.name.text}` : node.name.text;
-      pushFn(name);
+      pushFn(name, node.name, node);
       childScope = name;
     } else {
       const base = scopeNameFor(node);
@@ -325,35 +358,23 @@ function parseFunctionsFromFile(filePath: string): ParsedFunction[] {
     ts.forEachChild(node, (child) => collectArrows(child, childScope));
   }
 
-  try {
-    const source = readFileSync(filePath, "utf-8");
-    const file = ts.createSourceFile(
-      filePath,
-      source,
-      ts.ScriptTarget.Latest,
-      true
-    );
-
-    ts.forEachChild(file, (node) => {
-      if (ts.isFunctionDeclaration(node) && node.name) {
-        pushFn(node.name.text);
-      }
-      // Express-style handlers: exports.name = function () {...}
-      if (
-        ts.isExpressionStatement(node) &&
-        ts.isBinaryExpression(node.expression) &&
-        node.expression.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
-        ts.isPropertyAccessExpression(node.expression.left) &&
-        (ts.isFunctionExpression(node.expression.right) ||
-          ts.isArrowFunction(node.expression.right))
-      ) {
-        pushFn(node.expression.left.name.text);
-      }
-    });
-    ts.forEachChild(file, (child) => collectArrows(child, null));
-  } catch (e) {
-    // skip
-  }
+  ts.forEachChild(file, (node) => {
+    if (ts.isFunctionDeclaration(node) && node.name) {
+      pushFn(node.name.text, node.name, node);
+    }
+    // Express-style handlers: exports.name = function () {...}
+    if (
+      ts.isExpressionStatement(node) &&
+      ts.isBinaryExpression(node.expression) &&
+      node.expression.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+      ts.isPropertyAccessExpression(node.expression.left) &&
+      (ts.isFunctionExpression(node.expression.right) ||
+        ts.isArrowFunction(node.expression.right))
+    ) {
+      pushFn(node.expression.left.name.text, node.expression.left.name, node.expression.right);
+    }
+  });
+  ts.forEachChild(file, (child) => collectArrows(child, null));
 
   return functions;
 }
@@ -361,33 +382,27 @@ function parseFunctionsFromFile(filePath: string): ParsedFunction[] {
 function parseClassesFromFile(filePath: string): ParsedClass[] {
   const classes: ParsedClass[] = [];
 
+  let source: string;
   try {
-    const source = readFileSync(filePath, "utf-8");
-    const file = ts.createSourceFile(
-      filePath,
-      source,
-      ts.ScriptTarget.Latest,
-      true
-    );
-
-    ts.forEachChild(file, (node) => {
-      if (ts.isClassDeclaration(node) && node.name) {
-        // @ts-ignore - pos properties vary by TS version
-        const line = node.name.pos?.lineNumber ?? node.pos?.lineNumber ?? 1;
-        // @ts-ignore - pos properties vary by TS version
-        const column = node.name.pos?.columnNumber ?? node.pos?.columnNumber ?? 1;
-        classes.push({
-          id: randomUUID(),
-          name: node.name.text,
-          path: filePath,
-          line: typeof line === "number" ? line : 1,
-          column: typeof column === "number" ? column : 1,
-        });
-      }
-    });
-  } catch (e) {
-    // skip
+    source = readFileSync(filePath, "utf-8");
+  } catch {
+    return classes;
   }
+  const file = ts.createSourceFile(filePath, source, ts.ScriptTarget.Latest, true);
+
+  ts.forEachChild(file, (node) => {
+    if (ts.isClassDeclaration(node) && node.name) {
+      const pos = node.name.getStart(file);
+      const loc = file.getLineAndCharacterOfPosition(pos);
+      classes.push({
+        id: randomUUID(),
+        name: node.name.text,
+        path: filePath,
+        line: loc.line + 1,
+        column: loc.character + 1,
+      });
+    }
+  });
 
   return classes;
 }

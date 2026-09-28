@@ -9,11 +9,22 @@ import {
   selectForgeEvidenceJob,
   toForgeRunView,
   buildVerifyBody,
+  buildInvestigateBody,
+  canForgePlan,
+  composeForgeFocus,
+  describeInvestigationFailure,
+  findSavedInvestigation,
   describeRunStatus,
   jobSourceRef,
+  shortRunStatus,
+  toInvestigation,
   toLiveVerification,
   toVerifyError,
   findRunView,
+  buildForgeBody,
+  buildReproduceBody,
+  forgeReviewHref,
+  investigationReviewHref,
   STRUCTURED_VERIFY_PATH,
   LEGACY_VERIFY_PATH,
 } from "../app/lib/forge-run";
@@ -297,7 +308,7 @@ describe("VERIFY IN SANDBOX structured routing (no live model)", () => {
   it("3. structured endpoint receives job/focus; invalid input settles locally", () => {
     expect(buildVerifyBody("", "x").ok).toBe(false);
     expect(buildVerifyBody("job-1", "   ").ok).toBe(false);
-    expect(buildVerifyBody("job-1", "x".repeat(501)).ok).toBe(false);
+    expect(buildVerifyBody("job-1", "x".repeat(2001)).ok).toBe(false);
   });
 
   it("4. the body cannot trigger the old direct-diff branch", () => {
@@ -520,5 +531,475 @@ describe("source revision evidence (no live backend)", () => {
     const html = renderToStaticMarkup(ForgeRunPanel({ run: v }));
     expect(html).toContain("SOURCE REVISION MISMATCH");
     expect(html).toContain("NOT RUN");
+  });
+
+  it("EDIT_CONTEXT_MISMATCH surfaces the bounded byte-mismatch diagnostic", () => {
+    const mismatch = {
+      oldTextLength: 11,
+      sourceLength: 13,
+      matchingPrefixChars: 0,
+      sourceOffset: -1,
+      oldTextSnippet: "missing();",
+      sourceSnippet: "foo();\n",
+    };
+    const v = toForgeRunView(
+      structuredRun({ status: "EDIT_CONTEXT_MISMATCH", mismatch }),
+      1
+    )!;
+    expect(v.outcome).toBe("VALIDATION_FAILED");
+    expect(v.mismatch?.oldTextLength).toBe(11);
+    expect(v.mismatch?.sourceLength).toBe(13);
+    expect(v.mismatch?.matchingPrefixChars).toBe(0);
+    const html = renderToStaticMarkup(ForgeRunPanel({ run: v }));
+    expect(html).toContain("Exact-match failure");
+    expect(html).toContain("Model oldText 11 chars");
+    expect(html).toContain("authoritative source 13 chars");
+    expect(html).toContain("missing();");
+    expect(html).toContain("not applied");
+  });
+
+  it("malformed mismatch evidence degrades to null, never fabricated", () => {
+    const v = toForgeRunView(
+      structuredRun({ status: "EDIT_CONTEXT_MISMATCH", mismatch: { nope: true } }),
+      1
+    )!;
+    expect(v.mismatch).toBeNull();
+  });
+});
+
+describe("INVESTIGATE → FORGE flow (no live calls)", () => {
+  it("binds reproduction requests to the exact investigation", () => {
+    expect(buildReproduceBody("job-a", "inv-a", "pnpm test -- tests/users.test.ts")).toEqual({
+      ok: true,
+      body: { jobId: "job-a", investigationId: "inv-a", script: "pnpm test -- tests/users.test.ts" },
+    });
+  });
+
+  const READY_PAYLOAD = {
+    jobId: "job-1",
+    investigationId: "inv-1",
+    status: "READY",
+    plan: {
+      summary: '"createPayment" in src/payments.ts matches the report',
+      target: { file: "src/payments.ts", function: "createPayment" },
+      currentBehavior: "Reported behavior: duplicate keys accepted",
+      expectedBehavior: "Duplicate keys are rejected and the suite passes.",
+      repairContract: {
+        requiredOutcome: "The repeated request must throw.",
+        preserveBehavior: ["Preserve the duplicate error assertion."],
+        relevantCondition: "Repository condition: if (idempotencyKey !== undefined)",
+        relevantOperation: "Repository operation: seenIdempotencyKeys.add(idempotencyKey);",
+        existingErrorContract: "Related tests require an error matching: /duplicate/i.",
+        minimalRepairDescription: "Restore the missing guard at the existing condition before the existing payment operation.",
+        setupFacts: ["const payment = createPayment(...)"],
+        actionFacts: ["retryPayment()"],
+        observedFacts: ["duplicate payment is created"],
+        expectedFacts: ["expect(() => retryPayment()).toThrow()"],
+        sourceEvidence: ["if (idempotencyKey !== undefined)", "seenIdempotencyKeys.add(idempotencyKey);"],
+        relevantAssertions: ["expect(() => retryPayment()).toThrow()"],
+        conditionOperationAreDistinct: true,
+      },
+      constraints: ["Make the smallest possible change.", 'Keep test "payments.test" passing.'],
+      evidence: ["Function createPayment at src/payments.ts:41"],
+      confidence: "medium",
+    },
+  };
+
+  it("parses READY/AMBIGUOUS/NO_MATCH verdicts, rejects malformed payloads", () => {
+    const ready = toInvestigation(READY_PAYLOAD);
+    expect(ready?.status).toBe("READY");
+    expect(ready?.plan?.target).toEqual({ file: "src/payments.ts", function: "createPayment" });
+    expect(toInvestigation({ jobId: "j", status: "AMBIGUOUS", message: "two targets" })?.message).toBe("two targets");
+    expect(toInvestigation({ jobId: "j", status: "NO_MATCH", message: "none" })?.status).toBe("NO_MATCH");
+    expect(toInvestigation(null)).toBeNull();
+    expect(toInvestigation({ status: "READY" })).toBeNull();
+    expect(toInvestigation({ status: "READY", plan: {} })).toBeNull();
+    expect(toInvestigation({ status: "BOGUS" })).toBeNull();
+    expect(canForgePlan(toInvestigation({ ...READY_PAYLOAD, investigationId: undefined }))).toBe(false);
+  });
+
+  it("FORGE FIX enables only for verified READY plans", () => {
+    expect(canForgePlan(toInvestigation(READY_PAYLOAD))).toBe(true);
+    expect(canForgePlan(toInvestigation({ status: "AMBIGUOUS", message: "x" }))).toBe(false);
+    expect(canForgePlan(toInvestigation({ status: "NO_MATCH", message: "x" }))).toBe(false);
+    expect(canForgePlan(null)).toBe(false);
+  });
+
+  it("restores the latest READY investigation from persisted job state", () => {
+    const saved = findSavedInvestigation({
+      id: "job-1",
+      result: {
+        investigationRuns: [
+          { ...READY_PAYLOAD, investigationId: "inv-old", jobId: "job-1", focus: "old" },
+          { ...READY_PAYLOAD, investigationId: "inv-new", jobId: "job-1", focus: "new" },
+        ],
+      },
+    });
+    expect(saved?.investigationId).toBe("inv-new");
+    expect(saved?.focus).toBe("new");
+    expect(findSavedInvestigation({ result: { investigationRuns: [] } })).toBeNull();
+    expect(
+      findSavedInvestigation(
+        {
+          result: {
+            investigationRuns: [
+              { ...READY_PAYLOAD, investigationId: "inv-old", jobId: "job-1", focus: "old" },
+            ],
+          },
+        },
+        "missing"
+      )
+    ).toBeNull();
+  });
+
+  it("findSavedInvestigation loads the exact id, never another investigation", () => {
+    const job = {
+      id: "job-1",
+      result: {
+        investigationRuns: [
+          { ...READY_PAYLOAD, investigationId: "inv-old", jobId: "job-1", focus: "old" },
+          { ...READY_PAYLOAD, investigationId: "inv-new", jobId: "job-1", focus: "new" },
+        ],
+      },
+    };
+    // Requesting the OLDER investigation returns it — not the newest.
+    expect(findSavedInvestigation(job, "inv-old")?.investigationId).toBe("inv-old");
+    expect(findSavedInvestigation(job, "inv-old")?.focus).toBe("old");
+    // A non-READY run with the matching id is never promoted.
+    expect(
+      findSavedInvestigation(
+        {
+          id: "job-1",
+          result: {
+            investigationRuns: [
+              { ...READY_PAYLOAD, investigationId: "inv-old", jobId: "job-1", focus: "old" },
+              { investigationId: "inv-amb", status: "AMBIGUOUS", jobId: "job-1", message: "x" },
+            ],
+          },
+        },
+        "inv-amb"
+      )
+    ).toBeNull();
+  });
+
+  it("buildForgeBody requires an investigationId and bounded focus", () => {
+    const ok = buildForgeBody("job-1", "inv-1", "Repair focus");
+    expect(ok).toEqual({
+      ok: true,
+      body: { jobId: "job-1", investigationId: "inv-1", focus: "Repair focus" },
+    });
+    expect(buildForgeBody("job-1", "", "focus").ok).toBe(false);
+    expect(buildForgeBody("job-1", null, "focus").ok).toBe(false);
+    expect(buildForgeBody("", "inv-1", "focus").ok).toBe(false);
+    expect(buildForgeBody("job-1", "inv-1", "   ").ok).toBe(false);
+    expect(buildForgeBody("job-1", "inv-1", "x".repeat(2001)).ok).toBe(false);
+  });
+
+  it("navigation helpers carry the exact investigation identity", () => {
+    expect(forgeReviewHref("job-1", "inv-1")).toBe("/forge?jobId=job-1&investigationId=inv-1");
+    expect(investigationReviewHref("job-1", "inv-1")).toBe(
+      "/investigate?jobId=job-1&investigationId=inv-1"
+    );
+  });
+
+  it("builds the Forge handoff from the returned response identities", () => {
+    const ready = toInvestigation(READY_PAYLOAD);
+    expect(ready).not.toBeNull();
+    expect(canForgePlan(ready)).toBe(true);
+    expect(forgeReviewHref(ready!.jobId!, ready!.investigationId!)).toBe(
+      "/forge?jobId=job-1&investigationId=inv-1"
+    );
+  });
+
+  it("investigate body requires job and bounded description", () => {
+    expect(buildInvestigateBody("job-1", "duplicate keys accepted")).toEqual({
+      ok: true,
+      body: { jobId: "job-1", focus: "duplicate keys accepted" },
+    });
+    expect(buildInvestigateBody("", "x").ok).toBe(false);
+    expect(buildInvestigateBody("job-1", "   ").ok).toBe(false);
+    expect(buildInvestigateBody("job-1", "x".repeat(501)).ok).toBe(false);
+  });
+
+  it("composed Forge focus carries the complete repair contract", () => {
+    const view = toInvestigation(READY_PAYLOAD);
+    expect(view?.plan).not.toBeNull();
+    const focus = composeForgeFocus(view!.plan!);
+    expect(focus.length).toBeGreaterThan(0);
+    expect(focus.length).toBeLessThanOrEqual(2000);
+    expect(focus).toContain("createPayment");
+    expect(focus).toContain("src/payments.ts");
+    expect(focus).toContain("smallest possible change");
+  });
+
+  it("reports status, URL, and bounded response details for malformed responses", () => {
+    const message = describeInvestigationFailure(200, "/api/investigate", { answer: "legacy" });
+    expect(message).toContain("HTTP 200");
+    expect(message).toContain("/api/investigate");
+    expect(message).toContain('"answer":"legacy"');
+    expect(describeInvestigationFailure(null, "/api/investigate", undefined)).toContain(
+      "network error"
+    );
+  });
+});
+
+// Phase RAG frontend contract: the state model, clarification, and the
+// clarification-carrying investigate body are additive and never fabricate.
+describe("investigation agent view-model (RAG)", () => {
+  it("parses state, observed/expected behavior, and clarification", () => {
+    const view = toInvestigation({
+      status: "AMBIGUOUS",
+      investigationId: "inv-2",
+      jobId: "job-1",
+      state: "CLARIFICATION_NEEDED",
+      observedBehavior: "SAVE10 leaves the total unchanged",
+      expectedBehavior: "SAVE10 reduces the total by 10%",
+      clarification: {
+        question: "Is the problem the order total?",
+        options: ["the order total", "order creation"],
+      },
+    });
+    expect(view?.state).toBe("CLARIFICATION_NEEDED");
+    expect(view?.observedBehavior).toContain("SAVE10");
+    expect(view?.clarification?.options).toHaveLength(2);
+  });
+
+  it("drops a malformed clarification and an unknown state", () => {
+    const view = toInvestigation({
+      status: "NO_MATCH",
+      investigationId: "inv-3",
+      jobId: "job-1",
+      state: "NONSENSE",
+      clarification: { question: "", options: [] },
+    });
+    expect(view?.state).toBeNull();
+    expect(view?.clarification).toBeNull();
+  });
+
+  it("carries the clarification question and answer into the investigate body", () => {
+    const prepared = buildInvestigateBody("job-1", "Something is wrong with orders.", {
+      priorQuestion: "Is the problem the order total?",
+      answer: "Yes, the total.",
+    });
+    expect(prepared.ok).toBe(true);
+    if (!prepared.ok) return;
+    expect(prepared.body.priorQuestion).toBe("Is the problem the order total?");
+    expect(prepared.body.clarification).toBe("Yes, the total.");
+  });
+
+  it("omits clarification fields for a fresh report", () => {
+    const prepared = buildInvestigateBody("job-1", "duplicate keys accepted");
+    expect(prepared.ok).toBe(true);
+    if (!prepared.ok) return;
+    expect("clarification" in prepared.body).toBe(false);
+  });
+});
+
+// ---- User-facing verification assessment ----
+//
+// A non-zero suite exit must not become a generic FAILED when the repair was
+// applied and the investigated behavior passed.
+describe("verification assessment (ForgeRunView + ForgeRunPanel)", () => {
+  function runWith(
+    assessment: Record<string, unknown> | null,
+    opts: { status?: string; exitCode?: number; timedOut?: boolean; stdout?: string } = {}
+  ) {
+    const status = opts.status ?? "FAILED";
+    const exitCode = opts.exitCode ?? (status === "VERIFIED" ? 0 : 1);
+    const raw = structuredRun({
+      status,
+      verified: status === "VERIFIED",
+      ...(opts.stdout !== undefined ? { stdout: opts.stdout } : {}),
+      verification: {
+        command: "pnpm test",
+        commandSource: "detected",
+        exitCode,
+        timedOut: opts.timedOut ?? false,
+        passed: status === "VERIFIED",
+        ...(assessment ? { assessment } : {}),
+      },
+    });
+    return resolveForgeRuns({ result: { forgeRuns: [raw] } })[0];
+  }
+
+  it("REPAIR_VERIFIED: applied + target passed + unrelated failures", () => {
+    const view = runWith({
+      state: "REPAIR_VERIFIED",
+      patchApplied: true,
+      targetVerificationPassed: true,
+      targetTestFile: "tests/orders.test.ts",
+      targetScenario: "applies a discount code to the order total",
+      targetCommand:
+        "pnpm exec vitest run 'tests/orders.test.ts' -t 'applies a discount code to the order total'",
+      fullSuitePassed: false,
+      unrelatedTestFailures: 3,
+      failedTests: ["tests/cart.test.ts", "tests/sessions.test.ts", "tests/users.test.ts"],
+      targetFailure: null,
+    });
+    expect(view.outcome).toBe("REPAIR_VERIFIED");
+    expect(shortRunStatus(view)).toBe("REPAIR VERIFIED");
+    const html = renderToStaticMarkup(ForgeRunPanel({ run: view }));
+    // Primary outcome, consistent in the header and banner.
+    expect(html).toContain("REPAIR VERIFIED");
+    expect(html).toContain("structured edit · REPAIR VERIFIED");
+    expect(html).toContain("Target behavior verified");
+    // The exact investigated scenario is named (not inferred from the suite).
+    expect(html).toContain("Target verification");
+    expect(html).toContain("applies a discount code to the order total");
+    expect(html).toContain("tests/orders.test.ts");
+    expect(html).toContain("Regression suite");
+    expect(html).toContain("✗ FAILED · 3 unrelated tests failed");
+    expect(html).toContain("Command: pnpm test");
+    expect(html).toContain("Exit code: 1");
+    // Secondary details, full-suite failure subordinate but visible.
+    expect(html).toContain("Unrelated failures");
+    expect(html).toContain("The broader test suite still has failures outside the investigated behavior.");
+    expect(html).toContain("tests/cart.test.ts");
+    expect(html).toContain("tests/users.test.ts");
+    expect(html).toContain("Verification evidence (test output)");
+    // No competing generic lifecycle failure label, and no unproven claim.
+    expect(html).not.toContain("VERIFICATION FAILED");
+    expect(html).not.toContain("structured edit · FAILED");
+    expect(html).not.toContain("pre-existing");
+    // The final lifecycle step is neutral, not an empty "Verified".
+    expect(html).toContain("Verification assessed");
+  });
+
+  it("REPAIR_NOT_VERIFIED: the reported behavior still fails", () => {
+    const view = runWith({
+      state: "REPAIR_NOT_VERIFIED",
+      patchApplied: true,
+      targetVerificationPassed: false,
+      fullSuitePassed: false,
+      unrelatedTestFailures: 1,
+      failedTests: ["tests/orders.test.ts", "tests/cart.test.ts"],
+      targetTestFile: "tests/orders.test.ts",
+      targetFailure: "tests/orders.test.ts",
+    });
+    expect(view.outcome).toBe("REPAIR_NOT_VERIFIED");
+    const html = renderToStaticMarkup(ForgeRunPanel({ run: view }));
+    expect(html).toContain("REPAIR NOT VERIFIED");
+    expect(html).toContain("The investigated behavior is still failing.");
+    expect(html).toContain("tests/orders.test.ts");
+  });
+
+  it("FULL_SUITE_PASSED: everything passed", () => {
+    const view = runWith(
+      {
+        state: "FULL_SUITE_PASSED",
+        patchApplied: true,
+        targetVerificationPassed: true,
+        fullSuitePassed: true,
+        unrelatedTestFailures: 0,
+        failedTests: [],
+        targetTestFile: "tests/orders.test.ts",
+        targetFailure: null,
+      },
+      { status: "VERIFIED", exitCode: 0 }
+    );
+    expect(view.outcome).toBe("FULL_SUITE_PASSED");
+    const html = renderToStaticMarkup(ForgeRunPanel({ run: view }));
+    expect(html).toContain("FULL SUITE PASSED");
+    expect(html).toContain("all tests passed");
+  });
+
+  it("VERIFICATION_INCOMPLETE: cannot attribute the failures", () => {
+    const view = runWith({
+      state: "VERIFICATION_INCOMPLETE",
+      patchApplied: true,
+      targetVerificationPassed: null,
+      fullSuitePassed: false,
+      unrelatedTestFailures: 0,
+      failedTests: [],
+      targetTestFile: null,
+      targetFailure: null,
+    });
+    expect(view.outcome).toBe("VERIFICATION_INCOMPLETE");
+    const html = renderToStaticMarkup(ForgeRunPanel({ run: view }));
+    expect(html).toContain("VERIFICATION INCOMPLETE");
+    expect(html).toContain("could not determine whether the test failures affect the reported bug");
+  });
+
+  it("VERIFICATION_INCOMPLETE with a named target says it could not directly verify it", () => {
+    const view = runWith({
+      state: "VERIFICATION_INCOMPLETE",
+      patchApplied: true,
+      targetVerificationPassed: null,
+      targetTestFile: "tests/orders.test.ts",
+      targetScenario: "applies a discount code to the order total",
+      targetCommand:
+        "pnpm exec vitest run 'tests/orders.test.ts' -t 'applies a discount code to the order total'",
+      fullSuitePassed: false,
+      unrelatedTestFailures: 0,
+      failedTests: [],
+      targetFailure: null,
+    });
+    const html = renderToStaticMarkup(ForgeRunPanel({ run: view }));
+    expect(html).toContain("VERIFICATION INCOMPLETE");
+    expect(html).toContain("could not directly verify the investigated test scenario");
+  });
+
+  it("legacy entries without an assessment keep the lifecycle outcome", () => {
+    const failed = runWith(null);
+    expect(failed.outcome).toBe("VERIFICATION_FAILED");
+    const verified = runWith(null, { status: "VERIFIED", exitCode: 0 });
+    expect(verified.outcome).toBe("VERIFIED");
+    expect(verified.verification?.assessment).toBeNull();
+  });
+});
+
+// UX wording: the full test command is the "Regression suite", distinct from
+// the exact "Target verification". The panel must not label it as generic
+// "Verification" nor render a contradictory "Verification for run … FAIL".
+describe("verification wording (target vs regression)", () => {
+  const view = resolveForgeRuns({
+    result: {
+      forgeRuns: [
+        structuredRun({
+          status: "FAILED",
+          verified: false,
+          verification: {
+            command: "pnpm test",
+            commandSource: "detected",
+            exitCode: 1,
+            timedOut: false,
+            passed: false,
+            assessment: {
+              state: "REPAIR_VERIFIED",
+              patchApplied: true,
+              targetVerificationPassed: true,
+              targetTestFile: "tests/orders.test.ts",
+              targetScenario: "applies a discount code to the order total",
+              targetCommand:
+                "pnpm exec vitest run 'tests/orders.test.ts' -t 'applies a discount code to the order total'",
+              fullSuitePassed: false,
+              unrelatedTestFailures: 3,
+              failedTests: ["tests/cart.test.ts", "tests/users.test.ts", "tests/sessions.test.ts"],
+              targetFailure: null,
+            },
+          },
+        }),
+      ],
+    },
+  })[0];
+
+  it("renders Target verification and Regression suite as distinct blocks", () => {
+    const html = renderToStaticMarkup(ForgeRunPanel({ run: view }));
+    expect(html).toContain("Target verification");
+    expect(html).toContain("applies a discount code to the order total");
+    expect(html).toContain("tests/orders.test.ts");
+    expect(html).toContain("Regression suite");
+    expect(html).toContain("✗ FAILED · 3 unrelated tests failed");
+    expect(html).toContain("Command: pnpm test");
+    expect(html).toContain("Exit code: 1");
+  });
+
+  it("never labels the full command as generic Verification", () => {
+    const html = renderToStaticMarkup(ForgeRunPanel({ run: view }));
+    expect(html).not.toContain("Verification Command");
+    expect(html).not.toContain("Verification for run");
+    // One primary outcome label; the regression failure is subordinate.
+    expect(html).toContain("REPAIR VERIFIED");
+    expect(html).not.toContain("VERIFICATION FAILED");
   });
 });

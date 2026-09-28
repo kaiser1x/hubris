@@ -1,5 +1,5 @@
 import type { ForgeRunView, VerifyResult } from "../lib/forge-run";
-import { shortCommit } from "../lib/forge-run";
+import { shortCommit, shortRunStatus } from "../lib/forge-run";
 
 function CheckRow({ label, ok }: { label: string; ok: boolean }) {
   return (
@@ -16,9 +16,52 @@ function resultLabel(result: VerifyResult): string {
   return "NOT RUN";
 }
 
+function MismatchEvidence({ run }: { run: ForgeRunView }) {
+  const m = run.mismatch;
+  if (!m) return null;
+  return (
+    <div className="mt-4 border-t border-[#dedada] pt-3">
+      <p className="kicker mb-1">Exact-match failure</p>
+      <p className="font-mono text-[11px] leading-5 text-[#7A7171]">
+        Model oldText {m.oldTextLength} chars · authoritative source{" "}
+        {m.sourceLength} chars · only {m.matchingPrefixChars} chars matched
+        {m.sourceOffset >= 0 ? ` at source offset ${m.sourceOffset}` : ""}.
+      </p>
+      <p className="font-mono text-[11px] leading-5 text-[#7A7171] mt-1.5">
+        Model oldText begins:{" "}
+        <span className="text-[#0A0A0A]">{m.oldTextSnippet.slice(0, 120) || "—"}</span>
+      </p>
+      <p className="font-mono text-[11px] leading-5 text-[#7A7171] mt-1">
+        Source at match offset:{" "}
+        <span className="text-[#0A0A0A]">{m.sourceSnippet.slice(0, 160) || "—"}</span>
+      </p>
+      <p className="font-mono text-[11px] leading-5 text-[#7A7171] mt-1.5">
+        Byte-exact matching is enforced; the edit was not applied.
+      </p>
+    </div>
+  );
+}
+
 function OutcomeBanner({ run }: { run: ForgeRunView }) {
   const v = run.verification;
+  const assessment = v?.assessment ?? null;
   const summary = run.testSummary ? `${run.testSummary.passed} / ${run.testSummary.total}` : null;
+
+  // Everything passed (assessment-backed).
+  if (run.outcome === "FULL_SUITE_PASSED") {
+    return (
+      <div className="border border-[#0A0A0A] px-5 py-5">
+        <p className="font-display text-[34px] leading-none">FULL SUITE PASSED</p>
+        <p className="font-mono text-[12px] mt-3">Repair applied and all tests passed.</p>
+        <p className="font-mono text-[12px] mt-1.5 text-[#7A7171]">
+          {summary ? `${summary} tests passed` : "tests passed"} · exit {v?.exitCode ?? "—"} ·{" "}
+          {v?.timedOut ? "timed out" : "no timeout"}
+        </p>
+      </div>
+    );
+  }
+
+  // Legacy runs that predate the assessment.
   if (run.outcome === "VERIFIED") {
     return (
       <div className="border border-[#0A0A0A] px-5 py-5">
@@ -31,6 +74,105 @@ function OutcomeBanner({ run }: { run: ForgeRunView }) {
       </div>
     );
   }
+
+  // Patch applied + investigated behavior verified, unrelated suite failures remain.
+  if (run.outcome === "REPAIR_VERIFIED") {
+    const n = assessment?.unrelatedTestFailures ?? 0;
+    return (
+      <div className="border-2 border-[#0A0A0A] px-5 py-5">
+        <p className="font-display text-[34px] leading-none">REPAIR VERIFIED</p>
+        <p className="font-mono text-[12px] mt-3">Target behavior verified.</p>
+        {assessment?.targetScenario && (
+          <div className="font-mono text-[12px] mt-4">
+            <p className="kicker">Target verification</p>
+            <p className="mt-1.5">
+              ✓ {assessment.targetScenario}
+              {assessment.targetTestFile ? (
+                <span className="text-[#7A7171]"> · {assessment.targetTestFile}</span>
+              ) : null}
+            </p>
+          </div>
+        )}
+        <div className="font-mono text-[12px] mt-4">
+          <p className="kicker">Regression suite</p>
+          <p className="mt-1.5">
+            {n} unrelated test{n === 1 ? "" : "s"} failed.
+          </p>
+        </div>
+        <dl className="font-mono text-[12px] mt-4 border-t border-[#dedada]">
+          <div className="flex justify-between py-1.5 border-b border-[#dedada]">
+            <dt className="text-[#7A7171]">Patch applied</dt>
+            <dd>{assessment?.patchApplied ? "✓" : "✕"}</dd>
+          </div>
+          <div className="flex justify-between py-1.5 border-b border-[#dedada]">
+            <dt className="text-[#7A7171]">Target behavior</dt>
+            <dd>{assessment?.targetVerificationPassed === false ? "✗" : "✓"}</dd>
+          </div>
+          <div className="flex justify-between py-1.5 border-b border-[#dedada]">
+            <dt className="text-[#7A7171]">Full suite</dt>
+            <dd>✗</dd>
+          </div>
+          <div className="flex justify-between py-1.5">
+            <dt className="text-[#7A7171]">Unrelated failures</dt>
+            <dd>{n}</dd>
+          </div>
+        </dl>
+        <p className="font-mono text-[11px] mt-3 text-[#7A7171]">
+          The repair was applied and the investigated behavior passed. The broader test suite still
+          has failures outside the investigated behavior.
+        </p>
+        {assessment && assessment.failedTests.length > 0 && (
+          <div className="font-mono text-[11px] mt-2 text-[#7A7171]">
+            <p>Unrelated:</p>
+            <ul className="break-all">
+              {assessment.failedTests.map((f) => (
+                <li key={f}>{f}</li>
+              ))}
+            </ul>
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  // The investigated behavior still fails.
+  if (run.outcome === "REPAIR_NOT_VERIFIED") {
+    return (
+      <div className="border border-[#dedada] px-5 py-5">
+        <p className="font-display text-[28px] leading-none">REPAIR NOT VERIFIED</p>
+        <p className="font-mono text-[12px] mt-3">The investigated behavior is still failing.</p>
+        {assessment?.targetFailure ? (
+          <p className="font-mono text-[11px] mt-1.5 text-[#7A7171] break-all">
+            Failing target: {assessment.targetFailure}
+            {v?.exitCode !== null && v?.exitCode !== undefined ? ` · exit ${v.exitCode}` : ""}
+          </p>
+        ) : (
+          <p className="font-mono text-[11px] mt-1.5 text-[#7A7171]">
+            {v?.command ?? "verification"} exited {v?.exitCode ?? "—"}
+          </p>
+        )}
+      </div>
+    );
+  }
+
+  // Applied, but the failures cannot be attributed.
+  if (run.outcome === "VERIFICATION_INCOMPLETE") {
+    const couldNotVerifyTarget =
+      Boolean(assessment?.targetScenario) && assessment?.targetVerificationPassed === null;
+    return (
+      <div className="border border-[#dedada] px-5 py-5">
+        <p className="font-display text-[24px] leading-none">
+          PATCH APPLIED — VERIFICATION INCOMPLETE
+        </p>
+        <p className="font-mono text-[12px] mt-3 text-[#7A7171]">
+          {couldNotVerifyTarget
+            ? "HUBRIS could not directly verify the investigated test scenario."
+            : "HUBRIS could not determine whether the test failures affect the reported bug."}
+        </p>
+      </div>
+    );
+  }
+
   const titles: Record<string, string> = {
     VERIFICATION_FAILED: "VERIFICATION FAILED",
     VERIFICATION_TIMEOUT: "VERIFICATION TIMED OUT",
@@ -57,11 +199,25 @@ function OutcomeBanner({ run }: { run: ForgeRunView }) {
     <div className="border border-[#dedada] px-5 py-5">
       <p className="font-display text-[28px] leading-none">{titles[run.outcome] ?? run.status}</p>
       <p className="font-mono text-[12px] mt-3 text-[#7A7171]">{detail}</p>
+      <MismatchEvidence run={run} />
     </div>
   );
 }
 
 export default function ForgeRunPanel({ run }: { run: ForgeRunView }) {
+  const v = run.verification;
+  const a = v?.assessment ?? null;
+  // The regression suite is the full repository test command — distinct from
+  // the exact target-scenario verification.
+  const regressionStatus = a
+    ? `${a.fullSuitePassed ? "✓ PASSED" : "✗ FAILED"}${
+        a.unrelatedTestFailures > 0
+          ? ` · ${a.unrelatedTestFailures} unrelated test${a.unrelatedTestFailures === 1 ? "" : "s"} failed`
+          : ""
+      }`
+    : v
+      ? resultLabel(v.result)
+      : "—";
   return (
     <article className="border border-[#dedada] bg-white/60">
       <div className="px-5 py-4 border-b border-[#dedada] flex items-baseline gap-3">
@@ -69,7 +225,7 @@ export default function ForgeRunPanel({ run }: { run: ForgeRunView }) {
           Forge run · #{run.number}
         </p>
         <span className="font-mono text-[10px] text-[#7A7171]">
-          {run.kind === "structured" ? "structured edit" : "unified diff"} · {run.status}
+          {run.kind === "structured" ? "structured edit" : "unified diff"} · {shortRunStatus(run)}
         </span>
         {run.at && (
           <span className="ml-auto font-mono text-[10px] text-[#7A7171] truncate max-w-[40%]">
@@ -165,7 +321,11 @@ export default function ForgeRunPanel({ run }: { run: ForgeRunView }) {
           </div>
           <div className="flex justify-between py-1.5 border-b border-[#dedada]">
             <dt className="text-[#7A7171]">Analysis commit</dt>
-            <dd>{shortCommit(run.source.commitSha) ?? "—"}</dd>
+            <dd>{shortCommit(run.source.analysisCommitSha ?? run.source.commitSha) ?? "—"}</dd>
+          </div>
+          <div className="flex justify-between py-1.5 border-b border-[#dedada]">
+            <dt className="text-[#7A7171]">Execution commit</dt>
+            <dd>{shortCommit(run.source.executionCommitSha) ?? "—"}</dd>
           </div>
           <div className="flex justify-between py-1.5 border-b border-[#dedada]">
             <dt className="text-[#7A7171]">Sandbox reported ref</dt>
@@ -214,35 +374,75 @@ export default function ForgeRunPanel({ run }: { run: ForgeRunView }) {
             )}
           </div>
         ) : (
-          <dl className="font-mono text-xs">
-            <div className="flex justify-between py-1.5 border-b border-[#dedada]">
-              <dt className="text-[#7A7171]">Command</dt>
-              <dd className="truncate max-w-[60%] text-right">{run.verification.command}</dd>
+          <div className="font-mono text-xs">
+            {run.verification.assessment?.targetScenario && (
+              <div className="pb-3 border-b border-[#dedada]">
+                <p className="text-[#7A7171]">Target verification</p>
+                <p className="mt-1">
+                  {run.verification.assessment.targetVerificationPassed === false ? "✗" : "✓"}{" "}
+                  {run.verification.assessment.targetScenario}
+                </p>
+                {run.verification.assessment.targetTestFile && (
+                  <p className="mt-1 text-[10px] text-[#7A7171] break-all">
+                    {run.verification.assessment.targetTestFile}
+                  </p>
+                )}
+              </div>
+            )}
+            <div className="py-3 border-b border-[#dedada]">
+              <p className="text-[#7A7171]">Regression suite</p>
+              <p className="mt-1">{regressionStatus}</p>
+              <p className="mt-1 text-[10px] text-[#7A7171] break-all">
+                Command: {run.verification.command}
+              </p>
+              <p className="mt-1 text-[10px] text-[#7A7171]">
+                Exit code: {run.verification.exitCode ?? "—"}
+              </p>
             </div>
-            <div className="flex justify-between py-1.5 border-b border-[#dedada]">
-              <dt className="text-[#7A7171]">Result</dt>
-              <dd>{resultLabel(run.verification.result)}</dd>
-            </div>
-            <div className="flex justify-between py-1.5 border-b border-[#dedada]">
-              <dt className="text-[#7A7171]">Exit code</dt>
-              <dd>{run.verification.exitCode ?? "—"}</dd>
-            </div>
-            <div className="flex justify-between py-1.5 border-b border-[#dedada]">
-              <dt className="text-[#7A7171]">Tests</dt>
-              <dd>
-                {run.testSummary ? `${run.testSummary.passed} / ${run.testSummary.total}` : "—"}
-              </dd>
-            </div>
-            <div className="flex justify-between py-1.5 last:border-b-0">
-              <dt className="text-[#7A7171]">Timeout</dt>
-              <dd>{run.verification!.timedOut ? "Yes" : "No"}</dd>
-            </div>
-          </dl>
+            <dl className="font-mono text-xs">
+              {run.verification.assessment && (
+                <>
+                  <div className="flex justify-between py-1.5 border-b border-[#dedada]">
+                    <dt className="text-[#7A7171]">Patch applied</dt>
+                    <dd>{run.verification.assessment.patchApplied ? "✓" : "✕"}</dd>
+                  </div>
+                  <div className="flex justify-between py-1.5 border-b border-[#dedada]">
+                    <dt className="text-[#7A7171]">Target behavior</dt>
+                    <dd>
+                      {run.verification.assessment.targetVerificationPassed === null
+                        ? "—"
+                        : run.verification.assessment.targetVerificationPassed
+                          ? "✓"
+                          : "✗"}
+                    </dd>
+                  </div>
+                  <div className="flex justify-between py-1.5 border-b border-[#dedada]">
+                    <dt className="text-[#7A7171]">Full suite</dt>
+                    <dd>{run.verification.assessment.fullSuitePassed ? "PASSED" : "FAILED"}</dd>
+                  </div>
+                  <div className="flex justify-between py-1.5 border-b border-[#dedada]">
+                    <dt className="text-[#7A7171]">Unrelated failures</dt>
+                    <dd>{run.verification.assessment.unrelatedTestFailures}</dd>
+                  </div>
+                </>
+              )}
+              <div className="flex justify-between py-1.5 border-b border-[#dedada]">
+                <dt className="text-[#7A7171]">Tests</dt>
+                <dd>
+                  {run.testSummary ? `${run.testSummary.passed} / ${run.testSummary.total}` : "—"}
+                </dd>
+              </div>
+              <div className="flex justify-between py-1.5 last:border-b-0">
+                <dt className="text-[#7A7171]">Timeout</dt>
+                <dd>{run.verification.timedOut ? "Yes" : "No"}</dd>
+              </div>
+            </dl>
+          </div>
         )}
         {(run.outputTail.length > 0 || run.errorTail.length > 0) && (
           <details className="mt-3 border border-[#dedada] px-3 py-2">
             <summary className="font-mono text-[11px] cursor-pointer">
-              View sandbox output
+              Verification evidence (test output)
             </summary>
             <pre className="font-mono text-[11px] leading-6 mt-2 whitespace-pre-wrap break-words max-h-64 overflow-y-auto">
               {[...run.outputTail, ...run.errorTail.map((l) => `stderr: ${l}`)].join("\n")}

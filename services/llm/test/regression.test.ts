@@ -54,12 +54,12 @@ describe("stripCodeFences", () => {
 });
 
 describe("forgeMaxTokens", () => {
-  it("defaults to 4096 (reasoning headroom past the 1200 starvation)", () => {
-    expect(DEFAULT_FORGE_MAX_TOKENS).toBe(4096);
-    expect(forgeMaxTokens({})).toBe(4096);
-    expect(forgeMaxTokens({ HUBRIS_FORGE_MAX_TOKENS: "0" })).toBe(4096);
-    expect(forgeMaxTokens({ HUBRIS_FORGE_MAX_TOKENS: "-5" })).toBe(4096);
-    expect(forgeMaxTokens({ HUBRIS_FORGE_MAX_TOKENS: "nope" })).toBe(4096);
+  it("defaults to 8192 (reasoning headroom past the 4096 starvation)", () => {
+    expect(DEFAULT_FORGE_MAX_TOKENS).toBe(8192);
+    expect(forgeMaxTokens({})).toBe(8192);
+    expect(forgeMaxTokens({ HUBRIS_FORGE_MAX_TOKENS: "0" })).toBe(8192);
+    expect(forgeMaxTokens({ HUBRIS_FORGE_MAX_TOKENS: "-5" })).toBe(8192);
+    expect(forgeMaxTokens({ HUBRIS_FORGE_MAX_TOKENS: "nope" })).toBe(8192);
   });
 
   it("honors an explicit override", () => {
