@@ -28,6 +28,7 @@ function makeRun(number: number, over: Record<string, unknown> = {}): ForgeRunVi
     editChecks: [],
     patchBytes: 510,
     patchShaShort: "a".repeat(12) + "…",
+    patchSha: "a".repeat(64),
     applyApplied: true,
     mismatch: null,
     source: { ref: "hubris/buggy-idempotency", refSource: "job", commitSha: null, analysisCommitSha: null, executionCommitSha: null, sandboxRef: null, sandboxSha: null, sandboxMatched: true },
@@ -38,6 +39,7 @@ function makeRun(number: number, over: Record<string, unknown> = {}): ForgeRunVi
     outputTail: [],
     errorTail: [],
     at: "2026-09-26T18:40:00.000Z",
+    pullRequest: null,
     ...over,
   };
 }

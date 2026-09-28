@@ -493,6 +493,56 @@ describe("POST /api/forge-structured source revision (mocked clone/sandbox)", ()
     });
     expect((runs[1] as Record<string, unknown>).source).toMatchObject({ ref: "main" });
   });
+
+  it("7. persists the EXACT canonical patch content with matching sha and byte count", async () => {
+    stubCreds();
+    const { createHash } = await import("crypto");
+    store.draftPlan = MATCHING_PLAN;
+    const content =
+      "diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1,2 +1,2 @@\n-foo();\n-foo();\n+bar();\n+bar();\n";
+    const sha = createHash("sha256").update(content).digest("hex");
+    const bytes = Buffer.byteLength(content, "utf-8");
+    const b64 = Buffer.from(content, "utf-8").toString("base64");
+    sandboxSuccess(
+      [
+        "EDIT_OK 1",
+        `CANONICAL_SHA ${sha} ${bytes}`,
+        `CANONICAL_B64 ${b64}`,
+        `SOURCE_REF ${JOB_REF}`,
+        `SOURCE_SHA ${COMMIT}`,
+        "PATCH_OK",
+        "VERIFY_BEGIN",
+      ].join("\n")
+    );
+    const res = await postStructured({ focus: "do things" });
+    expect(res.status).toBe(200);
+    // The persisted patch is byte-for-byte the canonical diff, with its sha and byte count.
+    expect(lastRun().canonicalPatch).toEqual({ sha, bytes, content });
+  });
+
+  it("8. withholds canonical patch content when the sha does not match (fail closed)", async () => {
+    stubCreds();
+    store.draftPlan = MATCHING_PLAN;
+    const content = "diff --git a/x b/x\n--- a/x\n+++ b/x\n";
+    const b64 = Buffer.from(content, "utf-8").toString("base64");
+    sandboxSuccess(
+      [
+        "EDIT_OK 1",
+        `CANONICAL_SHA ${CANON} ${Buffer.byteLength(content, "utf-8")}`,
+        `CANONICAL_B64 ${b64}`,
+        `SOURCE_REF ${JOB_REF}`,
+        `SOURCE_SHA ${COMMIT}`,
+        "PATCH_OK",
+        "VERIFY_BEGIN",
+      ].join("\n")
+    );
+    const res = await postStructured({ focus: "do things" });
+    expect(res.status).toBe(200);
+    const cp = lastRun().canonicalPatch as Record<string, unknown>;
+    expect(cp.sha).toBe(CANON);
+    // sha256(content) !== sha → content is not persisted.
+    expect(cp.content).toBeUndefined();
+  });
 });
 
 describe("POST /api/forge-structured model failure classes (mocked model)", () => {

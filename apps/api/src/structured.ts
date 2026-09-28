@@ -277,6 +277,7 @@ function shQuote(s: string): string {
 
 export const EDIT_OK_MARKER = "EDIT_OK";
 export const CANONICAL_MARKER = "CANONICAL_SHA";
+export const CANONICAL_B64_MARKER = "CANONICAL_B64";
 export const SOURCE_REF_MARKER = "SOURCE_REF";
 export const SOURCE_SHA_MARKER = "SOURCE_SHA";
 
@@ -313,6 +314,9 @@ export function buildStructuredScript(
     `git init -q; git config user.email t@t; git config user.name t; git add -A; git commit -qm base; ` +
     `node ${validator} ${dir} ${edits}; ` +
     `git diff > /tmp/canonical.patch; echo ${CANONICAL_MARKER} $(sha256sum /tmp/canonical.patch | cut -d' ' -f1) $(wc -c < /tmp/canonical.patch); ` +
+    // Echo the EXACT canonical patch bytes (base64) so HUBRIS can persist the
+    // same patch the sandbox validated and applied — never reconstructed later.
+    `echo ${CANONICAL_B64_MARKER} $(base64 -w0 /tmp/canonical.patch); ` +
     `echo ${SOURCE_REF_MARKER} ${shQuote(expected.ref ?? "")}; echo ${SOURCE_SHA_MARKER} ${shQuote(expected.sha ?? "")}; ` +
     `git diff --check; ` +
     `git stash -q; git apply --check /tmp/canonical.patch; git stash pop -q; ` +
@@ -393,4 +397,21 @@ export function parseStructuredRun(stdout: string): StructuredRunOutcome {
   const patchOk = editOk && canonicalSha !== null && stdout.includes("PATCH_OK");
   const verifyBegin = stdout.includes("VERIFY_BEGIN");
   return { editOk, editCategory, patchOk, verifyBegin, canonicalSha, canonicalBytes };
+}
+
+// Decode the base64 canonical patch echoed by the sandbox. Returns the exact
+// bytes as UTF-8 text, or null when the marker is absent/malformed. This is the
+// ONLY source of the SHIP patch: never reconstructed from the model, the edit
+// plan, or the contract.
+export function parseCanonicalPatchContent(stdout: string): string | null {
+  if (typeof stdout !== "string") return null;
+  // Tolerate trailing whitespace / CR so a CRLF-normalized stream still parses.
+  const m = stdout.match(new RegExp(`^${CANONICAL_B64_MARKER} ([A-Za-z0-9+/=]*)[\\r\\t ]*$`, "m"));
+  if (!m) return null;
+  if (m[1].length === 0) return "";
+  try {
+    return Buffer.from(m[1], "base64").toString("utf-8");
+  } catch {
+    return null;
+  }
 }

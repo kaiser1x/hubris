@@ -70,6 +70,7 @@ import {
   buildStructuredScript,
   EditPlanSchema,
   isSupportedEditPath,
+  parseCanonicalPatchContent,
   parseSourceMarkers,
   parseStructuredRun,
   resolveJobCommitSha,
@@ -101,6 +102,24 @@ import {
   REPRO_BEGIN_MARKER,
 } from "./reproduce";
 import { describeSourceMismatch } from "./mismatch";
+import {
+  buildPullRequestBody,
+  buildPullRequestTitle,
+  findExistingPullRequest,
+  getDefaultBranch,
+  githubTokenFromEnv,
+  redactSecrets,
+  repoNameFromCloneUrl as shipRepoNameFromCloneUrl,
+  shipBranchName,
+  shipEligibility,
+  shipForgeRun,
+  targetVerificationForBody,
+  uniqueShipBranch,
+  verifyCanonicalPatch,
+  verifyShipProvenance,
+  type ForgeRunLike,
+  type PullRequestRecord,
+} from "./ship";
 
 const execFileAsync = promisify(execFile);
 
@@ -3193,6 +3212,17 @@ const image = parsed.data.image ?? "tag:node:20-slim";
     // be proven to be the analyzed revision, so no apply/verify outcome
     // from it is admissible as evidence.
     const revisionOk = status !== "SOURCE_MISMATCH";
+    // The EXACT canonical patch bytes echoed by the sandbox (base64). Persisted
+    // only when sha256(content) and byte length match the reported canonical
+    // patch; otherwise withheld so SHIP fails closed. Never reconstructed from
+    // the model, edit plan, or contract.
+    const canonicalContent = parseCanonicalPatchContent(result.stdout);
+    const canonicalContentOk =
+      outcome.canonicalSha !== null &&
+      canonicalContent !== null &&
+      canonicalContent.length > 0 &&
+      createHash("sha256").update(canonicalContent).digest("hex") === outcome.canonicalSha &&
+      Buffer.byteLength(canonicalContent, "utf-8") === outcome.canonicalBytes;
     // Exact targeted verification of the investigated scenario, when the
     // investigation supplied both a test file and a scenario name. A run that
     // never executed (unsupported runner / missing marker) is fail-closed.
@@ -3231,6 +3261,7 @@ const image = parsed.data.image ?? "tag:node:20-slim";
           : {
               sha: outcome.canonicalSha,
               bytes: outcome.canonicalBytes,
+              ...(canonicalContentOk ? { content: canonicalContent } : {}),
             },
       validation: {
         editCategory: outcome.editCategory,
@@ -3281,6 +3312,239 @@ const image = parsed.data.image ?? "tag:node:20-slim";
   } finally {
     await fs.promises.rm(tmp, { recursive: true, force: true });
   }
+});
+
+const ShipBody = z.object({
+  jobId: z.string().min(1, "jobId is required"),
+  forgeRunId: z.string().min(1, "forgeRunId is required"),
+});
+
+// POST /api/ship - Publish an already-verified Forge repair as a GitHub PR.
+// Body: { jobId, forgeRunId }. The published patch is the EXACT canonical
+// patch Forge validated and applied. SHIP never regenerates the patch, never
+// force-pushes, never touches the default branch, and never merges. Any
+// provenance or integrity mismatch fails closed.
+app.post("/api/ship", async (c: Context) => {
+  let rawBody: unknown;
+  try {
+    rawBody = await c.req.json();
+  } catch {
+    return c.json({ error: "Invalid JSON body", status: 400 }, 400);
+  }
+  const parsed = ShipBody.safeParse(rawBody);
+  if (!parsed.success) {
+    return c.json({ error: "jobId and forgeRunId are required", status: 400 }, 400);
+  }
+
+  const db = getDb();
+  if (!db) return c.json({ error: "Job store unavailable", status: 503 }, 503);
+
+  const rows = await db.select().from(schema.jobs).where(eq(schema.jobs.id, parsed.data.jobId));
+  const job = rows[0];
+  if (!job) return c.json({ error: "Job not found", status: 404 }, 404);
+
+  const result = job.result as { forgeRuns?: unknown[]; investigationRuns?: unknown[] } | null;
+  const runs = Array.isArray(result?.forgeRuns) ? (result!.forgeRuns as unknown[]) : [];
+  const run = runs.find(
+    (r): r is ForgeRunLike =>
+      typeof r === "object" && r !== null && (r as { id?: unknown }).id === parsed.data.forgeRunId
+  );
+  if (!run) return c.json({ error: "Forge run not found", status: 404 }, 404);
+
+  // 1. Eligibility (assessment + applied + patch presence).
+  const eligibility = shipEligibility(run);
+  if (!eligibility.ok) {
+    return c.json({ error: `Cannot create PR. ${eligibility.reason}`, status: 409 }, 409);
+  }
+
+  // 2. Bound investigation must be a persisted READY run.
+  const investigationId = typeof run.investigationId === "string" ? run.investigationId : null;
+  const investigations = Array.isArray(result?.investigationRuns)
+    ? (result!.investigationRuns as unknown[])
+    : [];
+  const investigation = investigations.find(
+    (r): r is Record<string, unknown> =>
+      typeof r === "object" &&
+      r !== null &&
+      (r as { investigationId?: unknown }).investigationId === investigationId &&
+      (r as { status?: unknown }).status === "READY"
+  );
+  const provenanceReason =
+    "Cannot create PR. The verified repair provenance could not be established. Re-run Forge.";
+  if (!investigationId || !investigation) {
+    return c.json({ error: provenanceReason, status: 409 }, 409);
+  }
+
+  // 3. Repository must be the analyzed job's public github repository.
+  const cloneUrl = toSafeCloneUrl(job.repoUrl);
+  const repository = shipRepoNameFromCloneUrl(cloneUrl);
+  if (!cloneUrl || !repository) {
+    return c.json({ error: "Job has unsupported repo URL", status: 400 }, 400);
+  }
+
+  // 4. Provenance gate (repository, investigation, commit binding, equality).
+  if (!verifyShipProvenance(run, { repository, jobRepoUrl: job.repoUrl, investigationId }).ok) {
+    return c.json({ error: provenanceReason, status: 409 }, 409);
+  }
+
+  // 5. Canonical patch integrity — the exact bytes Forge verified.
+  const patch = verifyCanonicalPatch(run.canonicalPatch as never);
+  if (!patch.ok || !patch.content) {
+    return c.json({ error: `Cannot create PR. ${patch.reason}`, status: 409 }, 409);
+  }
+  const canonicalPatchSha = (run.canonicalPatch as { sha: string }).sha;
+  const source = (run.source ?? {}) as {
+    analysisCommitSha?: unknown;
+    executionCommitSha?: unknown;
+    commitSha?: unknown;
+  };
+  const analyzedCommitSha =
+    typeof source.analysisCommitSha === "string" ? source.analysisCommitSha : "";
+  const executionCommitSha =
+    typeof source.executionCommitSha === "string"
+      ? source.executionCommitSha
+      : typeof source.commitSha === "string"
+        ? source.commitSha
+        : "";
+
+  // 6. Duplicate PR safety (persisted).
+  const duplicate = findExistingPullRequest(runs, { repository, investigationId, canonicalPatchSha });
+  if (duplicate) {
+    return c.json({ jobId: job.id, duplicate: true, pullRequest: duplicate, state: "PR_EXISTS" });
+  }
+
+  // 7. GitHub authorization — reuse the existing env token.
+  const token = githubTokenFromEnv();
+  if (!token) {
+    return c.json(
+      {
+        error: "GitHub authorization is required to create a pull request.",
+        state: "ACTION_REQUIRED",
+        status: 503,
+      },
+      503
+    );
+  }
+  const owner = repository.split("/")[0];
+  const base = await getDefaultBranch(token, repository, fetch);
+  if (!base.ok || !base.branch) {
+    const auth = base.status === 401 || base.status === 403;
+    const status: ContentfulStatusCode = auth ? 403 : 502;
+    return c.json(
+      {
+        error: auth
+          ? "GitHub authorization required. HUBRIS could not read the repository with the configured token."
+          : redactSecrets(`GitHub repository could not be read: ${base.error}`, token),
+        state: auth ? "ACTION_REQUIRED" : "NOT_READY",
+        status,
+      },
+      status
+    );
+  }
+
+  // 8. Deterministic metadata built from persisted evidence.
+  const plan = (investigation.plan ?? {}) as Record<string, unknown>;
+  const target = (plan.target ?? {}) as { function?: unknown; file?: unknown };
+  const targetFunction = typeof target.function === "string" ? target.function : "";
+  const targetFile = typeof target.file === "string" ? target.file : "";
+  const report = typeof investigation.focus === "string" ? investigation.focus : "";
+  const assessment = ((run.verification as { assessment?: Record<string, unknown> })?.assessment ?? {}) as Record<string, unknown>;
+  // The FINAL target-verification result for the body, sourced from the
+  // authoritative assessment (the raw persisted record may lack `passed`).
+  const targetVerification = targetVerificationForBody(run);
+  const candidateBranch = shipBranchName(targetFunction, report, investigationId);
+  const existingBranches = runs
+    .map((r) =>
+      typeof r === "object" && r !== null
+        ? (r as { pullRequest?: { branch?: unknown } }).pullRequest?.branch
+        : null
+    )
+    .filter((b): b is string => typeof b === "string");
+  const branch = uniqueShipBranch(candidateBranch, existingBranches);
+  const title = buildPullRequestTitle(targetFunction, report);
+  const body = buildPullRequestBody({
+    repoName: repository,
+    targetFunction,
+    targetFile,
+    currentBehavior: typeof plan.currentBehavior === "string" ? plan.currentBehavior : "",
+    expectedBehavior: typeof plan.expectedBehavior === "string" ? plan.expectedBehavior : "",
+    targetVerification: {
+      scenario: typeof targetVerification.scenario === "string" ? targetVerification.scenario : null,
+      testFile: typeof targetVerification.testFile === "string" ? targetVerification.testFile : null,
+      passed: typeof targetVerification.passed === "boolean" ? targetVerification.passed : null,
+    },
+    regression: {
+      fullSuitePassed: assessment.fullSuitePassed === true,
+      unrelatedTestFailures:
+        typeof assessment.unrelatedTestFailures === "number" ? assessment.unrelatedTestFailures : 0,
+      failedTests: Array.isArray(assessment.failedTests)
+        ? assessment.failedTests.filter((t): t is string => typeof t === "string")
+        : [],
+    },
+    provenance: {
+      investigationId,
+      forgeRunId: parsed.data.forgeRunId,
+      analyzedCommitSha,
+      executionCommitSha,
+      canonicalPatchSha,
+      assessment: typeof assessment.state === "string" ? assessment.state : "",
+    },
+  });
+
+  // 9. Publish: clone at the exact commit, apply the exact patch, push a
+  //    hubris/* branch, open a PR. Fail closed on any deviation.
+  const shipped = await shipForgeRun({
+    repository,
+    owner,
+    commitSha: analyzedCommitSha,
+    baseBranch: base.branch,
+    branch,
+    patchContent: patch.content,
+    canonicalPatchSha,
+    title,
+    body,
+    token,
+  });
+  if (!shipped.ok) {
+    const auth = shipped.kind === "auth";
+    const stale = /changed since this repair was verified/.test(shipped.reason);
+    const status: ContentfulStatusCode = auth
+      ? 403
+      : shipped.kind === "conflict" || stale
+        ? 409
+        : 502;
+    return c.json(
+      { error: shipped.reason, state: auth ? "ACTION_REQUIRED" : "NOT_READY", status },
+      status
+    );
+  }
+
+  const record: PullRequestRecord = {
+    ...(shipped.pullRequest ?? shipped.duplicate)!,
+    investigationId,
+    forgeRunId: parsed.data.forgeRunId,
+  };
+  if (shipped.pullRequest) {
+    const updatedRuns = runs.map((r) =>
+      typeof r === "object" && r !== null && (r as { id?: unknown }).id === parsed.data.forgeRunId
+        ? { ...(r as object), pullRequest: record }
+        : r
+    );
+    try {
+      await db
+        .update(schema.jobs)
+        .set({ result: { ...(job.result as object), forgeRuns: updatedRuns }, updatedAt: new Date() })
+        .where(eq(schema.jobs.id, job.id));
+    } catch (error: any) {
+      console.error("Ship persist error:", error?.message);
+    }
+  }
+  return c.json({
+    jobId: job.id,
+    pullRequest: record,
+    pushStatus: shipped.pushStatus ?? null,
+    state: "PR_CREATED",
+  });
 });
 
 // GET /health - Health check

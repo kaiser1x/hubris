@@ -122,6 +122,13 @@ function splitRepoName(name: string): [string | null, string | null] {
   return [parts[parts.length - 2], parts[parts.length - 1]];
 }
 
+// Canonical repository identity for a job, used to group duplicate analysis
+// jobs of the same repository. Null when the job has no provable identity.
+export function jobRepositoryIdentity(job: LiveJob | null | undefined): string | null {
+  if (!job) return null;
+  return jobRepositoryContext(job).repoName ?? repoNameFromUrl(job.repoUrl);
+}
+
 // A job with a repoUrl but no derivable repository name is a legacy job.
 function legacyOrUnavailable(job: LiveJob): string {
   return repoNameFromUrl(job.repoUrl) ? LEGACY_JOB_LABEL : REPOSITORY_UNAVAILABLE_LABEL;
@@ -149,6 +156,69 @@ export function writeActiveJobId(id: string | null, storage?: Storage | null): v
     // storage unavailable; workspace context still resolves per-navigation
   }
 }
+
+// ---- Removed repositories (presentational only) ----
+//
+// A repository the user removed from HUBRIS is hidden from the selector by
+// canonical owner/repo identity. This is purely a HUBRIS-side list: it never
+// deletes jobs, investigations, Forge runs, verifications, or provenance, and
+// it NEVER touches the GitHub repository. Multiple analysis jobs for the same
+// repository share one identity, so removing hides all of them at once.
+
+export const REMOVED_REPOS_STORAGE_KEY = "hubris.removedRepos";
+
+const REPO_IDENTITY_RE = /^[\w.-]+\/[\w.-]+$/;
+
+export function isCanonicalRepoName(value: unknown): value is string {
+  return typeof value === "string" && REPO_IDENTITY_RE.test(value);
+}
+
+export function readRemovedRepos(storage?: Storage | null): string[] {
+  if (!storage) return [];
+  try {
+    const raw = storage.getItem(REMOVED_REPOS_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(isCanonicalRepoName);
+  } catch {
+    return [];
+  }
+}
+
+export function writeRemovedRepos(repos: string[], storage?: Storage | null): void {
+  if (!storage) return;
+  try {
+    const unique = [...new Set(repos.filter(isCanonicalRepoName))];
+    if (unique.length === 0) storage.removeItem(REMOVED_REPOS_STORAGE_KEY);
+    else storage.setItem(REMOVED_REPOS_STORAGE_KEY, JSON.stringify(unique));
+  } catch {
+    // storage unavailable; removal is a best-effort presentational hint
+  }
+}
+
+export function addRemovedRepo(repoName: string, storage?: Storage | null): void {
+  if (!isCanonicalRepoName(repoName)) return;
+  writeRemovedRepos([...readRemovedRepos(storage), repoName], storage);
+}
+
+// Undo: drop the identity from the removed list so it is selectable again.
+export function removeRemovedRepo(repoName: string, storage?: Storage | null): void {
+  if (!repoName) return;
+  writeRemovedRepos(
+    readRemovedRepos(storage).filter((name) => name !== repoName),
+    storage
+  );
+}
+
+export function isRepoRemoved(
+  repoName: string | null | undefined,
+  storage?: Storage | null
+): boolean {
+  if (!repoName) return false;
+  return readRemovedRepos(storage).includes(repoName);
+}
+
 
 // Extract the authoritative job id from a URLSearchParams, if present.
 export function jobIdFromSearch(search: URLSearchParams | null | undefined): string | null {

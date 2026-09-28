@@ -66,6 +66,18 @@ vi.mock("@hubris/sandbox", async (importOriginal) => {
   };
 });
 
+// Deterministic staging failure: a valid diff must proceed PAST extraction to
+// staging without a real (flaky, slow) network clone of a nonexistent repo.
+vi.mock("../src/checkout", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/checkout")>();
+  return {
+    ...actual,
+    cloneAndArchive: async () => {
+      throw new Error("clone");
+    },
+  };
+});
+
 import { app } from "../src/app";
 import { chatComplete, ModelError } from "@hubris/llm";
 import { runCommand, uploadFile } from "@hubris/sandbox";

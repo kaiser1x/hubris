@@ -203,3 +203,22 @@ describe("Forge page regression-suite wording", () => {
     expect(source).not.toContain("Verification Command");
   });
 });
+
+// The Forge page hands an eligible run to SHIP with the EXACT run id — never a
+// generic /ship link that would rely on "latest Forge run".
+describe("Forge page SHIP handoff", () => {
+  const PAGE = fileURLToPath(
+    new URL("../app/(workspace)/forge/page.tsx", import.meta.url)
+  );
+  const source = readFileSync(PAGE, "utf8");
+
+  it("shows SHIP VERIFIED REPAIR only for an eligible run", () => {
+    expect(source).toContain("SHIP VERIFIED REPAIR");
+    expect(source).toContain("shipEligible(current).eligible");
+  });
+
+  it("binds the link to the exact forgeRunId", () => {
+    expect(source).toContain("shipRepairHref(jobId, current.id)");
+    expect(source).not.toContain('href="/ship"');
+  });
+});

@@ -79,6 +79,17 @@ export interface ForgeMismatchView {
   sourceSnippet: string;
 }
 
+export interface PullRequestView {
+  provider: string;
+  repository: string;
+  branch: string;
+  baseBranch: string;
+  commitSha: string;
+  prNumber: number;
+  prUrl: string;
+  status: string;
+}
+
 export interface ForgeRunView {
   id: string;
   investigationId: string | null;
@@ -93,6 +104,7 @@ export interface ForgeRunView {
   editChecks: ForgeCheck[];
   patchBytes: number | null;
   patchShaShort: string | null;
+  patchSha: string | null;
   applyApplied: boolean;
   // Bounded byte-mismatch evidence for EDIT_CONTEXT_MISMATCH. Null when the
   // run reached another terminal or predates this diagnostic.
@@ -121,6 +133,9 @@ export interface ForgeRunView {
   outputTail: string[];
   errorTail: string[];
   at: string | null;
+  // GitHub Pull Request published from this verified run (SHIP). Null until
+  // shipped; never fabricated.
+  pullRequest: PullRequestView | null;
 }
 
 function isRecord(v: unknown): v is Record<string, unknown> {
@@ -184,6 +199,23 @@ function asAssessment(raw: unknown): ForgeAssessmentView | null {
       ? raw.failedTests.filter((t): t is string => typeof t === "string")
       : [],
     targetFailure: asString(raw.targetFailure),
+  };
+}
+
+function asPullRequest(raw: unknown): PullRequestView | null {
+  if (!isRecord(raw)) return null;
+  const prNumber = asNumber(raw.prNumber);
+  const prUrl = asString(raw.prUrl);
+  if (prNumber === null || !prUrl) return null;
+  return {
+    provider: asString(raw.provider) ?? "github",
+    repository: asString(raw.repository) ?? "",
+    branch: asString(raw.branch) ?? "",
+    baseBranch: asString(raw.baseBranch) ?? "",
+    commitSha: asString(raw.commitSha) ?? "",
+    prNumber,
+    prUrl,
+    status: asString(raw.status) ?? "OPEN",
   };
 }
 
@@ -351,6 +383,7 @@ export function toForgeRunView(raw: unknown, number: number): ForgeRunView | nul
   const patch = isRecord(raw.patch) ? raw.patch : null;
   const patchBytes = asNumber(canonical?.bytes) ?? asNumber(patch?.diffBytes) ?? asNumber(patch?.bytes);
   const patchShaShort = shortSha(canonical?.sha) ?? shortSha(patch?.diffSha256);
+  const patchSha = asString(canonical?.sha) ?? asString(patch?.diffSha256);
   const applied = isRecord(raw.apply) ? raw.apply.applied === true : false;
   const ver = isRecord(raw.verification) ? raw.verification : null;
   const timedOut = ver?.timedOut === true;
@@ -414,6 +447,7 @@ export function toForgeRunView(raw: unknown, number: number): ForgeRunView | nul
     editChecks,
     patchBytes,
     patchShaShort,
+    patchSha,
     applyApplied: applied,
     mismatch: asMismatchView(raw.mismatch),
     source: {
@@ -438,6 +472,7 @@ export function toForgeRunView(raw: unknown, number: number): ForgeRunView | nul
     outputTail: tailLines(stdout),
     errorTail: tailLines(stderr, 4),
     at: asString(raw.at),
+    pullRequest: asPullRequest(raw.pullRequest),
   };
 }
 
@@ -1051,4 +1086,101 @@ export function composeForgeFocus(plan: InvestigationPlanView): string {
     `Evidence: ${plan.evidence.join(" ")}`,
   ].join(" ");
   return text.length > 2000 ? text.slice(0, 2000) : text;
+}
+
+// ---- SHIP → GitHub Pull Request ----
+
+export const SHIP_PATH = "/api/ship";
+
+// Deterministic, URL-safe SHIP link bound to the exact Forge run. Mirrors
+// investigationReviewHref/forgeReviewHref. The SHIP page MUST load this exact
+// forgeRunId — never the latest or first-eligible run.
+export function shipRepairHref(
+  jobId: string | null | undefined,
+  forgeRunId: string | null | undefined
+): string {
+  const params = new URLSearchParams();
+  if (jobId) params.set("jobId", jobId);
+  if (forgeRunId) params.set("forgeRunId", forgeRunId);
+  const query = params.toString();
+  return query ? `/ship?${query}` : "/ship";
+}
+
+// A Forge run may be published only when its assessment is REPAIR_VERIFIED or
+// FULL_SUITE_PASSED, the patch was applied, and the target behavior did not
+// fail. Legacy runs without an assessment never qualify.
+export function shipEligible(
+  run: ForgeRunView | null | undefined
+): { eligible: boolean; reason: string } {
+  if (!run) return { eligible: false, reason: "No Forge run selected." };
+  const a = run.verification?.assessment ?? null;
+  if (!a) {
+    return {
+      eligible: false,
+      reason: "This Forge run predates verification assessment and cannot be shipped.",
+    };
+  }
+  if (a.state !== "REPAIR_VERIFIED" && a.state !== "FULL_SUITE_PASSED") {
+    return { eligible: false, reason: `The repair is not verified (${a.state}).` };
+  }
+  if (a.targetVerificationPassed === false) {
+    return { eligible: false, reason: "The investigated behavior did not pass verification." };
+  }
+  if (!run.applyApplied) {
+    return { eligible: false, reason: "The patch was not applied." };
+  }
+  return { eligible: true, reason: "" };
+}
+
+export type ShipBodyResult =
+  | { ok: true; body: { jobId: string; forgeRunId: string } }
+  | { ok: false; error: string };
+
+// Build the SHIP request body. Never guesses the run — both ids are required.
+export function buildShipBody(
+  jobId: string,
+  forgeRunId: string | null | undefined
+): ShipBodyResult {
+  if (!jobId || jobId.trim().length === 0) return { ok: false, error: "No analysis job selected." };
+  if (!forgeRunId || forgeRunId.trim().length === 0) {
+    return { ok: false, error: "No Forge run selected." };
+  }
+  return { ok: true, body: { jobId, forgeRunId: forgeRunId.trim() } };
+}
+
+// Client-side PREVIEW of the deterministic SHIP branch/title (the server owns
+// the authoritative values and may append a collision suffix).
+function slugPreview(value: string, maxWords: number): string {
+  return (value ?? "")
+    .replace(/([a-z0-9])([A-Z])/g, "$1-$2")
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .split("-")
+    .filter(Boolean)
+    .slice(0, maxWords)
+    .join("-")
+    .slice(0, 48);
+}
+
+export function shipBranchPreview(
+  targetFunction: string,
+  report: string,
+  investigationId: string | null
+): string {
+  const fnSlug = slugPreview(targetFunction, 3);
+  const reportSlug = slugPreview(report, 4);
+  const base = [fnSlug, reportSlug].filter(Boolean).join("-") || "repair";
+  const shortId = (investigationId ?? "").replace(/[^a-z0-9]/gi, "").slice(0, 8).toLowerCase();
+  let name = `hubris/fix/${base}`;
+  if (shortId) name = `${name}-${shortId}`;
+  return name.length > 100 ? name.slice(0, 100).replace(/[-./]+$/, "") : name;
+}
+
+export function shipTitlePreview(targetFunction: string, report: string): string {
+  const fn = (targetFunction || "").trim();
+  const words = (report || "").replace(/\s+/g, " ").trim().split(" ").slice(0, 8).join(" ");
+  const summary = words || "verified repair";
+  return fn ? `Fix ${fn}: ${summary}` : `Fix: ${summary}`;
 }

@@ -27,6 +27,12 @@ import {
   investigationReviewHref,
   STRUCTURED_VERIFY_PATH,
   LEGACY_VERIFY_PATH,
+  SHIP_PATH,
+  shipEligible,
+  shipRepairHref,
+  buildShipBody,
+  shipBranchPreview,
+  shipTitlePreview,
 } from "../app/lib/forge-run";
 import ForgeRunPanel from "../app/components/ForgeRunPanel";
 
@@ -1001,5 +1007,85 @@ describe("verification wording (target vs regression)", () => {
     // One primary outcome label; the regression failure is subordinate.
     expect(html).toContain("REPAIR VERIFIED");
     expect(html).not.toContain("VERIFICATION FAILED");
+  });
+});
+
+// ---- SHIP eligibility / body / preview ----
+describe("SHIP (eligibility, body, preview)", () => {
+  function runWith(assessment: Record<string, unknown> | null, applyApplied = true) {
+    return resolveForgeRuns({
+      result: {
+        forgeRuns: [
+          structuredRun({
+            apply: { applied: applyApplied },
+            verification: {
+              command: "pnpm test",
+              commandSource: "detected",
+              exitCode: 1,
+              timedOut: false,
+              passed: false,
+              ...(assessment ? { assessment } : {}),
+            },
+          }),
+        ],
+      },
+    })[0];
+  }
+
+  it("is eligible only for REPAIR_VERIFIED / FULL_SUITE_PASSED", () => {
+    expect(shipEligible(runWith({ state: "REPAIR_VERIFIED", targetVerificationPassed: true, fullSuitePassed: false })).eligible).toBe(true);
+    expect(shipEligible(runWith({ state: "FULL_SUITE_PASSED", targetVerificationPassed: true, fullSuitePassed: true })).eligible).toBe(true);
+    expect(shipEligible(runWith({ state: "REPAIR_NOT_VERIFIED", targetVerificationPassed: false })).eligible).toBe(false);
+    expect(shipEligible(runWith({ state: "VERIFICATION_INCOMPLETE", targetVerificationPassed: null })).eligible).toBe(false);
+    expect(shipEligible(runWith({ state: "REPAIR_VERIFIED", targetVerificationPassed: true }, false)).eligible).toBe(false);
+    expect(shipEligible(runWith(null)).eligible).toBe(false);
+  });
+
+  it("requires both ids for the ship request body", () => {
+    expect(buildShipBody("job-1", "run-1")).toEqual({ ok: true, body: { jobId: "job-1", forgeRunId: "run-1" } });
+    expect(buildShipBody("", "run-1").ok).toBe(false);
+    expect(buildShipBody("job-1", null).ok).toBe(false);
+  });
+
+  it("parses a persisted pull request and previews a safe branch/title", () => {
+    const withPr = resolveForgeRuns({
+      result: {
+        forgeRuns: [
+          structuredRun({
+            pullRequest: {
+              provider: "github",
+              repository: "o/r",
+              branch: "hubris/fix/x",
+              baseBranch: "main",
+              commitSha: "a".repeat(40),
+              prNumber: 7,
+              prUrl: "https://github.com/o/r/pull/7",
+              status: "OPEN",
+            },
+          }),
+        ],
+      },
+    })[0];
+    expect(withPr.pullRequest?.prNumber).toBe(7);
+    expect(withPr.pullRequest?.prUrl).toContain("/pull/7");
+    expect(SHIP_PATH).toBe("/api/ship");
+
+    const branch = shipBranchPreview("createOrder", "discount is wrong", "ab12cd34");
+    expect(branch.startsWith("hubris/fix/create-order-discount-is-wrong-")).toBe(true);
+    expect(shipBranchPreview("x$(rm) y", "a;b #c", null)).not.toMatch(/[ $;#`]/);
+    expect(shipTitlePreview("createOrder", "discount is wrong")).toBe("Fix createOrder: discount is wrong");
+  });
+});
+
+describe("shipRepairHref", () => {
+  it("is deterministic, URL-safe, and carries jobId + forgeRunId", () => {
+    expect(shipRepairHref("job-1", "run-2")).toBe("/ship?jobId=job-1&forgeRunId=run-2");
+    expect(shipRepairHref("job/ with space", "run#2")).toBe(
+      "/ship?jobId=job%2F+with+space&forgeRunId=run%232"
+    );
+  });
+
+  it("never emits a bare /ship link when ids are present", () => {
+    expect(shipRepairHref("job-1", "run-2")).not.toBe("/ship");
   });
 });

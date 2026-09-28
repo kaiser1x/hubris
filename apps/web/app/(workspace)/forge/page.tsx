@@ -21,6 +21,8 @@ import {
   findSavedInvestigation,
   investigationReviewHref,
   resolveForgeRuns,
+  shipEligible,
+  shipRepairHref,
   STRUCTURED_VERIFY_PATH,
   toVerifyError,
   type ForgeRunView,
@@ -294,6 +296,17 @@ function ForgePageContent() {
                 </div>
               )}
             </div>
+
+            {current && shipEligible(current).eligible && (
+              <div className="mt-6">
+                <Link
+                  href={shipRepairHref(jobId, current.id)}
+                  className="inline-flex bg-[#0A0A0A] text-white font-mono text-[11px] tracking-[0.08em] px-4 py-3 hover:bg-black active:scale-[0.98] transition-all"
+                >
+                  SHIP VERIFIED REPAIR →
+                </Link>
+              </div>
+            )}
 
             <div className="mt-8">
               <p className="kicker">Validation</p>
