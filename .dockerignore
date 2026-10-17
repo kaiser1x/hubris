@@ -1,0 +1,15 @@
+# Never send local secrets or build output into the image build context.
+.env
+.env.*
+!.env.example
+.git
+.claude
+.agents
+.turbo
+**/node_modules
+**/dist
+**/.next
+**/.vercel
+debug_outputs
+hubris-design-concept
+*.diff
