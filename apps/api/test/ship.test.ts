@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import {
   buildPullRequestTitle,
   buildPullRequestBody,
+  buildPullRequestBodyFromRun,
   createGitHubPullRequest,
   findExistingPullRequest,
   githubTokenFromEnv,
@@ -94,6 +95,33 @@ describe("ship eligibility", () => {
     expect(shipEligibility(verifiedRun({ apply: { applied: false } })).ok).toBe(false);
     expect(shipEligibility(verifiedRun({ canonicalPatch: { sha: PATCH_SHA, bytes: PATCH_BYTES } })).ok).toBe(false);
     expect(shipEligibility(verifiedRun({ verification: { assessment: { state: "REPAIR_VERIFIED", targetVerificationPassed: false } } })).ok).toBe(false);
+  });
+
+  it("REPAIR_VERIFIED requires targetVerificationPassed === true (fail closed)", () => {
+    const withTarget = (v: unknown) =>
+      verifiedRun({
+        verification: { assessment: { state: "REPAIR_VERIFIED", targetVerificationPassed: v } },
+        // A passing raw record must never be used to infer a pass.
+        targetVerification: { scenario: "s", testFile: "t.test.ts", passed: true },
+      });
+    expect(shipEligibility(withTarget(true)).ok).toBe(true);
+    expect(shipEligibility(withTarget(false)).ok).toBe(false);
+    for (const v of [null, undefined, "true", 1]) {
+      const r = shipEligibility(withTarget(v));
+      expect(r.ok).toBe(false);
+      expect(r.reason).toContain("Target verification must pass");
+    }
+    const noField = verifiedRun({ verification: { assessment: { state: "REPAIR_VERIFIED" } } });
+    expect(shipEligibility(noField).ok).toBe(false);
+  });
+
+  it("FULL_SUITE_PASSED keeps its semantics: null target ok, explicit false blocked", () => {
+    const full = (v: unknown) =>
+      verifiedRun({ verification: { assessment: { state: "FULL_SUITE_PASSED", fullSuitePassed: true, targetVerificationPassed: v } } });
+    expect(shipEligibility(full(null)).ok).toBe(true);
+    expect(shipEligibility(full(undefined)).ok).toBe(true);
+    expect(shipEligibility(full(true)).ok).toBe(true);
+    expect(shipEligibility(full(false)).ok).toBe(false);
   });
 
   it("rejects legacy runs without an assessment and generic FAILED runs", () => {
@@ -522,6 +550,93 @@ describe("PR body target verification uses the final assessment", () => {
       provenance: { ...provenance, assessment: "REPAIR_NOT_VERIFIED" },
     });
     expect(body).toContain("- Result: NOT VERIFIED");
+  });
+
+  describe("buildPullRequestBodyFromRun (exact finalized Forge run)", () => {
+    const ctx = {
+      repoName: "kaiser1x/test2-codebase",
+      targetFunction: "createOrder",
+      targetFile: "src/orders.ts",
+      currentBehavior: "A customer applies the SAVE10 discount, but createOrder charges the full subtotal.",
+      expectedBehavior: "expect(order.total).toBe(1350)",
+      investigationId: "inv-1",
+      forgeRunId: "run-1",
+      analyzedCommitSha: COMMIT,
+      executionCommitSha: COMMIT,
+      canonicalPatchSha: PATCH_SHA,
+    };
+    const finalRun = (over: Partial<ForgeRunLike> = {}) =>
+      verifiedRun({
+        // Stale raw record: no `passed`, and the old NOT-verified shape would
+        // have produced "Result: NOT VERIFIED".
+        targetVerification: { scenario: "applies a discount code to the order total", testFile: "tests/orders.test.ts" },
+        verification: {
+          assessment: {
+            state: "REPAIR_VERIFIED",
+            patchApplied: true,
+            targetVerificationPassed: true,
+            targetScenario: "applies a discount code to the order total",
+            targetTestFile: "tests/orders.test.ts",
+            fullSuitePassed: false,
+            unrelatedTestFailures: 3,
+            failedTests: ["tests/cart.test.ts", "tests/users.test.ts", "tests/sessions.test.ts"],
+          },
+        },
+        ...over,
+      });
+
+    it("verified run → Target verification PASSED, never NOT VERIFIED", () => {
+      const body = buildPullRequestBodyFromRun(finalRun(), ctx);
+      const section = body.split("### Regression suite")[0].split("### Target verification")[1];
+      expect(section).toContain("- Scenario: `applies a discount code to the order total`");
+      expect(section).toContain("- Test: `tests/orders.test.ts`");
+      expect(section).toContain("- Result: PASSED");
+      expect(body).not.toContain("Result: NOT VERIFIED");
+      expect(body).not.toContain("NOT VERIFIED");
+    });
+
+    it("represents 3 unrelated regression failures", () => {
+      const body = buildPullRequestBodyFromRun(finalRun(), ctx);
+      const regression = body.split("### Regression suite")[1].split("### HUBRIS provenance")[0];
+      expect(regression).toContain("- Result: FAILED");
+      expect(regression).toContain("- Unrelated failures: 3");
+      expect(regression).toContain("Unrelated:");
+      expect(regression).toContain("- `tests/cart.test.ts`");
+      expect(regression).toContain("- `tests/users.test.ts`");
+      expect(regression).toContain("- `tests/sessions.test.ts`");
+      expect(regression).not.toContain("tests/orders.test.ts");
+    });
+
+    it("includes the exact assessment and full provenance", () => {
+      const body = buildPullRequestBodyFromRun(finalRun(), ctx);
+      expect(body).toContain("- Investigation ID: `inv-1`");
+      expect(body).toContain("- Forge run: `run-1`");
+      expect(body).toContain(`- Analyzed commit: \`${COMMIT}\``);
+      expect(body).toContain(`- Execution commit: \`${COMMIT}\``);
+      expect(body).toContain(`- Canonical patch SHA: \`${PATCH_SHA}\``);
+      expect(body).toContain("- Assessment: `REPAIR_VERIFIED`");
+      expect(body).toContain("_Created by HUBRIS from a verified repair. HUBRIS did not merge this");
+    });
+
+    it("reports the exact final assessment state (FULL_SUITE_PASSED)", () => {
+      const run = finalRun({
+        verification: {
+          assessment: { state: "FULL_SUITE_PASSED", targetVerificationPassed: true, fullSuitePassed: true },
+        },
+      });
+      const body = buildPullRequestBodyFromRun(run, ctx);
+      expect(body).toContain("- Assessment: `FULL_SUITE_PASSED`");
+      expect(body).toContain("### Regression suite\n\n- Result: PASSED");
+      expect(body).not.toContain("Unrelated failures");
+    });
+
+    it("the final assessment wins over a stale raw record", () => {
+      const run = finalRun({ targetVerification: { scenario: "old", testFile: "old.test.ts", passed: false } });
+      const body = buildPullRequestBodyFromRun(run, ctx);
+      expect(body).toContain("- Result: PASSED");
+      expect(body).toContain("- Scenario: `applies a discount code to the order total`");
+      expect(body).not.toContain("NOT VERIFIED");
+    });
   });
 
   it("the body never references an earlier/deleted PR", () => {

@@ -117,7 +117,12 @@ describe("investigateTwin verdicts", () => {
     expect(r.plan.repairContract.existingErrorContract).toContain("duplicate");
     expect(r.plan.repairContract.relevantCondition).toContain("idempotencyKey");
     expect(r.plan.repairContract.relevantOperation).toContain("seenIdempotencyKeys.add");
-    expect(r.plan.repairContract.minimalRepairDescription).toContain("existing condition");
+    // The only enclosing guard tests key PRESENCE; it is not the duplicate
+    // guard, so the contract asks for the missing check instead of telling the
+    // repair to "preserve the existing condition".
+    expect(r.plan.repairContract.conditionKind).toBe("presence-precondition");
+    expect(r.plan.repairContract.minimalRepairDescription).toContain("Add the missing check");
+    expect(r.plan.repairContract.minimalRepairDescription).not.toContain("existing condition");
   });
 
   it("ignores generic repair prose that collides with unrelated symbols", () => {

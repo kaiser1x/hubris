@@ -1,0 +1,1431 @@
+{
+ "_meta": "CodeTwin captured from a persisted analysis of kaiser1x/ts-js-dummy @ hubris/buggy-idempotency (guard dropped), job 051683d2, 2026-10-16.",
+ "repository": {
+  "id": "0c09628e-5c9b-475a-8f90-0e9b8b940c5f",
+  "name": "kaiser1x/ts-js-dummy",
+  "analysisStatus": "complete"
+ },
+ "ref": "hubris/buggy-idempotency",
+ "commitSha": "256e395f8df8e345f647b43fb1a97bb2011b9672",
+ "packageManager": "pnpm",
+ "scripts": {
+  "test": "vitest run",
+  "build": "tsc",
+  "start": "node src/index.ts",
+  "typecheck": "tsc --noEmit"
+ },
+ "full": {
+  "functions": [
+   {
+    "id": "4effc0fc-8758-49b2-9f86-795f7edf9c17",
+    "line": 35,
+    "name": "listRoutes",
+    "path": "src/api.ts",
+    "column": 17,
+    "endLine": 37
+   },
+   {
+    "id": "15d423c9-6062-4767-8b3b-b392dd4730d4",
+    "line": 9,
+    "name": "auditLog",
+    "path": "src/audit.ts",
+    "column": 17,
+    "endLine": 13
+   },
+   {
+    "id": "30eb913a-e07d-40cb-b585-f9321947cb1c",
+    "line": 15,
+    "name": "auditTrail",
+    "path": "src/audit.ts",
+    "column": 17,
+    "endLine": 17
+   },
+   {
+    "id": "d2e46de6-676f-4d87-b8a4-4913b0cca6b9",
+    "line": 23,
+    "name": "begin",
+    "path": "src/audit.ts",
+    "column": 17,
+    "endLine": 26
+   },
+   {
+    "id": "df13e376-36d8-4338-aa4e-e7f8424be2dc",
+    "line": 28,
+    "name": "alpha",
+    "path": "src/audit.ts",
+    "column": 10,
+    "endLine": 30
+   },
+   {
+    "id": "4a1ad879-e11e-4abd-a778-e5553c03c87c",
+    "line": 32,
+    "name": "bravo",
+    "path": "src/audit.ts",
+    "column": 10,
+    "endLine": 34
+   },
+   {
+    "id": "36feaf19-e28e-458e-a671-f733268c93c9",
+    "line": 36,
+    "name": "charlie",
+    "path": "src/audit.ts",
+    "column": 10,
+    "endLine": 39
+   },
+   {
+    "id": "95e37b2f-d28e-4129-af5b-99f30a72ea51",
+    "line": 41,
+    "name": "delta",
+    "path": "src/audit.ts",
+    "column": 10,
+    "endLine": 45
+   },
+   {
+    "id": "f87185bc-c81e-4533-874a-54a173a9d496",
+    "line": 47,
+    "name": "echo",
+    "path": "src/audit.ts",
+    "column": 10,
+    "endLine": 49
+   },
+   {
+    "id": "1e7230d5-b3ea-4f13-9273-fc54e18cd166",
+    "line": 51,
+    "name": "foxtrot",
+    "path": "src/audit.ts",
+    "column": 10,
+    "endLine": 53
+   },
+   {
+    "id": "1091f650-e3cd-4ff5-839b-efd5d1202ddf",
+    "line": 55,
+    "name": "zulu",
+    "path": "src/audit.ts",
+    "column": 10,
+    "endLine": 57
+   },
+   {
+    "id": "170bb3ac-3e65-40f2-a498-bc8634bc1948",
+    "line": 3,
+    "name": "main",
+    "path": "src/index.ts",
+    "column": 10,
+    "endLine": 7
+   },
+   {
+    "id": "8e5f5238-9660-4452-9a3e-48ceda5cdbe9",
+    "line": 3,
+    "name": "isolatedHelper",
+    "path": "src/isolated.ts",
+    "column": 17,
+    "endLine": 5
+   },
+   {
+    "id": "d6170830-89bc-4507-afb1-46ff20744279",
+    "line": 7,
+    "name": "anotherLonelyFunction",
+    "path": "src/isolated.ts",
+    "column": 17,
+    "endLine": 9
+   },
+   {
+    "id": "473fc337-0a99-490b-88d9-899a0dfce08f",
+    "line": 3,
+    "name": "sendNotification",
+    "path": "src/notifications.ts",
+    "column": 17,
+    "endLine": 7
+   },
+   {
+    "id": "27cc6782-cbfc-4cfd-8fff-377e8bc2b71e",
+    "line": 17,
+    "name": "validatePayment",
+    "path": "src/payments.ts",
+    "column": 17,
+    "endLine": 21
+   },
+   {
+    "id": "16ee9a8a-ef40-4c0a-b949-4f5bb4edd0b6",
+    "line": 23,
+    "name": "savePayment",
+    "path": "src/payments.ts",
+    "column": 17,
+    "endLine": 32
+   },
+   {
+    "id": "143a96f7-cc5d-4dd8-9cdb-6386d7b9120e",
+    "line": 34,
+    "name": "ledger",
+    "path": "src/payments.ts",
+    "column": 17,
+    "endLine": 36
+   },
+   {
+    "id": "1949d2c8-c55d-48dc-aeb1-5723ca384208",
+    "line": 41,
+    "name": "createPayment",
+    "path": "src/payments.ts",
+    "column": 17,
+    "endLine": 55
+   },
+   {
+    "id": "ad5eaab1-fad1-4160-91e6-bc11cafbc9ad",
+    "line": 12,
+    "name": "findUser",
+    "path": "src/users.ts",
+    "column": 17,
+    "endLine": 14
+   },
+   {
+    "id": "7c07ab5b-d4c3-4613-9f5a-0108bc57afdb",
+    "line": 16,
+    "name": "getUser",
+    "path": "src/users.ts",
+    "column": 17,
+    "endLine": 22
+   },
+   {
+    "id": "bd16e5cb-2c4d-47aa-b38c-74a3d3f4a42f",
+    "line": 1,
+    "name": "isPositive",
+    "path": "src/utils.ts",
+    "column": 17,
+    "endLine": 3
+   },
+   {
+    "id": "307ad548-3d4b-449d-8779-fdcb432d1aec",
+    "line": 5,
+    "name": "formatMoney",
+    "path": "src/utils.ts",
+    "column": 17,
+    "endLine": 10
+   }
+  ],
+  "tests": [
+   {
+    "file": "tests/idempotency-regression.test.ts",
+    "name": "idempotency-regression.test",
+    "path": "tests/idempotency-regression.test.ts"
+   },
+   {
+    "file": "tests/payments.test.ts",
+    "name": "payments.test",
+    "path": "tests/payments.test.ts"
+   },
+   {
+    "file": "tests/users.test.ts",
+    "name": "users.test",
+    "path": "tests/users.test.ts"
+   }
+  ],
+  "relationships": [
+   {
+    "to": "./users.js",
+    "from": "src/api.ts",
+    "type": "IMPORTS"
+   },
+   {
+    "to": "./payments.js",
+    "from": "src/api.ts",
+    "type": "IMPORTS"
+   },
+   {
+    "to": "./audit.js",
+    "from": "src/api.ts",
+    "type": "IMPORTS"
+   },
+   {
+    "to": "./api.js",
+    "from": "src/index.ts",
+    "type": "IMPORTS"
+   },
+   {
+    "to": "./users.js",
+    "from": "src/notifications.ts",
+    "type": "IMPORTS"
+   },
+   {
+    "to": "node:crypto",
+    "from": "src/payments.ts",
+    "type": "IMPORTS"
+   },
+   {
+    "to": "./users.js",
+    "from": "src/payments.ts",
+    "type": "IMPORTS"
+   },
+   {
+    "to": "./notifications.js",
+    "from": "src/payments.ts",
+    "type": "IMPORTS"
+   },
+   {
+    "to": "./audit.js",
+    "from": "src/payments.ts",
+    "type": "IMPORTS"
+   },
+   {
+    "to": "./utils.js",
+    "from": "src/payments.ts",
+    "type": "IMPORTS"
+   },
+   {
+    "to": "vitest",
+    "from": "tests/idempotency-regression.test.ts",
+    "type": "IMPORTS"
+   },
+   {
+    "to": "../src/payments.js",
+    "from": "tests/idempotency-regression.test.ts",
+    "type": "IMPORTS"
+   },
+   {
+    "to": "vitest",
+    "from": "tests/payments.test.ts",
+    "type": "IMPORTS"
+   },
+   {
+    "to": "../src/notifications.js",
+    "from": "tests/payments.test.ts",
+    "type": "IMPORTS"
+   },
+   {
+    "to": "../src/payments.js",
+    "from": "tests/payments.test.ts",
+    "type": "IMPORTS"
+   },
+   {
+    "to": "vitest",
+    "from": "tests/users.test.ts",
+    "type": "IMPORTS"
+   },
+   {
+    "to": "../src/users.js",
+    "from": "tests/users.test.ts",
+    "type": "IMPORTS"
+   },
+   {
+    "to": "vitest/config",
+    "from": "vitest.config.ts",
+    "type": "IMPORTS"
+   },
+   {
+    "to": "users.getUser",
+    "from": "src/api.ts",
+    "type": "CALLS",
+    "caller": "endpoint:GET:/users/:id"
+   },
+   {
+    "to": "createPayment",
+    "from": "src/api.ts",
+    "type": "CALLS",
+    "caller": "endpoint:POST:/payments"
+   },
+   {
+    "to": "begin",
+    "from": "src/api.ts",
+    "type": "CALLS",
+    "caller": "endpoint:GET:/start"
+   },
+   {
+    "to": "router.list",
+    "from": "src/api.ts",
+    "type": "CALLS",
+    "caller": "listRoutes"
+   },
+   {
+    "to": "TRAIL.push",
+    "from": "src/audit.ts",
+    "type": "CALLS",
+    "caller": "auditLog"
+   },
+   {
+    "to": "alpha",
+    "from": "src/audit.ts",
+    "type": "CALLS",
+    "caller": "begin"
+   },
+   {
+    "to": "bravo",
+    "from": "src/audit.ts",
+    "type": "CALLS",
+    "caller": "alpha"
+   },
+   {
+    "to": "charlie",
+    "from": "src/audit.ts",
+    "type": "CALLS",
+    "caller": "bravo"
+   },
+   {
+    "to": "delta",
+    "from": "src/audit.ts",
+    "type": "CALLS",
+    "caller": "charlie"
+   },
+   {
+    "to": "alpha",
+    "from": "src/audit.ts",
+    "type": "CALLS",
+    "caller": "charlie"
+   },
+   {
+    "to": "echo",
+    "from": "src/audit.ts",
+    "type": "CALLS",
+    "caller": "delta"
+   },
+   {
+    "to": "zulu",
+    "from": "src/audit.ts",
+    "type": "CALLS",
+    "caller": "delta"
+   },
+   {
+    "to": "fetch",
+    "from": "src/audit.ts",
+    "type": "CALLS",
+    "caller": "delta"
+   },
+   {
+    "to": "foxtrot",
+    "from": "src/audit.ts",
+    "type": "CALLS",
+    "caller": "echo"
+   },
+   {
+    "to": "charlie",
+    "from": "src/audit.ts",
+    "type": "CALLS",
+    "caller": "foxtrot"
+   },
+   {
+    "to": "listRoutes",
+    "from": "src/index.ts",
+    "type": "CALLS",
+    "caller": "main"
+   },
+   {
+    "to": "main",
+    "from": "src/index.ts",
+    "type": "CALLS"
+   },
+   {
+    "to": "isPositive",
+    "from": "src/payments.ts",
+    "type": "CALLS",
+    "caller": "validatePayment"
+   },
+   {
+    "to": "randomUUID",
+    "from": "src/payments.ts",
+    "type": "CALLS",
+    "caller": "savePayment"
+   },
+   {
+    "to": "LEDGER.push",
+    "from": "src/payments.ts",
+    "type": "CALLS",
+    "caller": "savePayment"
+   },
+   {
+    "to": "getUser",
+    "from": "src/payments.ts",
+    "type": "CALLS",
+    "caller": "createPayment"
+   },
+   {
+    "to": "validatePayment",
+    "from": "src/payments.ts",
+    "type": "CALLS",
+    "caller": "createPayment"
+   },
+   {
+    "to": "seenIdempotencyKeys.add",
+    "from": "src/payments.ts",
+    "type": "CALLS",
+    "caller": "createPayment"
+   },
+   {
+    "to": "savePayment",
+    "from": "src/payments.ts",
+    "type": "CALLS",
+    "caller": "createPayment"
+   },
+   {
+    "to": "sendNotification",
+    "from": "src/payments.ts",
+    "type": "CALLS",
+    "caller": "createPayment"
+   },
+   {
+    "to": "formatMoney",
+    "from": "src/payments.ts",
+    "type": "CALLS",
+    "caller": "createPayment"
+   },
+   {
+    "to": "auditLog",
+    "from": "src/payments.ts",
+    "type": "CALLS",
+    "caller": "createPayment"
+   },
+   {
+    "to": "USERS.find",
+    "from": "src/users.ts",
+    "type": "CALLS",
+    "caller": "findUser"
+   },
+   {
+    "to": "findUser",
+    "from": "src/users.ts",
+    "type": "CALLS",
+    "caller": "getUser"
+   },
+   {
+    "to": "describe",
+    "from": "tests/idempotency-regression.test.ts",
+    "type": "CALLS"
+   },
+   {
+    "to": "it",
+    "from": "tests/idempotency-regression.test.ts",
+    "type": "CALLS",
+    "caller": "describe#arg1"
+   },
+   {
+    "to": "createPayment",
+    "from": "tests/idempotency-regression.test.ts",
+    "type": "CALLS",
+    "caller": "it#arg1"
+   },
+   {
+    "to": "expect",
+    "from": "tests/idempotency-regression.test.ts",
+    "type": "CALLS",
+    "caller": "it#arg1"
+   },
+   {
+    "to": "createPayment",
+    "from": "tests/idempotency-regression.test.ts",
+    "type": "CALLS",
+    "caller": "expect#arg0"
+   },
+   {
+    "to": "describe",
+    "from": "tests/payments.test.ts",
+    "type": "CALLS"
+   },
+   {
+    "to": "it",
+    "from": "tests/payments.test.ts",
+    "type": "CALLS",
+    "caller": "describe#arg1"
+   },
+   {
+    "to": "expect",
+    "from": "tests/payments.test.ts",
+    "type": "CALLS",
+    "caller": "it#arg1"
+   },
+   {
+    "to": "validatePayment",
+    "from": "tests/payments.test.ts",
+    "type": "CALLS",
+    "caller": "expect#arg0"
+   },
+   {
+    "to": "it.each",
+    "from": "tests/payments.test.ts",
+    "type": "CALLS",
+    "caller": "describe#arg1"
+   },
+   {
+    "to": "expect",
+    "from": "tests/payments.test.ts",
+    "type": "CALLS",
+    "caller": "describe#arg1"
+   },
+   {
+    "to": "validatePayment",
+    "from": "tests/payments.test.ts",
+    "type": "CALLS",
+    "caller": "expect#arg0"
+   },
+   {
+    "to": "describe",
+    "from": "tests/payments.test.ts",
+    "type": "CALLS"
+   },
+   {
+    "to": "it",
+    "from": "tests/payments.test.ts",
+    "type": "CALLS",
+    "caller": "describe#arg1"
+   },
+   {
+    "to": "createPayment",
+    "from": "tests/payments.test.ts",
+    "type": "CALLS",
+    "caller": "it#arg1"
+   },
+   {
+    "to": "expect",
+    "from": "tests/payments.test.ts",
+    "type": "CALLS",
+    "caller": "it#arg1"
+   },
+   {
+    "to": "expect",
+    "from": "tests/payments.test.ts",
+    "type": "CALLS",
+    "caller": "it#arg1"
+   },
+   {
+    "to": "expect",
+    "from": "tests/payments.test.ts",
+    "type": "CALLS",
+    "caller": "it#arg1"
+   },
+   {
+    "to": "expect",
+    "from": "tests/payments.test.ts",
+    "type": "CALLS",
+    "caller": "it#arg1"
+   },
+   {
+    "to": "it",
+    "from": "tests/payments.test.ts",
+    "type": "CALLS",
+    "caller": "describe#arg1"
+   },
+   {
+    "to": "expect",
+    "from": "tests/payments.test.ts",
+    "type": "CALLS",
+    "caller": "it#arg1"
+   },
+   {
+    "to": "createPayment",
+    "from": "tests/payments.test.ts",
+    "type": "CALLS",
+    "caller": "expect#arg0"
+   },
+   {
+    "to": "it",
+    "from": "tests/payments.test.ts",
+    "type": "CALLS",
+    "caller": "describe#arg1"
+   },
+   {
+    "to": "createPayment",
+    "from": "tests/payments.test.ts",
+    "type": "CALLS",
+    "caller": "it#arg1"
+   },
+   {
+    "to": "expect",
+    "from": "tests/payments.test.ts",
+    "type": "CALLS",
+    "caller": "it#arg1"
+   },
+   {
+    "to": "createPayment",
+    "from": "tests/payments.test.ts",
+    "type": "CALLS",
+    "caller": "expect#arg0"
+   },
+   {
+    "to": "it",
+    "from": "tests/payments.test.ts",
+    "type": "CALLS",
+    "caller": "describe#arg1"
+   },
+   {
+    "to": "savePayment",
+    "from": "tests/payments.test.ts",
+    "type": "CALLS",
+    "caller": "it#arg1"
+   },
+   {
+    "to": "expect",
+    "from": "tests/payments.test.ts",
+    "type": "CALLS",
+    "caller": "it#arg1"
+   },
+   {
+    "to": "describe",
+    "from": "tests/payments.test.ts",
+    "type": "CALLS"
+   },
+   {
+    "to": "it",
+    "from": "tests/payments.test.ts",
+    "type": "CALLS",
+    "caller": "describe#arg1"
+   },
+   {
+    "to": "sendNotification",
+    "from": "tests/payments.test.ts",
+    "type": "CALLS",
+    "caller": "it#arg1"
+   },
+   {
+    "to": "expect",
+    "from": "tests/payments.test.ts",
+    "type": "CALLS",
+    "caller": "it#arg1"
+   },
+   {
+    "to": "describe",
+    "from": "tests/users.test.ts",
+    "type": "CALLS"
+   },
+   {
+    "to": "it",
+    "from": "tests/users.test.ts",
+    "type": "CALLS",
+    "caller": "describe#arg1"
+   },
+   {
+    "to": "expect",
+    "from": "tests/users.test.ts",
+    "type": "CALLS",
+    "caller": "it#arg1"
+   },
+   {
+    "to": "findUser",
+    "from": "tests/users.test.ts",
+    "type": "CALLS",
+    "caller": "it#arg1"
+   },
+   {
+    "to": "it",
+    "from": "tests/users.test.ts",
+    "type": "CALLS",
+    "caller": "describe#arg1"
+   },
+   {
+    "to": "expect",
+    "from": "tests/users.test.ts",
+    "type": "CALLS",
+    "caller": "it#arg1"
+   },
+   {
+    "to": "findUser",
+    "from": "tests/users.test.ts",
+    "type": "CALLS",
+    "caller": "it#arg1"
+   },
+   {
+    "to": "it",
+    "from": "tests/users.test.ts",
+    "type": "CALLS",
+    "caller": "describe#arg1"
+   },
+   {
+    "to": "expect",
+    "from": "tests/users.test.ts",
+    "type": "CALLS",
+    "caller": "it#arg1"
+   },
+   {
+    "to": "getUser",
+    "from": "tests/users.test.ts",
+    "type": "CALLS",
+    "caller": "expect#arg0"
+   },
+   {
+    "to": "defineConfig",
+    "from": "vitest.config.ts",
+    "type": "CALLS"
+   }
+  ],
+  "sourceFacts": [
+   {
+    "kind": "source",
+    "line": 5,
+    "path": "src/api.ts",
+    "text": "type Handler = (...args: any[]) => unknown;"
+   },
+   {
+    "kind": "source",
+    "line": 16,
+    "path": "src/api.ts",
+    "text": "get(path: string, handler: Handler): void {"
+   },
+   {
+    "kind": "source",
+    "line": 17,
+    "path": "src/api.ts",
+    "text": "this.routes.push({ method: \"GET\", path, handler });"
+   },
+   {
+    "kind": "source",
+    "line": 20,
+    "path": "src/api.ts",
+    "text": "post(path: string, handler: Handler): void {"
+   },
+   {
+    "kind": "source",
+    "line": 21,
+    "path": "src/api.ts",
+    "text": "this.routes.push({ method: \"POST\", path, handler });"
+   },
+   {
+    "kind": "source",
+    "line": 24,
+    "path": "src/api.ts",
+    "text": "list(): Route[] {"
+   },
+   {
+    "kind": "source",
+    "line": 29,
+    "path": "src/api.ts",
+    "text": "export const router = new Router();"
+   },
+   {
+    "kind": "source",
+    "line": 31,
+    "path": "src/api.ts",
+    "text": "router.get(\"/users/:id\", users.getUser);"
+   },
+   {
+    "kind": "source",
+    "line": 32,
+    "path": "src/api.ts",
+    "text": "router.post(\"/payments\", createPayment);"
+   },
+   {
+    "kind": "source",
+    "line": 33,
+    "path": "src/api.ts",
+    "text": "router.get(\"/start\", begin);"
+   },
+   {
+    "kind": "source",
+    "line": 35,
+    "path": "src/api.ts",
+    "text": "export function listRoutes(): Route[] {"
+   },
+   {
+    "kind": "source",
+    "line": 36,
+    "path": "src/api.ts",
+    "text": "return router.list();"
+   },
+   {
+    "kind": "source",
+    "line": 9,
+    "path": "src/audit.ts",
+    "text": "export function auditLog(event: string, ref: string): AuditEntry {"
+   },
+   {
+    "kind": "source",
+    "line": 10,
+    "path": "src/audit.ts",
+    "text": "const entry: AuditEntry = { event, ref, at: new Date().toISOString() };"
+   },
+   {
+    "kind": "source",
+    "line": 11,
+    "path": "src/audit.ts",
+    "text": "TRAIL.push(entry);"
+   },
+   {
+    "kind": "source",
+    "line": 15,
+    "path": "src/audit.ts",
+    "text": "export function auditTrail(): AuditEntry[] {"
+   },
+   {
+    "kind": "source",
+    "line": 19,
+    "path": "src/audit.ts",
+    "text": "// --- Settlement pipeline (simplified end-of-day run) ---"
+   },
+   {
+    "kind": "source",
+    "line": 21,
+    "path": "src/audit.ts",
+    "text": "// delta \u2192 echo \u2192 foxtrot (8 steps, capped)."
+   },
+   {
+    "kind": "source",
+    "line": 23,
+    "path": "src/audit.ts",
+    "text": "export function begin(): void {"
+   },
+   {
+    "kind": "source",
+    "line": 24,
+    "path": "src/audit.ts",
+    "text": "console.log(\"settlement started\");"
+   },
+   {
+    "kind": "source",
+    "line": 25,
+    "path": "src/audit.ts",
+    "text": "alpha();"
+   },
+   {
+    "kind": "source",
+    "line": 28,
+    "path": "src/audit.ts",
+    "text": "function alpha(): void {"
+   },
+   {
+    "kind": "source",
+    "line": 29,
+    "path": "src/audit.ts",
+    "text": "bravo();"
+   },
+   {
+    "kind": "source",
+    "line": 32,
+    "path": "src/audit.ts",
+    "text": "function bravo(): void {"
+   },
+   {
+    "kind": "source",
+    "line": 33,
+    "path": "src/audit.ts",
+    "text": "charlie();"
+   },
+   {
+    "kind": "source",
+    "line": 36,
+    "path": "src/audit.ts",
+    "text": "function charlie(): void {"
+   },
+   {
+    "kind": "source",
+    "line": 37,
+    "path": "src/audit.ts",
+    "text": "delta();"
+   },
+   {
+    "kind": "source",
+    "line": 38,
+    "path": "src/audit.ts",
+    "text": "alpha(); // retry guard: cycle, absorbed by the visited set"
+   },
+   {
+    "kind": "source",
+    "line": 41,
+    "path": "src/audit.ts",
+    "text": "function delta(): void {"
+   },
+   {
+    "kind": "source",
+    "line": 42,
+    "path": "src/audit.ts",
+    "text": "echo();"
+   },
+   {
+    "kind": "source",
+    "line": 43,
+    "path": "src/audit.ts",
+    "text": "zulu();"
+   },
+   {
+    "kind": "source",
+    "line": 44,
+    "path": "src/audit.ts",
+    "text": "void fetch(\"https://example.com/health\"); // external runtime call"
+   },
+   {
+    "kind": "source",
+    "line": 47,
+    "path": "src/audit.ts",
+    "text": "function echo(): void {"
+   },
+   {
+    "kind": "source",
+    "line": 48,
+    "path": "src/audit.ts",
+    "text": "foxtrot();"
+   },
+   {
+    "kind": "source",
+    "line": 51,
+    "path": "src/audit.ts",
+    "text": "function foxtrot(): void {"
+   },
+   {
+    "kind": "source",
+    "line": 52,
+    "path": "src/audit.ts",
+    "text": "charlie(); // back edge: cycle, absorbed by the visited set"
+   },
+   {
+    "kind": "source",
+    "line": 55,
+    "path": "src/audit.ts",
+    "text": "function zulu(): void {"
+   },
+   {
+    "kind": "source",
+    "line": 56,
+    "path": "src/audit.ts",
+    "text": "console.log(\"zulu branch\");"
+   },
+   {
+    "kind": "source",
+    "line": 3,
+    "path": "src/index.ts",
+    "text": "function main(): void {"
+   },
+   {
+    "kind": "source",
+    "line": 4,
+    "path": "src/index.ts",
+    "text": "for (const route of listRoutes()) {"
+   },
+   {
+    "kind": "source",
+    "line": 5,
+    "path": "src/index.ts",
+    "text": "console.log(`${route.method} ${route.path}`);"
+   },
+   {
+    "kind": "source",
+    "line": 9,
+    "path": "src/index.ts",
+    "text": "main();"
+   },
+   {
+    "kind": "source",
+    "line": 3,
+    "path": "src/isolated.ts",
+    "text": "export function isolatedHelper(x: number): number {"
+   },
+   {
+    "kind": "source",
+    "line": 7,
+    "path": "src/isolated.ts",
+    "text": "export function anotherLonelyFunction(): string {"
+   },
+   {
+    "kind": "source",
+    "line": 3,
+    "path": "src/notifications.ts",
+    "text": "export function sendNotification(user: User, message: string): string {"
+   },
+   {
+    "kind": "source",
+    "line": 4,
+    "path": "src/notifications.ts",
+    "text": "const line = `[notify] ${user.email}: ${message}`;"
+   },
+   {
+    "kind": "source",
+    "line": 5,
+    "path": "src/notifications.ts",
+    "text": "console.log(line);"
+   },
+   {
+    "kind": "source",
+    "line": 15,
+    "path": "src/payments.ts",
+    "text": "const seenIdempotencyKeys = new Set<string>();"
+   },
+   {
+    "kind": "source",
+    "line": 17,
+    "path": "src/payments.ts",
+    "text": "export function validatePayment(amountCents: number): void {"
+   },
+   {
+    "kind": "source",
+    "line": 18,
+    "path": "src/payments.ts",
+    "text": "if (!isPositive(amountCents)) {"
+   },
+   {
+    "kind": "source",
+    "line": 19,
+    "path": "src/payments.ts",
+    "text": "throw new Error(`invalid amount: ${amountCents}`);"
+   },
+   {
+    "kind": "source",
+    "line": 23,
+    "path": "src/payments.ts",
+    "text": "export function savePayment(userId: string, amountCents: number): Payment {"
+   },
+   {
+    "kind": "source",
+    "line": 24,
+    "path": "src/payments.ts",
+    "text": "const payment: Payment = {"
+   },
+   {
+    "kind": "source",
+    "line": 25,
+    "path": "src/payments.ts",
+    "text": "id: randomUUID(),"
+   },
+   {
+    "kind": "source",
+    "line": 30,
+    "path": "src/payments.ts",
+    "text": "LEDGER.push(payment);"
+   },
+   {
+    "kind": "source",
+    "line": 34,
+    "path": "src/payments.ts",
+    "text": "export function ledger(): Payment[] {"
+   },
+   {
+    "kind": "source",
+    "line": 38,
+    "path": "src/payments.ts",
+    "text": "// Controlled bug fixture (hubris/buggy-idempotency): the idempotency guard"
+   },
+   {
+    "kind": "source",
+    "line": 39,
+    "path": "src/payments.ts",
+    "text": "// was dropped \u2014 keys are recorded but never checked, so duplicate requests"
+   },
+   {
+    "kind": "source",
+    "line": 40,
+    "path": "src/payments.ts",
+    "text": "// are processed instead of rejected. FORGE demo target: restore the check."
+   },
+   {
+    "kind": "source",
+    "line": 46,
+    "path": "src/payments.ts",
+    "text": "const user = getUser(userId);"
+   },
+   {
+    "kind": "source",
+    "line": 47,
+    "path": "src/payments.ts",
+    "text": "validatePayment(amountCents);"
+   },
+   {
+    "kind": "source",
+    "line": 48,
+    "path": "src/payments.ts",
+    "text": "if (idempotencyKey !== undefined) {"
+   },
+   {
+    "kind": "source",
+    "line": 49,
+    "path": "src/payments.ts",
+    "text": "seenIdempotencyKeys.add(idempotencyKey);"
+   },
+   {
+    "kind": "source",
+    "line": 51,
+    "path": "src/payments.ts",
+    "text": "const payment = savePayment(user.id, amountCents);"
+   },
+   {
+    "kind": "source",
+    "line": 52,
+    "path": "src/payments.ts",
+    "text": "const notice = sendNotification(user, `charged ${formatMoney(amountCents)}`);"
+   },
+   {
+    "kind": "source",
+    "line": 53,
+    "path": "src/payments.ts",
+    "text": "auditLog(\"payment.created\", payment.id);"
+   },
+   {
+    "kind": "source",
+    "line": 12,
+    "path": "src/users.ts",
+    "text": "export function findUser(id: string): User | undefined {"
+   },
+   {
+    "kind": "source",
+    "line": 13,
+    "path": "src/users.ts",
+    "text": "return USERS.find((u) => u.id === id);"
+   },
+   {
+    "kind": "source",
+    "line": 16,
+    "path": "src/users.ts",
+    "text": "export function getUser(id: string): User {"
+   },
+   {
+    "kind": "source",
+    "line": 17,
+    "path": "src/users.ts",
+    "text": "const user = findUser(id);"
+   },
+   {
+    "kind": "source",
+    "line": 18,
+    "path": "src/users.ts",
+    "text": "if (!user) {"
+   },
+   {
+    "kind": "source",
+    "line": 19,
+    "path": "src/users.ts",
+    "text": "throw new Error(`unknown user: ${id}`);"
+   },
+   {
+    "kind": "source",
+    "line": 1,
+    "path": "src/utils.ts",
+    "text": "export function isPositive(n: number): boolean {"
+   },
+   {
+    "kind": "source",
+    "line": 2,
+    "path": "src/utils.ts",
+    "text": "return Number.isFinite(n) && n > 0;"
+   },
+   {
+    "kind": "source",
+    "line": 5,
+    "path": "src/utils.ts",
+    "text": "export function formatMoney(amountCents: number): string {"
+   },
+   {
+    "kind": "source",
+    "line": 9,
+    "path": "src/utils.ts",
+    "text": "}).format(amountCents / 100);"
+   },
+   {
+    "kind": "test",
+    "line": 5,
+    "path": "tests/idempotency-regression.test.ts",
+    "text": "// Behavioral contract: the second call with an already-seen key must throw"
+   },
+   {
+    "kind": "test",
+    "line": 6,
+    "path": "tests/idempotency-regression.test.ts",
+    "text": "// \"Duplicate idempotency key\". Currently FAILS (bug: keys are recorded but"
+   },
+   {
+    "kind": "test",
+    "line": 8,
+    "path": "tests/idempotency-regression.test.ts",
+    "text": "describe(\"idempotency regression (buggy fixture)\", () => {"
+   },
+   {
+    "kind": "test",
+    "line": 9,
+    "path": "tests/idempotency-regression.test.ts",
+    "text": "it(\"rejects a previously seen idempotency key\", () => {"
+   },
+   {
+    "kind": "test",
+    "line": 10,
+    "path": "tests/idempotency-regression.test.ts",
+    "text": "createPayment(\"u-1\", 100, \"regression-k1\");"
+   },
+   {
+    "kind": "test",
+    "line": 11,
+    "path": "tests/idempotency-regression.test.ts",
+    "text": "// Case-insensitive: any duplicate rejection satisfies the contract,"
+   },
+   {
+    "kind": "test",
+    "line": 13,
+    "path": "tests/idempotency-regression.test.ts",
+    "text": "expect(() => createPayment(\"u-1\", 100, \"regression-k1\")).toThrow(/duplicate/i);"
+   },
+   {
+    "kind": "test",
+    "line": 9,
+    "path": "tests/payments.test.ts",
+    "text": "describe(\"validatePayment\", () => {"
+   },
+   {
+    "kind": "test",
+    "line": 10,
+    "path": "tests/payments.test.ts",
+    "text": "it(\"accepts positive amounts\", () => {"
+   },
+   {
+    "kind": "test",
+    "line": 11,
+    "path": "tests/payments.test.ts",
+    "text": "expect(() => validatePayment(100)).not.toThrow();"
+   },
+   {
+    "kind": "test",
+    "line": 14,
+    "path": "tests/payments.test.ts",
+    "text": "it.each([0, -5, Number.NaN])(\"rejects %s\", (amount) => {"
+   },
+   {
+    "kind": "test",
+    "line": 15,
+    "path": "tests/payments.test.ts",
+    "text": "expect(() => validatePayment(amount)).toThrow(\"invalid amount\");"
+   },
+   {
+    "kind": "test",
+    "line": 19,
+    "path": "tests/payments.test.ts",
+    "text": "describe(\"createPayment\", () => {"
+   },
+   {
+    "kind": "test",
+    "line": 20,
+    "path": "tests/payments.test.ts",
+    "text": "it(\"creates a completed payment and notifies\", () => {"
+   },
+   {
+    "kind": "test",
+    "line": 21,
+    "path": "tests/payments.test.ts",
+    "text": "const { payment, notice } = createPayment(\"u-1\", 2500);"
+   },
+   {
+    "kind": "test",
+    "line": 22,
+    "path": "tests/payments.test.ts",
+    "text": "expect(payment.status).toBe(\"completed\");"
+   },
+   {
+    "kind": "test",
+    "line": 23,
+    "path": "tests/payments.test.ts",
+    "text": "expect(payment.amountCents).toBe(2500);"
+   },
+   {
+    "kind": "test",
+    "line": 24,
+    "path": "tests/payments.test.ts",
+    "text": "expect(notice).toContain(\"ada@example.com\");"
+   },
+   {
+    "kind": "test",
+    "line": 25,
+    "path": "tests/payments.test.ts",
+    "text": "expect(notice).toContain(\"$25.00\");"
+   },
+   {
+    "kind": "test",
+    "line": 28,
+    "path": "tests/payments.test.ts",
+    "text": "it(\"rejects unknown users\", () => {"
+   },
+   {
+    "kind": "test",
+    "line": 29,
+    "path": "tests/payments.test.ts",
+    "text": "expect(() => createPayment(\"ghost\", 100)).toThrow(\"unknown user\");"
+   },
+   {
+    "kind": "test",
+    "line": 32,
+    "path": "tests/payments.test.ts",
+    "text": "it(\"rejects duplicate idempotency keys\", () => {"
+   },
+   {
+    "kind": "test",
+    "line": 33,
+    "path": "tests/payments.test.ts",
+    "text": "createPayment(\"u-2\", 100, \"key-1\");"
+   },
+   {
+    "kind": "test",
+    "line": 34,
+    "path": "tests/payments.test.ts",
+    "text": "expect(() => createPayment(\"u-2\", 100, \"key-1\")).toThrow(\"duplicate payment\");"
+   },
+   {
+    "kind": "test",
+    "line": 37,
+    "path": "tests/payments.test.ts",
+    "text": "it(\"savePayment appends to the ledger\", () => {"
+   },
+   {
+    "kind": "test",
+    "line": 38,
+    "path": "tests/payments.test.ts",
+    "text": "const payment = savePayment(\"u-1\", 50);"
+   },
+   {
+    "kind": "test",
+    "line": 39,
+    "path": "tests/payments.test.ts",
+    "text": "expect(payment.id).toBeTruthy();"
+   },
+   {
+    "kind": "test",
+    "line": 43,
+    "path": "tests/payments.test.ts",
+    "text": "describe(\"sendNotification\", () => {"
+   },
+   {
+    "kind": "test",
+    "line": 44,
+    "path": "tests/payments.test.ts",
+    "text": "it(\"formats the message\", () => {"
+   },
+   {
+    "kind": "test",
+    "line": 45,
+    "path": "tests/payments.test.ts",
+    "text": "const line = sendNotification("
+   },
+   {
+    "kind": "test",
+    "line": 49,
+    "path": "tests/payments.test.ts",
+    "text": "expect(line).toBe(\"[notify] t@example.com: hello\");"
+   },
+   {
+    "kind": "test",
+    "line": 4,
+    "path": "tests/users.test.ts",
+    "text": "describe(\"users\", () => {"
+   },
+   {
+    "kind": "test",
+    "line": 5,
+    "path": "tests/users.test.ts",
+    "text": "it(\"finds a seeded user\", () => {"
+   },
+   {
+    "kind": "test",
+    "line": 6,
+    "path": "tests/users.test.ts",
+    "text": "expect(findUser(\"u-1\")?.name).toBe(\"Ada Lovelace\");"
+   },
+   {
+    "kind": "test",
+    "line": 9,
+    "path": "tests/users.test.ts",
+    "text": "it(\"returns undefined for unknown ids\", () => {"
+   },
+   {
+    "kind": "test",
+    "line": 10,
+    "path": "tests/users.test.ts",
+    "text": "expect(findUser(\"nope\")).toBeUndefined();"
+   },
+   {
+    "kind": "test",
+    "line": 13,
+    "path": "tests/users.test.ts",
+    "text": "it(\"getUser throws for unknown ids\", () => {"
+   },
+   {
+    "kind": "test",
+    "line": 14,
+    "path": "tests/users.test.ts",
+    "text": "expect(() => getUser(\"nope\")).toThrow(\"unknown user: nope\");"
+   }
+  ]
+ }
+}

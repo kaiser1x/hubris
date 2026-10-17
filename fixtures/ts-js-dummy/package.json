@@ -1,0 +1,10 @@
+{
+  "name": "ts-js-dummy-fixture",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "vitest run",
+    "build": "tsc",
+    "typecheck": "tsc --noEmit"
+  }
+}

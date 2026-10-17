@@ -235,6 +235,20 @@ describe("GET /api/analyze", () => {
     const res = await app.request("/api/analyze?repo=octocat/nope");
     expect(res.status).toBe(404);
   });
+
+  // `repo` is interpolated into an AUTHENTICATED api.github.com path (the
+  // server GITHUB_TOKEN is attached). Anything but a plain owner/name could
+  // steer that token to another endpoint, e.g. "../user" normalizes to /user.
+  it.each(["../user", "..", "octocat/../../user", "a/b/c", "octocat", "octocat/Hello World", "octocat/%2e%2e", "./x", "owner/..", "/etc/passwd"])(
+    "rejects a non owner/name repo before any GitHub call: %s",
+    async (repo) => {
+      const fetchMock = vi.fn(async () => new Response("{}", { status: 200 }));
+      vi.stubGlobal("fetch", fetchMock);
+      const res = await app.request(`/api/analyze?repo=${encodeURIComponent(repo)}`);
+      expect(res.status).toBe(400);
+      expect(fetchMock).not.toHaveBeenCalled();
+    }
+  );
 });
 
 describe("POST /api/analyze validation", () => {

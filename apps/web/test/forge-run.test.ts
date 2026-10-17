@@ -29,6 +29,7 @@ import {
   LEGACY_VERIFY_PATH,
   SHIP_PATH,
   shipEligible,
+  targetVerificationMark,
   shipRepairHref,
   buildShipBody,
   shipBranchPreview,
@@ -793,6 +794,60 @@ describe("investigation agent view-model (RAG)", () => {
     expect(prepared.body.clarification).toBe("Yes, the total.");
   });
 
+  it("parses structured clarification options with stable ids (legacy strings keep working)", () => {
+    const view = toInvestigation({
+      status: "AMBIGUOUS",
+      investigationId: "inv-4",
+      jobId: "job-1",
+      state: "CLARIFICATION_NEEDED",
+      clarification: {
+        questionId: "q_abc",
+        question: "Which test matches?",
+        options: [
+          { id: "opt_1", label: "\"rejects unknown users\" (tests/payments.test.ts)" },
+          { id: "", label: "dropped: no id" },
+          "legacy label",
+        ],
+      },
+    });
+    expect(view?.clarification?.questionId).toBe("q_abc");
+    expect(view?.clarification?.options).toEqual([
+      { id: "opt_1", label: "\"rejects unknown users\" (tests/payments.test.ts)" },
+      { id: "legacy label", label: "legacy label" },
+    ]);
+  });
+
+  it("parses a blocked state with a specific next step, and drops a partial one", () => {
+    const blocked = toInvestigation({
+      status: "AMBIGUOUS",
+      investigationId: "inv-5",
+      jobId: "job-1",
+      state: "AMBIGUOUS",
+      blocked: { code: "NO_TEST_SCENARIO", reason: "No test exercises f.", nextStep: "Name the test." },
+    });
+    expect(blocked?.blocked).toEqual({ code: "NO_TEST_SCENARIO", reason: "No test exercises f.", nextStep: "Name the test." });
+    const partial = toInvestigation({ status: "AMBIGUOUS", investigationId: "inv-6", jobId: "job-1", blocked: { code: "X" } });
+    expect(partial?.blocked).toBeNull();
+  });
+
+  it("builds a structured answer body from stable ids (no free text)", () => {
+    const prepared = buildInvestigateBody("job-1", "Users cannot be found sometimes.", {
+      priorInvestigationId: "inv-2",
+      questionId: "q_abc",
+      optionId: "opt_1",
+    });
+    expect(prepared.ok).toBe(true);
+    if (!prepared.ok) return;
+    expect(prepared.body.priorInvestigationId).toBe("inv-2");
+    expect(prepared.body.answer).toEqual({ questionId: "q_abc", optionId: "opt_1" });
+    expect("clarification" in prepared.body).toBe(false);
+  });
+
+  it("refuses to build a structured answer that lost its question identity", () => {
+    const prepared = buildInvestigateBody("job-1", "x", { priorInvestigationId: "", questionId: "q", optionId: "o" });
+    expect(prepared.ok).toBe(false);
+  });
+
   it("omits clarification fields for a fresh report", () => {
     const prepared = buildInvestigateBody("job-1", "duplicate keys accepted");
     expect(prepared.ok).toBe(true);
@@ -1039,6 +1094,30 @@ describe("SHIP (eligibility, body, preview)", () => {
     expect(shipEligible(runWith({ state: "VERIFICATION_INCOMPLETE", targetVerificationPassed: null })).eligible).toBe(false);
     expect(shipEligible(runWith({ state: "REPAIR_VERIFIED", targetVerificationPassed: true }, false)).eligible).toBe(false);
     expect(shipEligible(runWith(null)).eligible).toBe(false);
+  });
+
+  it("REPAIR_VERIFIED requires a confirmed target pass (null/missing/false block)", () => {
+    const missing = shipEligible(runWith({ state: "REPAIR_VERIFIED", fullSuitePassed: false }));
+    expect(missing.eligible).toBe(false);
+    expect(missing.reason).toContain("Target verification must pass");
+    expect(shipEligible(runWith({ state: "REPAIR_VERIFIED", targetVerificationPassed: null })).eligible).toBe(false);
+    expect(shipEligible(runWith({ state: "REPAIR_VERIFIED", targetVerificationPassed: false })).eligible).toBe(false);
+  });
+
+  it("FULL_SUITE_PASSED without a targeted run stays eligible (suite proves it)", () => {
+    expect(
+      shipEligible(runWith({ state: "FULL_SUITE_PASSED", targetVerificationPassed: null, fullSuitePassed: true })).eligible
+    ).toBe(true);
+    expect(
+      shipEligible(runWith({ state: "FULL_SUITE_PASSED", targetVerificationPassed: false, fullSuitePassed: true })).eligible
+    ).toBe(false);
+  });
+
+  it("never renders a missing target result as a pass", () => {
+    expect(targetVerificationMark(true)).toBe("✓");
+    expect(targetVerificationMark(false)).toBe("✗");
+    expect(targetVerificationMark(null)).toBe("—");
+    expect(targetVerificationMark(undefined)).toBe("—");
   });
 
   it("requires both ids for the ship request body", () => {

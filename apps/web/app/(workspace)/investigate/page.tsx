@@ -73,14 +73,22 @@ function InvestigatePageContent() {
     };
   }, [jobId, requestedJobId, requestedInvestigationId]);
 
-  async function investigate(answer?: string) {
+  async function investigate(option?: { id: string; label: string }) {
     if (!jobId || busy) return;
-    const priorQuestion = result?.clarification?.question ?? "";
-    const prepared = buildInvestigateBody(
-      jobId,
-      focus,
-      answer ? { priorQuestion, answer } : undefined
-    );
+    const asked = result?.clarification ?? null;
+    // Prefer the structured answer (stable question/option ids validated by
+    // the API); fall back to free text only for legacy runs without ids.
+    const clarification =
+      option && asked?.questionId && result?.investigationId
+        ? {
+            priorInvestigationId: result.investigationId,
+            questionId: asked.questionId,
+            optionId: option.id,
+          }
+        : option
+          ? { priorQuestion: asked?.question ?? "", answer: option.label }
+          : undefined;
+    const prepared = buildInvestigateBody(jobId, focus, clarification);
     if (!prepared.ok) {
       setError(prepared.error);
       return;
@@ -108,7 +116,15 @@ function InvestigatePageContent() {
       }
       const parsed = response.ok ? toInvestigation(data) : null;
       if (!parsed) {
-        setError(describeInvestigationFailure(response.status, INVESTIGATE_PATH, data));
+        // A rejected clarification answer carries a controlled, user-safe
+        // explanation (stale question, changed description, ...).
+        const body = (typeof data === "object" && data !== null ? data : {}) as {
+          state?: unknown;
+          error?: unknown;
+        };
+        const rejected =
+          body.state === "STALE_CLARIFICATION" && typeof body.error === "string" ? body.error : null;
+        setError(rejected ?? describeInvestigationFailure(response.status, INVESTIGATE_PATH, data));
       } else {
         setResult(parsed);
         if (canReviewInvestigation(parsed)) {
@@ -221,13 +237,13 @@ function InvestigatePageContent() {
               <div className="mt-3 flex flex-col gap-2 max-w-xl">
                 {result.clarification.options.map((option) => (
                   <button
-                    key={option}
+                    key={option.id}
                     type="button"
                     disabled={busy || !jobId}
                     onClick={() => void investigate(option)}
                     className="text-left border border-[#0A0A0A] px-4 py-3 font-mono text-[11px] leading-5 hover:bg-white active:scale-[0.99] disabled:opacity-40"
                   >
-                    {option}
+                    {option.label}
                   </button>
                 ))}
               </div>
@@ -261,7 +277,14 @@ function InvestigatePageContent() {
               )}
             </>
           ) : (
-            <p className="font-mono text-[13px] leading-6 text-[#7A7171] mt-3">{result.message}</p>
+            <>
+              <p className="font-mono text-[13px] leading-6 text-[#7A7171] mt-3">
+                {result.blocked?.reason ?? result.message}
+              </p>
+              {result.blocked && (
+                <p className="font-mono text-[12px] leading-6 mt-3">Next step: {result.blocked.nextStep}</p>
+              )}
+            </>
           )}
         </section>
       )}

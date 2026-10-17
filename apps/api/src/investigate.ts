@@ -97,6 +97,10 @@ export interface InvestigationPlan {
     sourceEvidence: string[];
     relevantAssertions: string[];
     conditionOperationAreDistinct: boolean;
+    // Additive: whether relevantCondition is a real guard for the reported
+    // behavior, or only an enclosing presence check (the rejecting check is
+    // missing from the source).
+    conditionKind?: "causal-guard" | "presence-precondition";
   };
   constraints: string[];
   evidence: string[];
@@ -107,9 +111,21 @@ export interface InvestigationPlan {
   confidence: "low" | "medium" | "high";
 }
 
+// Why an investigation could not establish a repair contract. Lets callers
+// tell a genuinely askable ambiguity (several viable interpretations) from a
+// hard evidence gap that no answer can fix.
+export type AmbiguityCode =
+  | "CONTRADICTORY_REPORT"
+  | "NO_TEST_SCENARIO"
+  | "SCENARIO_DOES_NOT_EXERCISE_TARGET"
+  | "SCENARIO_ASSERTS_NOTHING"
+  | "CONTRACT_NOT_GROUNDED"
+  | "TARGET_UNRESOLVED"
+  | "EVIDENCE_UNRESOLVED";
+
 export type InvestigationResult =
   | { status: "READY"; plan: InvestigationPlan; message: string }
-  | { status: "AMBIGUOUS"; plan: null; message: string }
+  | { status: "AMBIGUOUS"; plan: null; message: string; code?: AmbiguityCode }
   | { status: "NO_MATCH"; plan: null; message: string };
 
 
@@ -129,60 +145,197 @@ interface ReportClaim {
   expectedPositive: Set<string>;
   expectedNegated: Set<string>;
   expectedText: string;
+  // The report's own expectation, original case, label stripped and bounded —
+  // quoted verbatim in the plan so the user's stronger requirements survive.
+  expectedOriginal: string;
+  // Message-like quoted strings inside the expectation ("duplicate payment for
+  // key"): error text the USER requires, independent of any test substring.
+  expectedMessages: string[];
+  // The report's own description of the CURRENT behavior (original case,
+  // labels stripped, directives and the expectation excluded), bounded.
+  observedOriginal: string;
   contradictory: boolean;
 }
 
+
+// Sentences that instruct the investigator ("Investigate why…", "Do not guess…",
+// "Preserve the existing error messages") are directives, not statements of
+// expected behavior. They must never be read as the report's expectation.
+const DIRECTIVE_VERBS = new Set([
+  "investigate", "trace", "examine", "identify", "find", "determine", "explain",
+  "analyze", "analyse", "inspect", "review", "use", "do", "don't", "dont",
+  "keep", "preserve", "ensure", "make", "show", "list", "report", "look",
+  "check", "verify", "confirm", "describe", "locate", "focus", "avoid",
+  "never", "only", "please", "also", "note",
+]);
+
+// Words that sequence an expectation ("accept the FIRST request and reject
+// the SECOND"). A positive and a rejecting outcome in one clause are only a
+// contradiction when nothing orders them.
+const SEQUENCING_WORDS =
+  /\b(first|second|third|subsequent|subsequently|initial|initially|later|then|next|original|originally|otherwise|until|unless|afterwards?|thereafter)\b/;
+
+function splitSentences(text: string): string[] {
+  return text
+    .split(/(?<=[.!?])\s+|\n+/)
+    .map((sentence) => sentence.trim())
+    .filter((sentence) => sentence.length > 0);
+}
+
+function isDirectiveSentence(sentence: string): boolean {
+  const first =
+    sentence
+      .toLowerCase()
+      .replace(/^[\s\-*•>"'`(\d.)]+/, "")
+      .split(/[^a-z']+/)[0] ?? "";
+  return DIRECTIVE_VERBS.has(first);
+}
+
+const EXPECTATION_MARKER_RE = /\b(should|must|ought|ideally|expected|needs?|requires?|wants?)\b/;
+const INSTEAD_RE = /\binstead(?:\s+of)?\b/;
+
+// Concept sets for one expectation clause. Negation applies to the next
+// concept-bearing token ("should not be usable after it expires" negates
+// "expires", not the intervening function words).
+function expectationConcepts(clause: string): { positive: Set<string>; negated: Set<string> } {
+  const positive = new Set<string>();
+  const negated = new Set<string>();
+  let pendingNegation = false;
+  for (const token of tokensForMatch(clause)) {
+    if (NEGATION_WORDS.has(token)) {
+      pendingNegation = true;
+      continue;
+    }
+    if (STOPWORDS.has(token)) continue;
+    let added = false;
+    for (const concept of conceptsFor(token)) {
+      if (pendingNegation) negated.add(concept);
+      else positive.add(concept);
+      added = true;
+    }
+    if (added) pendingNegation = false;
+  }
+  return { positive, negated };
+}
+
+// "Expected behavior: the second call must throw…" → the clause after the
+// label, bounded for display.
+function cleanExpectation(text: string): string {
+  const cleaned = text
+    .replace(/^[\s:,-]*(?:behaviou?r|result|outcome)\b[\s:,-]*(?:is\s+)?(?:to\s+)?/i, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  return cleaned.length > 240 ? `${cleaned.slice(0, 237)}...` : cleaned;
+}
+
+// "Bug: … Current behavior: Calling f() twice creates another payment." →
+// the observed clauses without their labels, whitespace collapsed, bounded.
+function cleanObserved(parts: string[]): string {
+  const cleaned = parts
+    .map((p) => p.replace(/^[\s]*(?:bug|issue|problem|current behaviou?r|actual(?: behaviou?r)?|observed(?: behaviou?r)?)\s*[:-]\s*/i, "").replace(/\s+/g, " ").trim())
+    .filter((p) => p.length > 0);
+  const text = cleaned.join(" ");
+  return text.length > 200 ? `${text.slice(0, 197)}...` : text;
+}
+
+// Quoted strings that read like user-facing message text (multi-word, no code
+// punctuation): the error wording the USER requires. Identifiers, calls, and
+// paths in backticks are not messages.
+function messageLikeQuotes(text: string): string[] {
+  const out: string[] = [];
+  const re = /`([^`]+)`|"([^"]+)"|“([^”]+)”/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    const q = (m[1] ?? m[2] ?? m[3] ?? "").trim();
+    if (q.length < 5 || !/\s/.test(q)) continue;
+    if (/[(){}\/]|\.[a-z]{1,4}$/i.test(q)) continue;
+    if (!out.includes(q)) out.push(q);
+  }
+  return out.slice(0, 3);
+}
 
 function parseClaim(focus: string): ReportClaim {
   const lower = focus.toLowerCase();
   const allTokens = contentTokens(lower);
   const behaviorConcepts = conceptsFor(lower);
 
-  // The expectation portion: the "should/must" clause when one exists,
-  // otherwise the clause after "instead of" (which names the desired
-  // outcome, e.g. "accepted instead of rejected"). The part before
-  // "instead of" describes the current/observed behavior.
-  const insteadRe = /\binstead(?:\s+of)?\b/;
-  const insteadIdx = insteadRe.exec(lower)?.index ?? -1;
-  const primaryEnd = insteadIdx >= 0 ? insteadIdx : lower.length;
-  const primary = lower.slice(0, primaryEnd);
-  const markerRe = /\b(should|must|ought|ideally|expected|needs?|requires?|wants?)\b/g;
-  let expectedStart = -1;
-  let m: RegExpExecArray | null;
-  while ((m = markerRe.exec(primary)) !== null) expectedStart = m.index + m[0].length;
-  let expectedText = "";
-  if (expectedStart >= 0) {
-    expectedText = primary.slice(expectedStart);
-  } else if (insteadIdx >= 0) {
-    expectedText = lower.slice(insteadIdx + (insteadRe.exec(lower)?.[0]?.length ?? "instead of".length));
-  }
-  const expectedRawTokens = tokensForMatch(expectedText);
-  const expectedPositive = new Set<string>();
-  const expectedNegated = new Set<string>();
-  let pendingNegation = false;
-  for (const token of expectedRawTokens) {
-    if (NEGATION_WORDS.has(token)) {
-      pendingNegation = true;
+  // Decompose the report SENTENCE by sentence. The expectation is the
+  // "should/must/expected" clause of a non-directive sentence, or — when the
+  // sentence has no such marker — the clause after "instead of" (which names
+  // the desired outcome, e.g. "accepted instead of rejected"). It never spans
+  // sentences, so trailing investigation instructions cannot leak into it.
+  // Everything else (the part before the marker / "instead of", and
+  // directive sentences) describes the current/observed behavior.
+  const expectedSegments: string[] = [];
+  // Original-case expectation text, split by where it came from: an explicit
+  // "should / must / expected" clause is the user's stated expectation; the
+  // tail after "instead of" is only a fallback when there is none.
+  const markerOriginals: string[] = [];
+  const insteadOriginals: string[] = [];
+  const observedOriginals: string[] = [];
+  const observedParts: string[] = [];
+  for (const sentence of splitSentences(focus)) {
+    const s = sentence.toLowerCase();
+    if (isDirectiveSentence(sentence)) {
+      observedParts.push(s);
       continue;
     }
-    // Skip fillers while keeping negation state ("should not be usable after
-    // it expires" negates "expires", not the intervening function words).
-    if (STOPWORDS.has(token)) continue;
-    let added = false;
-    for (const concept of conceptsFor(token)) {
-      if (pendingNegation) expectedNegated.add(concept);
-      else expectedPositive.add(concept);
-      added = true;
+    const observedOriginal = (to: number) =>
+      (sentence.length === s.length ? sentence : s).slice(0, to);
+    const insteadMatch = INSTEAD_RE.exec(s);
+    const insteadIdx = insteadMatch?.index ?? -1;
+    const insteadTail = insteadMatch ? s.slice(insteadIdx + insteadMatch[0].length) : "";
+    const primary = insteadIdx >= 0 ? s.slice(0, insteadIdx) : s;
+    const marker = EXPECTATION_MARKER_RE.exec(primary);
+    // Original-case slice of the same range (lowercasing can, rarely, change
+    // length; then fall back to the lowercase text rather than misalign).
+    const original = (from: number, to?: number) =>
+      sentence.length === s.length ? sentence.slice(from, to) : s.slice(from, to);
+    if (marker) {
+      const from = marker.index + marker[0].length;
+      observedParts.push(primary.slice(0, marker.index));
+      observedOriginals.push(observedOriginal(marker.index));
+      expectedSegments.push(primary.slice(from));
+      markerOriginals.push(original(from, primary.length));
+      if (insteadIdx >= 0) observedParts.push(insteadTail);
+    } else if (insteadIdx >= 0) {
+      const from = insteadIdx + (insteadMatch?.[0].length ?? 0);
+      observedParts.push(primary);
+      expectedSegments.push(insteadTail);
+      observedOriginals.push(observedOriginal(primary.length));
+      insteadOriginals.push(original(from));
+    } else {
+      observedParts.push(s);
+      observedOriginals.push(observedOriginal(s.length));
     }
-    if (added) pendingNegation = false;
   }
+  const expectedText = expectedSegments.join(" ").trim();
+  const expectedOriginal = cleanExpectation(
+    (markerOriginals.length > 0 ? markerOriginals : insteadOriginals).map(cleanExpectation).join(" ")
+  );
+  const expectedMessages = messageLikeQuotes(expectedOriginal);
+  const observedOriginal = cleanObserved(observedOriginals);
 
-  // Contradiction: the expectation both demands an affirmative outcome and
-  // rejects one (e.g. "should create another payment and also reject the
+  const expectedPositive = new Set<string>();
+  const expectedNegated = new Set<string>();
+  // Contradiction: ONE expectation clause both demands an affirmative outcome
+  // and rejects it (e.g. "should create another payment and also reject the
   // retry"), or asserts the same concept both positively and under negation.
-  const contradictory =
-    (expectedPositive.has("create") && expectedPositive.has("reject")) ||
-    [...expectedPositive].some((c) => expectedNegated.has(c));
+  // A current-vs-expected difference is the bug itself, never a contradiction.
+  let contradictory = false;
+  for (const segment of expectedSegments) {
+    for (const clause of segment.split(/;|\bbut\b/)) {
+      const { positive, negated } = expectationConcepts(clause);
+      for (const c of positive) expectedPositive.add(c);
+      for (const c of negated) expectedNegated.add(c);
+      if (
+        (positive.has("create") && positive.has("reject") && !SEQUENCING_WORDS.test(clause)) ||
+        [...positive].some((c) => negated.has(c))
+      ) {
+        contradictory = true;
+      }
+    }
+  }
 
   // Subject tokens: report content words that are not pure behavior words.
   // They name the entity/operation the report is about and drive candidate
@@ -211,13 +364,13 @@ function parseClaim(focus: string): ReportClaim {
   // expectation ("should not be usable after it expires") also describes the
   // observed problem (the token currently IS usable after expiry), so its
   // concepts stay observed too.
-  const observedText = expectedStart >= 0 ? primary.slice(0, expectedStart) : primary;
+  const observedText = observedParts.join(" ");
   const observedConcepts = new Set([
     ...conceptsFor(observedText),
     ...expectedNegated,
   ]);
 
-  return { subjectTokens, entityTokens, behaviorConcepts, observedConcepts, expectedPositive, expectedNegated, expectedText, contradictory };
+  return { subjectTokens, entityTokens, behaviorConcepts, observedConcepts, expectedPositive, expectedNegated, expectedText, expectedOriginal, expectedMessages, observedOriginal, contradictory };
 }
 
 // ---- Test scenario reconstruction ----
@@ -371,6 +524,24 @@ export interface RelevantEvidence {
   observedFacts: TwinSourceFactInput[];
   expectedFacts: TwinSourceFactInput[];
   errorParts: string[];
+  // How the selected condition relates to the reported behavior:
+  //   causal-guard           a real guard (or no throw is expected) — as before
+  //   presence-precondition  a throw is expected, no source throw produces it,
+  //                          and the only enclosing guard merely tests that a
+  //                          value is present: the rejecting check is MISSING
+  conditionKind: "causal-guard" | "presence-precondition";
+  // The source throw (in the selected functions) whose text matches an
+  // asserted error part; null when none exists.
+  rejectionPath: TwinSourceFactInput | null;
+  // Does the selected write concern what the report is about?
+  operationRelevant: boolean;
+  // Statement-level calls after the write in the same function: effects a
+  // rejected request must not reach.
+  laterEffectNames: string[];
+  // Error wording the USER requires (quoted in the report's expectation).
+  userErrorTexts: string[];
+  // The report's own expectation clause (verbatim, bounded).
+  reportExpectation: string;
 }
 
 const GUARD_PATTERN = /\bif\s*\(|\.has\s*\(|!==|===|!=\s*undefined|throw|\.includes\(/i;
@@ -500,16 +671,59 @@ export function evidenceFromScenarios(
   // function never re-searches the repository for other source facts.
   const sourceFactsRelevant = [...scopedFacts]
     .filter((f) => f.kind !== "test")
-    .sort((a, b) => (a.line ?? 0) - (b.line ?? 0));
+    .sort(compareFactLocation);
+  // What the write must relate to: the report's own words PLUS the selected
+  // scenarios (their descriptions and facts, minus the target's own name and
+  // test boilerplate). A vague report still gets grounded by the scenario the user
+  // picked, but a write sharing nothing with either is never "the" operation.
+  const targetTokens = new Set(splitIdentifier(target.name ?? ""));
+  const scenarioWords = new Set<string>();
+  for (const sc of [primaryScenario, ...orderedScenarios.slice(0, 3)]) {
+    if (!sc) continue;
+    for (const t of contentTokens([sc.description, ...sc.facts.map(factText)].join(" "))) {
+      if (!targetTokens.has(t) && !TEST_BOILERPLATE.has(t)) scenarioWords.add(t);
+    }
+  }
+  const relevanceClaim: ReportClaim = { ...claim, entityTokens: new Set([...claim.entityTokens, ...scenarioWords]) };
   const selection = selectCausalOperation(
     valueAssertions,
     sourceFactsRelevant,
     target,
     opts.functions ?? [],
-    opts.selectedFunctionNames ?? new Set<string>()
+    opts.selectedFunctionNames ?? new Set<string>(),
+    relevanceClaim
   );
   const operationFacts = selection.operation ? [selection.operation] : [];
-  const conditionFacts = selection.condition ? [selection.condition] : [];
+  // Is the rejection the test asserts already produced by the selected source?
+  // A source `throw` whose text matches an asserted error part is the real
+  // rejecting path; without one, the check the test needs is MISSING and an
+  // enclosing guard that merely tests presence must not be mistaken for it.
+  const rejectionPath =
+    errorParts.length > 0
+      ? sourceFactsRelevant.find(
+          (f) => THROW_STATEMENT.test(factText(f)) && errorParts.some((part) => errorPartMatches(part, factText(f)))
+        ) ?? null
+      : null;
+  // When the source does throw the asserted error, the condition that matters
+  // is the guard governing THAT throw — even if it sits after the write the
+  // generic "closest guard before the write" rule looked at.
+  let condition = selection.condition;
+  let conditionFunction = selection.conditionFunction;
+  if (rejectionPath) {
+    const throwFn = functionContaining(rejectionPath, opts.functions ?? []);
+    const governing = sourceFactsRelevant.filter(
+      (f) =>
+        throwFn !== null &&
+        factInFunction(f, throwFn) &&
+        isGuardFact(factText(f)) &&
+        (f.line ?? 0) < (rejectionPath.line ?? 0)
+    );
+    if (governing.length > 0) {
+      condition = governing[governing.length - 1];
+      conditionFunction = throwFn;
+    }
+  }
+  const conditionFacts = condition ? [condition] : [];
   // The evidence window shown for the contract is the operation's function up
   // to the operation, plus the condition's function up to the condition — not
   // an arbitrary prefix of unrelated guards.
@@ -524,8 +738,8 @@ export function evidenceFromScenarios(
       : [];
   const sourceSelectionFacts = dedupeKeepOrder([
     ...windowFor(selection.operationFunction, selection.operation?.line),
-    ...windowFor(selection.conditionFunction, selection.condition?.line),
-  ]).sort((a, b) => (a.line ?? 0) - (b.line ?? 0));
+    ...windowFor(conditionFunction, condition?.line),
+  ]).sort(compareFactLocation);
   const scenarioFacts = primaryScenario?.facts ?? [];
   const actionIndex = primaryScenario
     ? scenarioFacts.findIndex((fact) => new RegExp(`\\b${escapeRe(target.name ?? "")}\\s*\\(`).test(factText(fact)))
@@ -537,6 +751,26 @@ export function evidenceFromScenarios(
   ).filter((fact) => assertionRelevant(factText(fact), claim, target.name ?? "", knownFunctions));
   const expectedFacts = relevantAssertions;
   const observedFacts = sourceFactsRelevant.filter((fact) => /\b(?:wrong|incorrect|unexpected|bug|fails?|instead)\b/i.test(factText(fact)));
+  const conditionKind: RelevantEvidence["conditionKind"] =
+    errorParts.length > 0 &&
+    !rejectionPath &&
+    condition !== null &&
+    isPresenceCheck(factText(condition))
+      ? "presence-precondition"
+      : "causal-guard";
+  // Effects after the write that a rejected request must not reach: the
+  // callee of each later statement-level call in the write's own function.
+  const laterEffectNames: string[] = [];
+  if (selection.operation && selection.operationFunction) {
+    const opLine = selection.operation.line ?? 0;
+    for (const f of sourceFactsRelevant) {
+      if (!factInFunction(f, selection.operationFunction) || (f.line ?? 0) <= opLine) continue;
+      const callee = factText(f).match(/^\s*(?:(?:const|let|var)\s+[\w$]+\s*=\s*|[\w$.]+\s*=\s*)?(?:await\s+)?([A-Za-z_$][\w$]*)\s*\(/)?.[1];
+      if (callee && knownFunctions.has(callee) && callee !== target.name && !laterEffectNames.includes(callee)) {
+        laterEffectNames.push(callee);
+      }
+    }
+  }
   if (process.env.HUBRIS_DEBUG_INVESTIGATE) {
     console.error("[investigate] contract facts", {
       actionIndex,
@@ -561,6 +795,12 @@ export function evidenceFromScenarios(
     observedFacts,
     expectedFacts,
     errorParts,
+    conditionKind,
+    rejectionPath,
+    operationRelevant: selection.operation ? writeRelevantToClaim(factText(selection.operation), relevanceClaim) : false,
+    laterEffectNames: laterEffectNames.slice(0, 3),
+    userErrorTexts: claim.expectedMessages,
+    reportExpectation: claim.expectedOriginal,
   };
 }
 
@@ -721,17 +961,91 @@ interface CausalSelection {
   conditionFunction: TwinFunctionInput | null;
 }
 
+// Stable source order: by file, then line. Never compares line numbers of
+// different files.
+function compareFactLocation(a: TwinSourceFactInput, b: TwinSourceFactInput): number {
+  const pa = a.path ?? "";
+  const pb = b.path ?? "";
+  if (pa !== pb) return pa < pb ? -1 : 1;
+  return (a.line ?? 0) - (b.line ?? 0);
+}
+
 // Operation = the selected assignment to the asserted subject, else the first
 // selected mutation. Condition = a guard in a SELECTED helper the operation
 // calls, else the closest guard before the operation in its own function.
+// Verbs of the write itself carry no subject information.
+const WRITE_WORDS = new Set(["add", "set", "push", "save", "delete", "remove", "unshift", "splice", "new"]);
+
+// Does a write concern what the report is about? True when an identifier in
+// the statement shares a content word with the report (idempotency / key ↔
+// seenIdempotencyKeys.add(idempotencyKey)); an unrelated write (LEDGER.push)
+// shares none.
+function writeRelevantToClaim(text: string, claim: ReportClaim): boolean {
+  for (const token of tokensForMatch(text)) {
+    if (token.length < 3 || STOPWORDS.has(token) || WRITE_WORDS.has(token)) continue;
+    for (const entity of claim.entityTokens) {
+      if (entity.length >= 3 && tokensMatch(token, entity)) return true;
+    }
+  }
+  return false;
+}
+
+// A guard that only tests whether a value is PRESENT (`x !== undefined`,
+// `x != null`, `!x`, `typeof x !== "undefined"`). It decides nothing about
+// whether the value was used before.
+function isPresenceCheck(guardText: string): boolean {
+  const m = guardText.match(/\bif\s*\((.*)\)/);
+  if (!m) return false;
+  const expr = m[1].trim();
+  const id = "[A-Za-z_$][\\w$]*(?:\\??\\.[A-Za-z_$][\\w$]*)*";
+  return (
+    new RegExp(`^!{0,2}\\s*${id}$`).test(expr) ||
+    new RegExp(`^${id}\\s*(?:!==|!=|===|==)\\s*(?:undefined|null)$`).test(expr) ||
+    new RegExp(`^typeof\\s+${id}\\s*(?:!==|!=|===|==)\\s*["']undefined["']$`).test(expr)
+  );
+}
+
+// Does an asserted error part (a string or a /regex/flags literal from
+// `toThrow(...)`) match this source text?
+function errorPartMatches(part: string, text: string): boolean {
+  const re = part.match(/^\/(.+)\/([a-z]*)$/);
+  if (re) {
+    try {
+      return new RegExp(re[1], re[2]).test(text);
+    } catch {
+      return false;
+    }
+  }
+  const literal = part.replace(/^["'`]|["'`]$/g, "");
+  return literal.length > 0 && text.includes(literal);
+}
+
+const TEST_BOILERPLATE = new Set(["expect", "tothrow", "throw", "throws", "describe", "test", "each", "not", "tobe", "toequal", "tocontain"]);
+// `expect(() => f(1)).toThrow("x")` → `the repository test expects f(1) to throw "x"`
+// (shorter than the raw assertion, which the contract carries verbatim anyway).
+function describeThrowAssertion(assertion: string): string {
+  const m = assertion.match(/expect\(\s*\(\)\s*=>\s*(.+?)\s*\)\s*\.toThrow\(\s*(.*?)\s*\)\s*;?\s*$/);
+  return m ? `the repository test expects ${m[1]} to throw ${m[2] || "an error"}` : `the repository test asserts ${assertion}`;
+}
+
+const THROW_STATEMENT = /\bthrow\s+new\b|^\s*throw\b/;
+
 function selectCausalOperation(
   valueAssertions: TwinSourceFactInput[],
   scopedFacts: TwinSourceFactInput[],
   target: TwinFunctionInput,
   functions: TwinFunctionInput[],
-  selectedFunctionNames: Set<string>
+  selectedFunctionNames: Set<string>,
+  claim?: ReportClaim
 ): CausalSelection {
-  const sorted = [...scopedFacts].sort((a, b) => (a.line ?? 0) - (b.line ?? 0));
+  // Facts from the TARGET function come first: its own writes and guards are
+  // the causal chain. Callee facts (other functions, other files) follow, and
+  // line numbers only order facts WITHIN a file — comparing line numbers
+  // across files let an unrelated helper's early line win over the target.
+  const sorted = [...scopedFacts].sort((a, b) => {
+    const rank = (f: TwinSourceFactInput) => (factInFunction(f, target) ? 0 : 1);
+    return rank(a) - rank(b) || compareFactLocation(a, b);
+  });
   const subject = assertedSubjectToken(valueAssertions);
 
   let operation: TwinSourceFactInput | null = null;
@@ -744,7 +1058,16 @@ function selectCausalOperation(
     if (pool.length > 0) operation = pool[pool.length - 1];
   }
   if (!operation) {
-    operation = sorted.find((f) => isMutationFact(factText(f))) ?? null;
+    // Prefer the write that concerns the report; within that, the target's own
+    // write before a callee's. With no related write, the first write as before.
+    const mutations = sorted.filter((f) => isMutationFact(factText(f)));
+    const related = claim ? mutations.filter((f) => writeRelevantToClaim(factText(f), claim)) : [];
+    operation =
+      related.find((f) => factInFunction(f, target)) ??
+      mutations.find((f) => factInFunction(f, target)) ??
+      related[0] ??
+      mutations[0] ??
+      null;
   }
   if (!operation) {
     return { operation: null, condition: null, operationFunction: null, conditionFunction: null };
@@ -802,30 +1125,55 @@ function buildRepairContract(
   const conditionFacts = evidence.conditionFacts;
   const operationFacts = evidence.operationFacts;
   const relevantScenario = evidence.scenarios[0];
+  const missingCheck = evidence.conditionKind === "presence-precondition";
 
   // requiredOutcome — grounded in the concrete assertion the relevant
   // scenario actually makes. Never a generic template when a concrete value
   // is available (spec §9).
   let requiredOutcome = "";
   if (evidence.throwFacts.length > 0) {
-    requiredOutcome = `The repeated request must throw, as the repository test asserts: ${factText(evidence.throwFacts[0])}`;
+    requiredOutcome = `Must throw: ${factText(evidence.throwFacts[0])}`;
   } else if (evidence.valueAssertions.length > 0 && operationFacts.length > 0) {
     requiredOutcome = `The existing operation must produce the result the repository test asserts: ${factText(evidence.valueAssertions[0])}`;
   } else if (evidence.valueAssertions.length > 0) {
     requiredOutcome = `The computed value must match the repository assertion: ${factText(evidence.valueAssertions[0])}`;
   }
 
-  // existingErrorContract — only the error strings the relevant scenario
-  // actually asserts. Never invented; absent when nothing throws.
+  // existingErrorContract — three separately labeled sources, never blended:
+  //   1. what the TEST asserts (a substring/pattern check, not the message),
+  //   2. what the USER requires (quoted in the report),
+  //   3. whether the SOURCE already throws it.
   const errorParts = evidence.errorParts;
-  let existingErrorContract = "";
+  const userTexts = evidence.userErrorTexts;
+  const errorSentences: string[] = [];
   if (errorParts.length > 0) {
-    existingErrorContract = `Related tests require an error matching: ${errorParts.join(", ")}.`;
+    errorSentences.push(
+      `Related tests require an error matching: ${errorParts.join(", ")} (substring/pattern check, not the full message).`
+    );
   }
+  if (userTexts.length > 0) {
+    errorSentences.push(
+      `Report requires ${userTexts.map((t) => `"${t}"`).join(", ")} (keep exactly).`
+    );
+  }
+  if (evidence.rejectionPath) {
+    errorSentences.push(`Existing source throws: ${factText(evidence.rejectionPath)}`);
+  } else if (errorParts.length > 0 || userTexts.length > 0) {
+    errorSentences.push(
+      "No source throw with this text was found."
+    );
+  }
+  const existingErrorContract = errorSentences.join(" ");
 
+  // relevantCondition — a real guard is reported as such. When the test needs a
+  // rejection the source never produces and the only enclosing guard merely
+  // tests presence, say so: that guard is NOT the check that rejects the case.
   let relevantCondition = "";
   if (conditionFacts.length > 0) {
-    relevantCondition = `Repository condition: selection predicate ${factText(conditionFacts[conditionFacts.length - 1])}`;
+    const guard = factText(conditionFacts[conditionFacts.length - 1]);
+    relevantCondition = missingCheck
+      ? `Repository condition: none found that rejects the case. The only enclosing guard, ${guard}, tests presence, not prior use.`
+      : `Repository condition: selection predicate ${guard}`;
   } else if (operationFacts.length > 0) {
     const split = splitConditionalMutation(factText(operationFacts[0]));
     if (split.condition) relevantCondition = `Repository condition: selection predicate ${split.condition}`;
@@ -841,18 +1189,38 @@ function buildRepairContract(
   if (relevantScenario) {
     preserveBehavior.push(`Keep the scenario "${relevantScenario.description}" (${relevantScenario.file}) passing.`);
   }
-  if (errorParts.length > 0) {
+  if (userTexts.length > 0) {
+    preserveBehavior.push(`Keep the required error message wording: ${userTexts.map((t) => `"${t}"`).join(", ")}.`);
+  }
+  if (errorParts.length > 0 && evidence.rejectionPath) {
     preserveBehavior.push(`Preserve the existing error contract: ${errorParts.join(", ")}.`);
   }
 
   let minimalRepairDescription = "";
-  if (requiredOutcome && relevantCondition && relevantOperation) {
+  // A missing rejecting check can only be grounded on a write that concerns
+  // the report; an unrelated write (a ledger append) never anchors it.
+  const groundable = !missingCheck || evidence.operationRelevant;
+  if (requiredOutcome && relevantCondition && relevantOperation && groundable) {
     const selectionEvidence = evidence.sourceSelectionFacts.some((fact) =>
       /\bfor\s*\(|\.keys\s*\(|\.get\s*\(/.test(factText(fact))
     );
-    minimalRepairDescription = selectionEvidence && /delete|remove/i.test(relevantOperation)
-      ? "Preserve the existing setup and mutation; correct the target-selection identity so the existing operation affects the requested entity and no unrelated matching entity."
-      : "Preserve the existing condition and operation; make the smallest evidence-backed change before the operation and do not alter unrelated behavior.";
+    if (missingCheck) {
+      const opText = factText(operationFacts[0]);
+      const receiver = opText.match(/([A-Za-z_$][\w$]*)\s*\.\s*(?:add|set|push|unshift)\s*\(/)?.[1];
+      const later =
+        evidence.laterEffectNames.length > 0
+          ? `, before ${evidence.laterEffectNames.map((n) => `${n}()`).join(", ")} can run`
+          : "";
+      minimalRepairDescription =
+        `Add the missing check: before ${opText.trim()} ` +
+        `${receiver ? `look for an already-recorded entry in ${receiver} and ` : ""}` +
+        `throw the required error on a repeat${later}; ` +
+        "first-time requests and unrelated behavior stay unchanged.";
+    } else {
+      minimalRepairDescription = selectionEvidence && /delete|remove/i.test(relevantOperation)
+        ? "Preserve the existing setup and mutation; correct the target-selection identity so the existing operation affects the requested entity and no unrelated matching entity."
+        : "Preserve the existing condition and operation; make the smallest evidence-backed change before the operation and do not alter unrelated behavior.";
+    }
   }
 
   return {
@@ -871,6 +1239,7 @@ function buildRepairContract(
     conditionOperationAreDistinct: Boolean(
       relevantCondition && relevantOperation && relevantCondition !== relevantOperation
     ),
+    conditionKind: evidence.conditionKind,
   };
 }
 
@@ -993,6 +1362,20 @@ function expectedBehaviorFor(
   if (concrete) {
     return `The reported behavior must produce the result the repository test asserts: ${concrete}`;
   }
+  // A throw assertion is concrete evidence too. It must win over the generic
+  // "right entity" template below: that template describes selection-identity
+  // bugs (a delete hitting the wrong entry) and fired for ANY report merely
+  // because the test calls the target and the source contains some write.
+  if (evidence && evidence.throwFacts.length > 0) {
+    const parts = [`Rejected with an error: ${describeThrowAssertion(factText(evidence.throwFacts[0]))}.`];
+    const stated = evidence.reportExpectation;
+    const unstated = evidence.userErrorTexts.filter((t) => !stated.toLowerCase().includes(t.toLowerCase()));
+    if (unstated.length > 0) {
+      parts.push(`The report requires the message to contain ${unstated.map((t) => `"${t}"`).join(", ")}.`);
+    }
+    if (stated) parts.push(`Report expectation: ${stated}`);
+    return parts.join(" ");
+  }
   if (evidence && evidence.actionFacts.length > 0 && evidence.sourceFacts.some((f) => isMutationFact(factText(f)))) {
     return "The requested entity must be the one affected by the existing operation; other matching entities must remain unchanged.";
   }
@@ -1020,11 +1403,27 @@ const FOCUS_ECHO_CHARS = 160;
 // enough for the Forge contract. The web mirror lives in
 // apps/web/app/lib/forge-run.ts and is tested there identically.
 export function composeForgeFocus(plan: InvestigationPlan): string {
+  const c = plan.repairContract;
+  // The evidence chain repeats facts the contract already states, so it comes
+  // AFTER the unique content (constraints) and lists only non-empty sections:
+  // when the 2000-character budget runs out, only the repetition is cut.
+  const chain: Array<[string, string[]]> = [
+    ["Setup", c.setupFacts],
+    ["Action", c.actionFacts],
+    ["Observed", c.observedFacts],
+    ["Expected", c.expectedFacts],
+    ["Source", c.sourceEvidence],
+    ["Assertions", c.relevantAssertions.join(" ") === c.expectedFacts.join(" ") ? [] : c.relevantAssertions],
+  ];
+  const evidenceChain = chain
+    .filter(([, facts]) => facts.length > 0)
+    .map(([label, facts]) => `${label}: ${facts.join(" ")}`)
+    .join(" ");
   const text = [
     `Target: ${plan.target.function} (${plan.target.file}). Current: ${plan.currentBehavior} Expected: ${plan.expectedBehavior}`,
-    `Repair contract: Required outcome: ${plan.repairContract.requiredOutcome} Preserve: ${plan.repairContract.preserveBehavior.join(" ")} Condition: ${plan.repairContract.relevantCondition} Operation: ${plan.repairContract.relevantOperation} Error: ${plan.repairContract.existingErrorContract} Minimal repair: ${plan.repairContract.minimalRepairDescription}`,
-    `Evidence chain: Setup: ${plan.repairContract.setupFacts.join(" ")} Action: ${plan.repairContract.actionFacts.join(" ")} Observed: ${plan.repairContract.observedFacts.join(" ")} Expected: ${plan.repairContract.expectedFacts.join(" ")} Source: ${plan.repairContract.sourceEvidence.join(" ")} Assertions: ${plan.repairContract.relevantAssertions.join(" ")}`,
+    `Repair contract: Required outcome: ${c.requiredOutcome} Preserve: ${c.preserveBehavior.join(" ")} Condition: ${c.relevantCondition} Operation: ${c.relevantOperation} Error: ${c.existingErrorContract} Minimal repair: ${c.minimalRepairDescription}`,
     `Constraints: ${plan.constraints.join(" ")}`,
+    `Evidence chain: ${evidenceChain}`,
     `Evidence: ${plan.evidence.join(" ")}`,
   ].join(" ");
   return text.length > 2000 ? text.slice(0, 2000) : text;
@@ -1252,7 +1651,7 @@ function assemblePlan(input: {
   const plan: InvestigationPlan = {
     summary: `The analyzed repository supports ${input.targetName} in ${input.targetPath} as the likely target for this report.`,
     target: { file: input.targetPath, function: input.targetName },
-    currentBehavior: `User claim: ${input.focus.slice(0, FOCUS_ECHO_CHARS)}`,
+    currentBehavior: `User claim: ${input.claim.observedOriginal || input.focus.replace(/\s+/g, " ").slice(0, FOCUS_ECHO_CHARS)}`,
     expectedBehavior: expectedBehaviorFor(input.claim, input.focus, input.evidence),
     repairContract: contract,
     constraints,
@@ -1311,6 +1710,7 @@ export function buildPlanFromEvidence(input: EvidencePlanInput): InvestigationRe
       status: "AMBIGUOUS",
       plan: null,
       message: "The report contains contradictory requirements (both accepting and rejecting the same behavior).",
+      code: "CONTRADICTORY_REPORT",
     };
   }
   // Primary = the FIRST SELECTED scenario. The selection is authoritative: we
@@ -1323,6 +1723,7 @@ export function buildPlanFromEvidence(input: EvidencePlanInput): InvestigationRe
       status: "AMBIGUOUS",
       plan: null,
       message: `The selected evidence does not include a test scenario exercising "${target.name}".`,
+      code: "NO_TEST_SCENARIO",
     };
   }
   // The selected scenario must actually exercise the selected target. This is
@@ -1332,6 +1733,7 @@ export function buildPlanFromEvidence(input: EvidencePlanInput): InvestigationRe
       status: "AMBIGUOUS",
       plan: null,
       message: `The selected test scenario "${primary.description}" does not exercise "${target.name}".`,
+      code: "SCENARIO_DOES_NOT_EXERCISE_TARGET",
     };
   }
   // Scope the source facts to the SELECTED functions when the caller names
@@ -1361,14 +1763,24 @@ export function buildPlanFromEvidence(input: EvidencePlanInput): InvestigationRe
       status: "AMBIGUOUS",
       plan: null,
       message: `The selected test scenario "${primary.description}" does not assert an expected outcome for the reported behavior.`,
+      code: "SCENARIO_ASSERTS_NOTHING",
     };
   }
   const contract = buildRepairContract(claim, evidence, target);
+  if (evidence.conditionKind === "presence-precondition" && !evidence.operationRelevant) {
+    return {
+      status: "AMBIGUOUS",
+      plan: null,
+      message: `The test needs a rejection that "${target.name}" never produces, but its only write does not concern the report, so no repair point can be grounded.`,
+      code: "CONTRACT_NOT_GROUNDED",
+    };
+  }
   if (!isGroundedRepairContract(contract)) {
     return {
       status: "AMBIGUOUS",
       plan: null,
       message: "The selected evidence does not establish a coherent repair contract grounded in the reported behavior.",
+      code: "CONTRACT_NOT_GROUNDED",
     };
   }
   return assemblePlan({

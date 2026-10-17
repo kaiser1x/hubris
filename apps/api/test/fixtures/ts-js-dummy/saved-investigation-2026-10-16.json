@@ -1,0 +1,45 @@
+{
+ "_meta": "The saved (defective) investigation output that exposed the contract-quality bugs, kept as a regression fixture.",
+ "investigationId": "44c5dac2-103c-4e36-9ee1-7f5709cc6cb9",
+ "focus": "A customer retries a payment request using an idempotency key that has already been used successfully. The system accepts the second request and creates another payment instead of rejecting the duplicate.\n\nExpected behavior: the first request succeeds, while a subsequent request using the same idempotency key throws an error containing \"duplicate payment for key\" and does not create a second payment.\n\nInvestigate createPayment() in src/payments.ts using the existing implementation and repository",
+ "status": "READY",
+ "state": "READY_FOR_REVIEW",
+ "expectedBehavior": "The requested entity must be the one affected by the existing operation; other matching entities must remain unchanged.",
+ "target": {
+  "file": "src/payments.ts",
+  "function": "createPayment"
+ },
+ "reproduction": {
+  "scenario": "rejects duplicate idempotency keys",
+  "testFile": "tests/payments.test.ts"
+ },
+ "repairContract": {
+  "setupFacts": [],
+  "actionFacts": [
+   "createPayment(\"u-2\", 100, \"key-1\");"
+  ],
+  "expectedFacts": [
+   "expect(() => createPayment(\"u-2\", 100, \"key-1\")).toThrow(\"duplicate payment\");"
+  ],
+  "observedFacts": [],
+  "sourceEvidence": [
+   "const user = getUser(userId);",
+   "validatePayment(amountCents);",
+   "if (idempotencyKey !== undefined) {",
+   "seenIdempotencyKeys.add(idempotencyKey);"
+  ],
+  "requiredOutcome": "The repeated request must throw, as the repository test asserts: expect(() => createPayment(\"u-2\", 100, \"key-1\")).toThrow(\"duplicate payment\");",
+  "preserveBehavior": [
+   "Keep the scenario \"rejects duplicate idempotency keys\" (tests/payments.test.ts) passing.",
+   "Preserve the existing error contract: \"duplicate payment\"."
+  ],
+  "relevantCondition": "Repository condition: selection predicate if (idempotencyKey !== undefined) {",
+  "relevantOperation": "Repository operation: seenIdempotencyKeys.add(idempotencyKey);",
+  "relevantAssertions": [
+   "expect(() => createPayment(\"u-2\", 100, \"key-1\")).toThrow(\"duplicate payment\");"
+  ],
+  "existingErrorContract": "Related tests require an error matching: \"duplicate payment\".",
+  "minimalRepairDescription": "Preserve the existing condition and operation; make the smallest evidence-backed change before the operation and do not alter unrelated behavior.",
+  "conditionOperationAreDistinct": true
+ }
+}

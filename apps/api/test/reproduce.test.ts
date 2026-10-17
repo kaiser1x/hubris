@@ -94,3 +94,115 @@ describe("classifyVerification", () => {
     expect(fail.result).toBe("TEST_FAILED");
   });
 });
+
+
+// A failing command is evidence of the REPORTED bug only when the failure is
+// the investigated scenario. Any other non-zero exit proves nothing about it.
+describe("classifyReproduction grounded in the investigated scenario", () => {
+  const EXPECT = {
+    scenario: "rejects a previously seen idempotency key",
+    testFile: "tests/idempotency-regression.test.ts",
+  };
+  const out = (body: string) => `${REPRO_BEGIN_MARKER}\n${body}`;
+
+  it("the investigated scenario failing -> REPRODUCED", () => {
+    const r = classifyReproduction(
+      {
+        exitCode: 1,
+        timedOut: false,
+        stdout: out(
+          [
+            " FAIL  tests/idempotency-regression.test.ts > idempotency regression (buggy fixture) > rejects a previously seen idempotency key",
+            "AssertionError: expected function to throw an error, but it didn't",
+          ].join("\n")
+        ),
+        stderr: "",
+      },
+      EXPECT
+    );
+    expect(r.outcome).toBe("REPRODUCED");
+    expect(r.demonstrated).toBe(true);
+  });
+
+  it("verbose runner marker for the scenario -> REPRODUCED", () => {
+    const r = classifyReproduction(
+      {
+        exitCode: 1,
+        timedOut: false,
+        stdout: out(" × idempotency regression (buggy fixture) > rejects a previously seen idempotency key 3ms"),
+        stderr: "",
+      },
+      EXPECT
+    );
+    expect(r.outcome).toBe("REPRODUCED");
+  });
+
+  it("a DIFFERENT test failing does not reproduce the report", () => {
+    const r = classifyReproduction(
+      {
+        exitCode: 1,
+        timedOut: false,
+        stdout: out(" FAIL  tests/users.test.ts > users > finds a seeded user\nAssertionError: expected 'x' to be 'Ada'"),
+        stderr: "",
+      },
+      EXPECT
+    );
+    expect(r.outcome).toBe("UNRELATED_FAILURE");
+    expect(r.demonstrated).toBe(false);
+    expect(r.reason).toMatch(/not the investigated scenario/i);
+  });
+
+  it("the scenario passing while the run still exits non-zero is not a reproduction", () => {
+    const r = classifyReproduction(
+      {
+        exitCode: 1,
+        timedOut: false,
+        stdout: out(
+          " ✓ idempotency regression (buggy fixture) > rejects a previously seen idempotency key 2ms\n FAIL  tests/other.test.ts > other > breaks"
+        ),
+        stderr: "",
+      },
+      EXPECT
+    );
+    expect(r.outcome).toBe("UNRELATED_FAILURE");
+  });
+
+  it("'No test files found' / module errors are an execution failure, never a reproduction", () => {
+    for (const body of [
+      "No test files found, exiting with code 1\nfilter: tests/idempotency-regression.test.ts",
+      "Error: Cannot find module '../src/payments.js'",
+      "SyntaxError: Unexpected token '}'",
+    ]) {
+      const r = classifyReproduction({ exitCode: 1, timedOut: false, stdout: out(body), stderr: "" }, EXPECT);
+      expect(r.outcome, body).toBe("EXECUTION_FAILED");
+      expect(r.demonstrated).toBe(false);
+    }
+  });
+
+  it("a passing run is still NOT_REPRODUCED, a timeout still TIMEOUT, missing setup still SETUP_FAILED", () => {
+    expect(classifyReproduction({ exitCode: 0, timedOut: false, stdout: out("ok"), stderr: "" }, EXPECT).outcome).toBe("NOT_REPRODUCED");
+    expect(classifyReproduction({ exitCode: null, timedOut: true, stdout: "", stderr: "" }, EXPECT).outcome).toBe("TIMEOUT");
+    expect(classifyReproduction({ exitCode: 1, timedOut: false, stdout: "ERR_PNPM", stderr: "" }, EXPECT).outcome).toBe("SETUP_FAILED");
+  });
+
+  it("without investigation context a failure is still reported, but flagged as not tied to the report", () => {
+    const r = classifyReproduction({ exitCode: 1, timedOut: false, stdout: out("boom"), stderr: "" });
+    expect(r.outcome).toBe("REPRODUCED");
+    expect(r.demonstrated).toBeNull();
+    expect(r.reason).toMatch(/not tied to an investigated scenario/i);
+  });
+
+  it("matches only the test file when the investigation named no scenario", () => {
+    const fileOnly = { scenario: null, testFile: "tests/idempotency-regression.test.ts" };
+    const hit = classifyReproduction(
+      { exitCode: 1, timedOut: false, stdout: out(" FAIL  tests/idempotency-regression.test.ts > a > b"), stderr: "" },
+      fileOnly
+    );
+    expect(hit.outcome).toBe("REPRODUCED");
+    const miss = classifyReproduction(
+      { exitCode: 1, timedOut: false, stdout: out(" FAIL  tests/users.test.ts > a > b"), stderr: "" },
+      fileOnly
+    );
+    expect(miss.outcome).toBe("UNRELATED_FAILURE");
+  });
+});

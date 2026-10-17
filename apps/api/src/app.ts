@@ -81,7 +81,11 @@ import {
   VALIDATOR_JS,
 } from "./structured";
 import { composeForgeFocus, isGroundedRepairContract } from "./investigate";
-import { runInvestigationAgent } from "./investigate-agent";
+import {
+  resolveClarificationAnswer,
+  runInvestigationAgent,
+  type ClarificationAnswerResolution,
+} from "./investigate-agent";
 import {
   buildRegressionScript,
   DEFAULT_REGRESSION_TEST_PATH,
@@ -103,7 +107,7 @@ import {
 } from "./reproduce";
 import { describeSourceMismatch } from "./mismatch";
 import {
-  buildPullRequestBody,
+  buildPullRequestBodyFromRun,
   buildPullRequestTitle,
   findExistingPullRequest,
   getDefaultBranch,
@@ -113,7 +117,6 @@ import {
   shipBranchName,
   shipEligibility,
   shipForgeRun,
-  targetVerificationForBody,
   uniqueShipBranch,
   verifyCanonicalPatch,
   verifyShipProvenance,
@@ -201,6 +204,17 @@ const InvestigateBody = z.object({
   // asking the user to restate the whole bug.
   priorQuestion: z.string().max(500).optional(),
   clarification: z.string().max(500).optional(),
+  // Structured answer (preferred): the investigation that asked the question
+  // plus the stable question/option ids. Validated server-side against the
+  // persisted question; the selected scenario/target is pinned into the
+  // evidence the contract is built from.
+  priorInvestigationId: z.string().min(1).max(64).optional(),
+  answer: z
+    .object({
+      questionId: z.string().min(1).max(64),
+      optionId: z.string().min(1).max(64),
+    })
+    .optional(),
 });
 
 const ForgeBody = z.object({
@@ -374,6 +388,13 @@ app.get("/api/analyze", async (c: Context) => {
   const { repo } = c.req.query();
   if (!repo) {
     return c.json({ error: "repo query parameter is required (format: owner/repo)", status: 400 }, 400);
+  }
+
+  // `repo` becomes part of an AUTHENTICATED api.github.com path. Only a plain
+  // owner/name is accepted: dot segments ("../user"), extra segments, and
+  // encoded separators must never steer the server token to another endpoint.
+  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo) || repo.split("/").some((part) => part === "." || part === "..")) {
+    return c.json({ error: "repo must be in the form owner/repo", status: 400 }, 400);
   }
 
   try {
@@ -690,8 +711,31 @@ app.post("/api/investigate", async (c: Context) => {
       testCount: Array.isArray(tests) ? tests.length : 0,
       relationshipCount: Array.isArray(full?.relationships) ? full.relationships.length : 0,
     });
+    // A structured answer is validated against the persisted prior question of
+    // THIS job before anything else runs: stale, unknown, already-answered, or
+    // report-changed selections are rejected without touching the model.
+    let answerResolution: Extract<ClarificationAnswerResolution, { ok: true }> | null = null;
+    if (parsed.data.answer) {
+      const priorRuns = (job.result as { investigationRuns?: unknown[] } | null)?.investigationRuns ?? [];
+      const resolution = resolveClarificationAnswer(
+        priorRuns,
+        { priorInvestigationId: parsed.data.priorInvestigationId, answer: parsed.data.answer },
+        focus,
+        job.id
+      );
+      if (!resolution.ok) {
+        logInvestigation("clarification-rejected", { jobId: job.id, code: resolution.code });
+        return c.json(
+          { error: resolution.error, state: "STALE_CLARIFICATION", code: resolution.code, status: resolution.status },
+          resolution.status
+        );
+      }
+      answerResolution = resolution;
+    }
     const agent = await runInvestigationAgent({
       llm: llmConfigFromEnv(),
+      selections: answerResolution?.selections,
+      askedOptionSets: answerResolution?.askedOptionSets,
       jobId: job.id,
       repository: result.repository?.name ?? job.repoUrl,
       ref: typeof result.ref === "string" ? result.ref : null,
@@ -734,6 +778,10 @@ app.post("/api/investigate", async (c: Context) => {
       expectedBehavior: agent.expectedBehavior,
       modelSummary: agent.modelSummary,
       clarification: agent.clarification,
+      blocked: agent.blocked,
+      selections: agent.selections,
+      askedOptionSets: agent.askedOptionSets,
+      answer: answerResolution?.answer ?? null,
       retrievedEvidence: agent.retrievedEvidence,
       relevantScenarios: agent.relevantScenarios,
       relevantSourceFacts: agent.relevantSourceFacts,
@@ -778,6 +826,10 @@ app.post("/api/investigate", async (c: Context) => {
       expectedBehavior: agent.expectedBehavior,
       modelSummary: agent.modelSummary,
       clarification: agent.clarification,
+      blocked: agent.blocked,
+      selections: agent.selections,
+      askedOptionSets: agent.askedOptionSets,
+      answer: answerResolution?.answer ?? null,
       retrievedEvidence: agent.retrievedEvidence,
       relevantScenarios: agent.relevantScenarios,
       relevantSourceFacts: agent.relevantSourceFacts,
@@ -1100,12 +1152,29 @@ app.post("/api/reproduce", async (c: Context) => {
       return c.json({ error: "Sandbox run failed", status: 502 }, 502);
     }
 
-     const classification = classifyReproduction({
-      exitCode: result.exitCode,
-      timedOut: result.timedOut,
-      stdout: result.stdout,
-      stderr: result.stderr,
-    });
+     // The failure must demonstrate the INVESTIGATED behavior: when the run is
+     // bound to a READY investigation, only a failure of its named scenario
+     // counts as a reproduction.
+     const investigatedPlan = (investigation?.plan ?? null) as {
+       reproduction?: { scenario?: unknown; testFile?: unknown };
+     } | null;
+     const expectation = investigatedPlan?.reproduction
+       ? {
+           scenario:
+             typeof investigatedPlan.reproduction.scenario === "string" ? investigatedPlan.reproduction.scenario : null,
+           testFile:
+             typeof investigatedPlan.reproduction.testFile === "string" ? investigatedPlan.reproduction.testFile : null,
+         }
+       : null;
+     const classification = classifyReproduction(
+       {
+         exitCode: result.exitCode,
+         timedOut: result.timedOut,
+         stdout: result.stdout,
+         stderr: result.stderr,
+       },
+       expectation
+     );
      const evidence = {
        script: parsed.data.script,
        requestedCommand: parsed.data.script,
@@ -1129,6 +1198,7 @@ app.post("/api/reproduce", async (c: Context) => {
        durationMs: Date.now() - startedAt,
        investigationId: parsed.data.investigationId ?? null,
        outcome: classification.outcome,
+      demonstrated: classification.demonstrated ?? null,
       reason: classification.reason,
       exitCode: result.exitCode,
       timedOut: result.timedOut,
@@ -3354,7 +3424,10 @@ app.post("/api/ship", async (c: Context) => {
   // 1. Eligibility (assessment + applied + patch presence).
   const eligibility = shipEligibility(run);
   if (!eligibility.ok) {
-    return c.json({ error: `Cannot create PR. ${eligibility.reason}`, status: 409 }, 409);
+    return c.json(
+      { error: `Cannot create PR. ${eligibility.reason}`, state: "NOT_READY", status: 409 },
+      409
+    );
   }
 
   // 2. Bound investigation must be a persisted READY run.
@@ -3448,10 +3521,6 @@ app.post("/api/ship", async (c: Context) => {
   const targetFunction = typeof target.function === "string" ? target.function : "";
   const targetFile = typeof target.file === "string" ? target.file : "";
   const report = typeof investigation.focus === "string" ? investigation.focus : "";
-  const assessment = ((run.verification as { assessment?: Record<string, unknown> })?.assessment ?? {}) as Record<string, unknown>;
-  // The FINAL target-verification result for the body, sourced from the
-  // authoritative assessment (the raw persisted record may lack `passed`).
-  const targetVerification = targetVerificationForBody(run);
   const candidateBranch = shipBranchName(targetFunction, report, investigationId);
   const existingBranches = runs
     .map((r) =>
@@ -3462,33 +3531,18 @@ app.post("/api/ship", async (c: Context) => {
     .filter((b): b is string => typeof b === "string");
   const branch = uniqueShipBranch(candidateBranch, existingBranches);
   const title = buildPullRequestTitle(targetFunction, report);
-  const body = buildPullRequestBody({
+  // Body comes from the exact finalized Forge run being shipped.
+  const body = buildPullRequestBodyFromRun(run, {
     repoName: repository,
     targetFunction,
     targetFile,
     currentBehavior: typeof plan.currentBehavior === "string" ? plan.currentBehavior : "",
     expectedBehavior: typeof plan.expectedBehavior === "string" ? plan.expectedBehavior : "",
-    targetVerification: {
-      scenario: typeof targetVerification.scenario === "string" ? targetVerification.scenario : null,
-      testFile: typeof targetVerification.testFile === "string" ? targetVerification.testFile : null,
-      passed: typeof targetVerification.passed === "boolean" ? targetVerification.passed : null,
-    },
-    regression: {
-      fullSuitePassed: assessment.fullSuitePassed === true,
-      unrelatedTestFailures:
-        typeof assessment.unrelatedTestFailures === "number" ? assessment.unrelatedTestFailures : 0,
-      failedTests: Array.isArray(assessment.failedTests)
-        ? assessment.failedTests.filter((t): t is string => typeof t === "string")
-        : [],
-    },
-    provenance: {
-      investigationId,
-      forgeRunId: parsed.data.forgeRunId,
-      analyzedCommitSha,
-      executionCommitSha,
-      canonicalPatchSha,
-      assessment: typeof assessment.state === "string" ? assessment.state : "",
-    },
+    investigationId,
+    forgeRunId: parsed.data.forgeRunId,
+    analyzedCommitSha,
+    executionCommitSha,
+    canonicalPatchSha,
   });
 
   // 9. Publish: clone at the exact commit, apply the exact patch, push a

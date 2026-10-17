@@ -87,7 +87,18 @@ export function shipEligibility(run: ForgeRunLike | null | undefined): Verdict {
     return { ok: false, reason: `The repair is not verified (${assessment.state}). Re-run Forge.` };
   }
   if (assessment.targetVerificationPassed === false) {
-    return { ok: false, reason: "The investigated behavior did not pass verification." };
+    return { ok: false, reason: "Target verification must pass before shipping; the investigated behavior did not pass verification." };
+  }
+  // REPAIR_VERIFIED means "target passed, full suite has unrelated failures":
+  // the target pass is its only proof, so it must be confirmed explicitly.
+  // Missing/null/undefined fails closed — never inferred from the label, the
+  // raw record, or the regression suite. (FULL_SUITE_PASSED is proven by the
+  // whole suite passing and may legitimately have no targeted run.)
+  if (assessment.state === "REPAIR_VERIFIED" && assessment.targetVerificationPassed !== true) {
+    return {
+      ok: false,
+      reason: "Target verification must pass before shipping; no confirmed target pass was recorded. Re-run Forge.",
+    };
   }
   if (apply?.applied !== true) {
     return { ok: false, reason: "The patch was not applied in the sandbox." };
@@ -291,6 +302,51 @@ export function buildPullRequestBody(input: PullRequestBodyInput): string {
     "_Created by HUBRIS from a verified repair. HUBRIS did not merge this and will not modify the base branch._"
   );
   return lines.join("\n");
+}
+
+export interface PullRequestBodyRunContext {
+  repoName: string;
+  targetFunction: string;
+  targetFile: string;
+  currentBehavior: string;
+  expectedBehavior: string;
+  investigationId: string;
+  forgeRunId: string;
+  analyzedCommitSha: string;
+  executionCommitSha: string;
+  canonicalPatchSha: string;
+}
+
+// Build the PR body from the EXACT finalized Forge run being shipped. Target
+// verification, regression results, and the assessment all come from the run's
+// final assessment — never from the investigation's older verification state.
+export function buildPullRequestBodyFromRun(run: ForgeRunLike, ctx: PullRequestBodyRunContext): string {
+  const verification = isRecord(run?.verification) ? run.verification : null;
+  const assessment = verification && isRecord(verification.assessment) ? verification.assessment : {};
+  return buildPullRequestBody({
+    repoName: ctx.repoName,
+    targetFunction: ctx.targetFunction,
+    targetFile: ctx.targetFile,
+    currentBehavior: ctx.currentBehavior,
+    expectedBehavior: ctx.expectedBehavior,
+    targetVerification: targetVerificationForBody(run),
+    regression: {
+      fullSuitePassed: assessment.fullSuitePassed === true,
+      unrelatedTestFailures:
+        typeof assessment.unrelatedTestFailures === "number" ? assessment.unrelatedTestFailures : 0,
+      failedTests: Array.isArray(assessment.failedTests)
+        ? assessment.failedTests.filter((t): t is string => typeof t === "string")
+        : [],
+    },
+    provenance: {
+      investigationId: ctx.investigationId,
+      forgeRunId: ctx.forgeRunId,
+      analyzedCommitSha: ctx.analyzedCommitSha,
+      executionCommitSha: ctx.executionCommitSha,
+      canonicalPatchSha: ctx.canonicalPatchSha,
+      assessment: typeof assessment.state === "string" ? assessment.state : "",
+    },
+  });
 }
 
 export interface PullRequestRecord {
