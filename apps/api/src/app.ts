@@ -7,7 +7,7 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import { z } from "zod";
-import { desc, eq } from "drizzle-orm";
+import { desc, eq, sql } from "drizzle-orm";
 import { analyzeRepository } from "@hubris/analyzer";
 import { getDb, schema } from "@hubris/db";
 import {
@@ -29,7 +29,7 @@ import {
   STRUCTURED_SYSTEM,
 } from "@hubris/llm";
 import { createHash } from "crypto";
-import { executionLimitsFromEnv, isSafeGitRef, REPO_WORKDIR, runCommand, sandboxConfigFromEnv, uploadFile } from "@hubris/sandbox";
+import { executionLimitsFromEnv, isSafeGitRef, REPO_WORKDIR, sandboxConfigFromEnv, uploadFile } from "@hubris/sandbox";
 import {
   buildCheckoutScript,
   CHECKOUT_UPLOAD_PATH,
@@ -106,6 +106,16 @@ import {
   REPRO_BEGIN_MARKER,
 } from "./reproduce";
 import { describeSourceMismatch } from "./mismatch";
+import { GIT_UNAVAILABLE_MESSAGE, isMissingBinary } from "./gitenv";
+import { DEFAULT_PROBE_REPO, isSafeProbeUrl, runGitDiagnostics, type GitDiagReport } from "./gitdiag";
+import {
+  apiKeyGuard,
+  budgetSignal,
+  coldStartGitCheck,
+  readiness,
+  requestBudget,
+  runCommandWithinBudget as runCommand,
+} from "./runtime";
 import {
   buildPullRequestBodyFromRun,
   buildPullRequestTitle,
@@ -114,6 +124,7 @@ import {
   githubTokenFromEnv,
   redactSecrets,
   repoNameFromCloneUrl as shipRepoNameFromCloneUrl,
+  resolveShipBase,
   shipBranchName,
   shipEligibility,
   shipForgeRun,
@@ -383,6 +394,24 @@ export function buildSourceFacts(
 
 export const app = new Hono();
 
+// Platform concerns (see runtime.ts): the request's time budget starts here,
+// and HUBRIS_API_KEY — when configured — gates everything except /health.
+app.use("*", requestBudget());
+app.use("*", apiKeyGuard());
+// Logs ONE line per function instance saying whether git works in this runtime.
+app.use("*", coldStartGitCheck());
+
+// Maps a cloneAndArchive failure to a response. A host without git is a runtime
+// problem (503, actionable), not a repository problem.
+function repoStageFailure(c: Context, error: any) {
+  if (error?.message === "git-missing") {
+    return c.json({ error: GIT_UNAVAILABLE_MESSAGE, code: "GIT_UNAVAILABLE", status: 503 }, 503);
+  }
+  const step =
+    error?.message === "clone" ? "clone" : error?.message === "ls-files" ? "listing" : "archive";
+  return c.json({ error: `Repository ${step} failed`, status: 500 }, 500);
+}
+
 // GET /api/analyze?repo=owner/repo - Analyze a GitHub repo
 app.get("/api/analyze", async (c: Context) => {
   const { repo } = c.req.query();
@@ -577,10 +606,13 @@ const started = Date.now();
       await fs.promises.rm(tmp, { recursive: true, force: true });
     }
   } catch (error: any) {
-    console.error("Analyze error:", error?.message);
-    const msg = error?.killed
-      ? "Clone timed out. Repo may be too large for local analysis."
-      : error?.message || "Failed to analyze repository";
+    const gitMissing = isMissingBinary(error);
+    console.error("Analyze error:", gitMissing ? "git binary not found" : error?.message);
+    const msg = gitMissing
+      ? GIT_UNAVAILABLE_MESSAGE
+      : error?.killed
+        ? "Clone timed out. Repo may be too large for local analysis."
+        : error?.message || "Failed to analyze repository";
     if (db) {
       try {
         await db
@@ -591,7 +623,9 @@ const started = Date.now();
         // store unreachable; fall through to error response
       }
     }
-    return c.json({ error: msg, status: 500 }, 500);
+    return gitMissing
+      ? c.json({ error: msg, code: "GIT_UNAVAILABLE", status: 503 }, 503)
+      : c.json({ error: msg, status: 500 }, 500);
   }
 });
 
@@ -877,7 +911,7 @@ app.post("/api/investigate", async (c: Context) => {
         { role: "system", content: INVESTIGATE_SYSTEM },
         { role: "user", content: prompt },
       ],
-      { signal: AbortSignal.timeout(60000) }
+      { signal: budgetSignal(60000) }
     );
     return c.json({ jobId: job.id, answer });
   } catch (error: any) {
@@ -947,7 +981,7 @@ app.post("/api/forge", async (c: Context) => {
         { role: "system", content: FORGE_SYSTEM },
         { role: "user", content: prompt },
       ],
-      { maxTokens: forgeMaxTokens(), signal: AbortSignal.timeout(90000) }
+      { maxTokens: forgeMaxTokens(), signal: budgetSignal(90000) }
     );
     return c.json({
       jobId: job.id,
@@ -1045,13 +1079,7 @@ app.post("/api/reproduce", async (c: Context) => {
       if (error?.message === "revision-mismatch") {
         return c.json({ error: "Staged source does not match the analyzed commit.", status: 409 }, 409);
       }
-      const step =
-        error?.message === "clone"
-          ? "clone"
-          : error?.message === "ls-files"
-            ? "listing"
-            : "archive";
-      return c.json({ error: `Repository ${step} failed`, status: 500 }, 500);
+      return repoStageFailure(c, error);
     }
     const { tracked } = staged;
     const excluded = tracked.filter(isTransferExcluded);
@@ -1541,13 +1569,7 @@ app.post("/api/checkout", async (c: Context) => {
     try {
       staged = await cloneAndArchive(cloneUrl, ref, tmp);
     } catch (error: any) {
-      const step =
-        error?.message === "clone"
-          ? "clone"
-          : error?.message === "ls-files"
-            ? "listing"
-            : "archive";
-      return c.json({ error: `Repository ${step} failed`, status: 500 }, 500);
+      return repoStageFailure(c, error);
     }
     const { tarPath, tracked } = staged;
     const excluded = tracked.filter(isTransferExcluded);
@@ -1684,13 +1706,7 @@ app.post("/api/install", async (c: Context) => {
     try {
       staged = await cloneAndArchive(cloneUrl, ref, tmp);
     } catch (error: any) {
-      const step =
-        error?.message === "clone"
-          ? "clone"
-          : error?.message === "ls-files"
-            ? "listing"
-            : "archive";
-      return c.json({ error: `Repository ${step} failed`, status: 500 }, 500);
+      return repoStageFailure(c, error);
     }
     const { tarPath, tracked } = staged;
     const excluded = tracked.filter(isTransferExcluded);
@@ -1829,13 +1845,7 @@ app.post("/api/run-tests", async (c: Context) => {
     try {
       staged = await cloneAndArchive(cloneUrl, ref, tmp);
     } catch (error: any) {
-      const step =
-        error?.message === "clone"
-          ? "clone"
-          : error?.message === "ls-files"
-            ? "listing"
-            : "archive";
-      return c.json({ error: `Repository ${step} failed`, status: 500 }, 500);
+      return repoStageFailure(c, error);
     }
     const { src, tarPath, tracked } = staged;
     const excluded = tracked.filter(isTransferExcluded);
@@ -2025,7 +2035,7 @@ app.post("/api/regression", async (c: Context) => {
           { role: "system", content: REGRESSION_SYSTEM },
           { role: "user", content: prompt },
         ],
-        { maxTokens: forgeMaxTokens(), signal: AbortSignal.timeout(90000) }
+        { maxTokens: forgeMaxTokens(), signal: budgetSignal(90000) }
       );
     } catch (error: any) {
       console.error("Regression draft error:", error?.message);
@@ -2062,13 +2072,7 @@ app.post("/api/regression", async (c: Context) => {
     try {
       staged = await cloneAndArchive(cloneUrl, ref, tmp);
     } catch (error: any) {
-      const step =
-        error?.message === "clone"
-          ? "clone"
-          : error?.message === "ls-files"
-            ? "listing"
-            : "archive";
-      return c.json({ error: `Repository ${step} failed`, status: 500 }, 500);
+      return repoStageFailure(c, error);
     }
     const { tarPath, tracked } = staged;
     const excluded = tracked.filter(isTransferExcluded);
@@ -2225,13 +2229,7 @@ app.post("/api/apply", async (c: Context) => {
     try {
       staged = await cloneAndArchive(cloneUrl, ref, tmp);
     } catch (error: any) {
-      const step =
-        error?.message === "clone"
-          ? "clone"
-          : error?.message === "ls-files"
-            ? "listing"
-            : "archive";
-      return c.json({ error: `Repository ${step} failed`, status: 500 }, 500);
+      return repoStageFailure(c, error);
     }
     const { tarPath, tracked } = staged;
     const excluded = tracked.filter(isTransferExcluded);
@@ -2467,7 +2465,7 @@ app.post("/api/forge-verify", async (c: Context) => {
           { role: "system", content: FORGE_SYSTEM },
           { role: "user", content: buildForgePrompt(forgeCtx) },
         ],
-        { maxTokens: forgeMaxTokens(), signal: AbortSignal.timeout(90000) }
+        { maxTokens: forgeMaxTokens(), signal: budgetSignal(90000) }
       );
     } catch (error: any) {
       console.error("Forge-verify draft error:", error instanceof ModelError ? error.kind : "unknown", error?.message);
@@ -2512,13 +2510,7 @@ app.post("/api/forge-verify", async (c: Context) => {
     try {
       staged = await cloneAndArchive(cloneUrl, ref, tmp);
     } catch (error: any) {
-      const step =
-        error?.message === "clone"
-          ? "clone"
-          : error?.message === "ls-files"
-            ? "listing"
-            : "archive";
-      return c.json({ error: `Repository ${step} failed`, status: 500 }, 500);
+      return repoStageFailure(c, error);
     }
     const { src, tarPath, tracked } = staged;
     const excluded = tracked.filter(isTransferExcluded);
@@ -2642,7 +2634,7 @@ app.post("/api/forge-verify", async (c: Context) => {
               }),
             },
           ],
-          { maxTokens: forgeMaxTokens(), signal: AbortSignal.timeout(90000) }
+          { maxTokens: forgeMaxTokens(), signal: budgetSignal(90000) }
         );
         const extracted2 = extractForgePatch(suggestion2);
         redraft = extracted2 && isPlausibleDiff(extracted2) ? extracted2 : null;
@@ -2925,13 +2917,7 @@ const image = parsed.data.image ?? "tag:node:20-slim";
       if (error?.message === "revision-mismatch") {
         return c.json({ error: "Staged source does not match the analyzed commit.", status: 409 }, 409);
       }
-      const step =
-        error?.message === "clone"
-          ? "clone"
-          : error?.message === "ls-files"
-            ? "listing"
-            : "archive";
-      return c.json({ error: `Repository ${step} failed`, status: 500 }, 500);
+      return repoStageFailure(c, error);
     }
     const { src, tarPath, tracked } = staged;
     // Exact analyzed revision, bound locally: the ref resolved above plus
@@ -3037,7 +3023,7 @@ const image = parsed.data.image ?? "tag:node:20-slim";
         ],
         {
           maxTokens: forgeMaxTokens(),
-          signal: AbortSignal.timeout(90000),
+          signal: budgetSignal(90000),
           // Verified contract: json_object constrains the model to valid
           // JSON. Parsing + zod + exact-match validation stay in place.
           responseFormat: "json_object",
@@ -3387,6 +3373,9 @@ const image = parsed.data.image ?? "tag:node:20-slim";
 const ShipBody = z.object({
   jobId: z.string().min(1, "jobId is required"),
   forgeRunId: z.string().min(1, "forgeRunId is required"),
+  // Optional PR base. Defaults to the ref Forge analyzed. A different base is
+  // honored only if it points at the very commit that was validated.
+  baseBranch: z.string().min(1).max(200).optional(),
 });
 
 // POST /api/ship - Publish an already-verified Forge repair as a GitHub PR.
@@ -3470,7 +3459,18 @@ app.post("/api/ship", async (c: Context) => {
     analysisCommitSha?: unknown;
     executionCommitSha?: unknown;
     commitSha?: unknown;
+    ref?: unknown;
+    analysisRef?: unknown;
   };
+  // The ref Forge actually staged and verified (falls back to the analysis
+  // ref). Null for legacy runs with no recorded ref: those analyzed the
+  // repository's default branch.
+  const verifiedRef =
+    typeof source.ref === "string" && source.ref
+      ? source.ref
+      : typeof source.analysisRef === "string" && source.analysisRef
+        ? source.analysisRef
+        : null;
   const analyzedCommitSha =
     typeof source.analysisCommitSha === "string" ? source.analysisCommitSha : "";
   const executionCommitSha =
@@ -3515,6 +3515,19 @@ app.post("/api/ship", async (c: Context) => {
     );
   }
 
+  // 7b. PR base. Defaults to the analyzed ref (a non-default branch included);
+  //     only a legacy run with no recorded ref uses the repository default.
+  //     Source freshness and base compatibility are enforced against the exact
+  //     refs inside shipForgeRun, before any GitHub write.
+  const baseChoice = resolveShipBase({
+    analysisRef: verifiedRef,
+    defaultBranch: base.branch,
+    requestedBase: parsed.data.baseBranch ?? null,
+  });
+  if (!baseChoice.ok) {
+    return c.json({ error: `Cannot create PR. ${baseChoice.reason}`, state: "NOT_READY", code: "BASE_INVALID", status: 400 }, 400);
+  }
+
   // 8. Deterministic metadata built from persisted evidence.
   const plan = (investigation.plan ?? {}) as Record<string, unknown>;
   const target = (plan.target ?? {}) as { function?: unknown; file?: unknown };
@@ -3551,7 +3564,8 @@ app.post("/api/ship", async (c: Context) => {
     repository,
     owner,
     commitSha: analyzedCommitSha,
-    baseBranch: base.branch,
+    analysisRef: baseChoice.analysisRef,
+    baseBranch: baseChoice.baseBranch,
     branch,
     patchContent: patch.content,
     canonicalPatchSha,
@@ -3562,13 +3576,25 @@ app.post("/api/ship", async (c: Context) => {
   if (!shipped.ok) {
     const auth = shipped.kind === "auth";
     const stale = /changed since this repair was verified/.test(shipped.reason);
+    const baseBlocked = shipped.kind === "base";
+    const runtimeBlocked = shipped.kind === "runtime";
     const status: ContentfulStatusCode = auth
       ? 403
-      : shipped.kind === "conflict" || stale
-        ? 409
-        : 502;
+      : runtimeBlocked
+        ? 503
+        : shipped.kind === "conflict" || stale || baseBlocked
+          ? 409
+          : 502;
     return c.json(
-      { error: shipped.reason, state: auth ? "ACTION_REQUIRED" : "NOT_READY", status },
+      {
+        error: shipped.reason,
+        state: auth ? "ACTION_REQUIRED" : "NOT_READY",
+        ...(baseBlocked ? { code: "BASE_NOT_VALIDATED" } : {}),
+        ...(runtimeBlocked ? { code: "GIT_UNAVAILABLE" } : {}),
+        analysisRef: baseChoice.analysisRef,
+        baseBranch: baseChoice.baseBranch,
+        status,
+      },
       status
     );
   }
@@ -3596,12 +3622,79 @@ app.post("/api/ship", async (c: Context) => {
   return c.json({
     jobId: job.id,
     pullRequest: record,
+    analysisRef: baseChoice.analysisRef,
+    baseBranch: record.baseBranch,
     pushStatus: shipped.pushStatus ?? null,
     state: "PR_CREATED",
   });
 });
 
-// GET /health - Health check
+// POST /api/diagnostics/git - Run the git capability checks INSIDE this runtime
+// (version, public ls-remote, temp repo, diff --check, apply --check, cleanup).
+// Not a public diagnostics page: it requires HUBRIS_API_KEY to be configured AND
+// presented (a keyless public deployment answers 403), is POST-only, and caches
+// its result briefly so it cannot be used to hammer the network. Read-only
+// toward the outside world; no credentials, no pushes, no GitHub writes.
+const DIAGNOSTICS_CACHE_MS = 30_000;
+let lastGitDiagnostics: { at: number; report: GitDiagReport } | null = null;
+
+export function resetGitDiagnosticsCache(): void {
+  lastGitDiagnostics = null;
+}
+
+app.post("/api/diagnostics/git", async (c: Context) => {
+  const keyConfigured = Boolean(process.env.HUBRIS_API_KEY);
+  // The key guard already rejected a wrong/missing key when one is configured.
+  // Without a key the endpoint is only available off-platform (local dev).
+  if (!keyConfigured && process.env.VERCEL) {
+    return c.json(
+      { error: "Diagnostics are disabled until HUBRIS_API_KEY is configured.", status: 403 },
+      403
+    );
+  }
+  const now = Date.now();
+  if (lastGitDiagnostics && now - lastGitDiagnostics.at < DIAGNOSTICS_CACHE_MS) {
+    return c.json({ ...lastGitDiagnostics.report, cached: true }, lastGitDiagnostics.report.ok ? 200 : 503);
+  }
+  const probe = process.env.HUBRIS_GIT_PROBE_REPO;
+  const report = await runGitDiagnostics({
+    probeRepo: probe && isSafeProbeUrl(probe) ? probe : DEFAULT_PROBE_REPO,
+  });
+  lastGitDiagnostics = { at: now, report };
+  console.info(
+    `[hubris] git diagnostics ${report.ok ? "PASSED" : "FAILED"}: ` +
+      report.steps.map((s) => `${s.step}=${s.ok ? "ok" : s.code}`).join(" ")
+  );
+  return c.json({ ...report, cached: false }, report.ok ? 200 : 503);
+});
+
+// GET /health - Liveness. Never touches a dependency.
 app.get("/health", (c: Context) => {
   return c.json({ status: "ok", service: "hubris-api" });
 });
+
+// GET /ready - Readiness: database reachable, `git` present, and which
+// integrations are configured (booleans only, never values). 503 when the API
+// cannot do its core work on this host.
+app.get("/ready", async (c: Context) => {
+  const report = await readiness({
+    databaseCheck: async () => {
+      const db = getDb();
+      if (!db) return "not-configured";
+      try {
+        await Promise.race([
+          db.execute(sql`select 1`),
+          new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), 3000)),
+        ]);
+        return "ok";
+      } catch {
+        return "error";
+      }
+    },
+  });
+  return c.json(report, report.status === "ready" ? 200 : 503);
+});
+
+// Vercel's Hono integration runs the DEFAULT EXPORT of this file as the
+// function; the local Node server (src/local.ts) imports the same app.
+export default app;

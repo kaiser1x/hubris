@@ -32,6 +32,7 @@ import {
   targetVerificationMark,
   shipRepairHref,
   buildShipBody,
+  shipBaseDescription,
   shipBranchPreview,
   shipTitlePreview,
 } from "../app/lib/forge-run";
@@ -1118,6 +1119,20 @@ describe("SHIP (eligibility, body, preview)", () => {
     expect(targetVerificationMark(false)).toBe("✗");
     expect(targetVerificationMark(null)).toBe("—");
     expect(targetVerificationMark(undefined)).toBe("—");
+  });
+
+  it("the PR base is the analyzed branch (non-default included), not an assumed default", () => {
+    const run = runWith({ state: "REPAIR_VERIFIED", targetVerificationPassed: true });
+    const onBranch = { ...run, source: { ...run.source, ref: "hubris/buggy-idempotency" } };
+    expect(shipBaseDescription(onBranch, null)).toEqual({ branch: "hubris/buggy-idempotency", label: "hubris/buggy-idempotency" });
+    // The job's analyzed ref is used when the run recorded none.
+    const noRef = { ...run, source: { ...run.source, ref: null } };
+    expect(shipBaseDescription(noRef, { result: { ref: "release/1.x" } }).branch).toBe("release/1.x");
+    // Legacy runs analyzed the default branch; say so instead of naming one.
+    const legacy = shipBaseDescription(noRef, { result: {} });
+    expect(legacy.branch).toBeNull();
+    expect(legacy.label).toMatch(/default branch/);
+    expect(shipBaseDescription(null, null).branch).toBeNull();
   });
 
   it("requires both ids for the ship request body", () => {

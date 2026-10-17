@@ -8,7 +8,10 @@ let client: ReturnType<typeof drizzle<typeof schema>> | null = null;
 export function getDb() {
   if (!process.env.DATABASE_URL) return null;
   if (!client) {
-    sql = postgres(process.env.DATABASE_URL);
+    // Serverless instances multiply: let deployments cap the per-instance pool
+    // (HUBRIS_DB_POOL_MAX) and point DATABASE_URL at a pooled endpoint.
+    const max = Number(process.env.HUBRIS_DB_POOL_MAX);
+    sql = postgres(process.env.DATABASE_URL, Number.isInteger(max) && max > 0 ? { max } : {});
     client = drizzle(sql, { schema });
   }
   return client;

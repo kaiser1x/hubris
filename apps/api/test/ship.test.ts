@@ -11,6 +11,7 @@ import {
   isSafeShipBranch,
   parseRemoteBranchSha,
   redactSecrets,
+  resolveShipBase,
   shipBranchName,
   shipEligibility,
   shipForgeRun,
@@ -266,7 +267,10 @@ function makeDeps(over: {
   diffCached?: string;
   nameOnly?: string;
   revParse?: string;
+  // `git ls-remote origin refs/heads/<hubris branch>` output.
   lsRemote?: string;
+  // Remote heads by name for every OTHER ref (default: each points at COMMIT).
+  heads?: Record<string, string>;
   fail?: (args: string[]) => string | null;
 } = {}): ShipDeps & Recorded {
   const calls: string[][] = [];
@@ -281,7 +285,14 @@ function makeDeps(over: {
       return { stdout: over.nameOnly ?? "", stderr: "" };
     }
     if (args[0] === "rev-parse") return { stdout: (over.revParse ?? COMMIT) + "\n", stderr: "" };
-    if (args[0] === "ls-remote") return { stdout: over.lsRemote ?? "", stderr: "" };
+    if (args[0] === "ls-remote") {
+      const ref = args[args.length - 1];
+      if (ref === `refs/heads/${BRANCH}`) return { stdout: over.lsRemote ?? "", stderr: "" };
+      if (ref.startsWith("refs/tags/")) return { stdout: "", stderr: "" };
+      const name = ref.replace(/^refs\/heads\//, "");
+      const sha = over.heads ? over.heads[name] : COMMIT;
+      return { stdout: sha ? `${sha}\t${ref}\n` : "", stderr: "" };
+    }
     return { stdout: "", stderr: "" };
   };
   const fetchImpl = (async (url: string, init?: RequestInit) => {
@@ -305,6 +316,7 @@ const SHIP_INPUT = {
   repository: "kaiser1x/test2-codebase",
   owner: "kaiser1x",
   commitSha: COMMIT,
+  analysisRef: "main",
   baseBranch: "main",
   branch: BRANCH,
   patchContent: PATCH,
@@ -335,8 +347,8 @@ describe("shipForgeRun orchestration", () => {
     expect(deps.calls.some((a) => a[0] === "push")).toBe(false);
   });
 
-  it("fails closed when the base branch advanced", async () => {
-    const deps = makeDeps({ revParse: "b".repeat(40) });
+  it("fails closed when the analyzed ref advanced", async () => {
+    const deps = makeDeps({ heads: { main: "b".repeat(40) } });
     const result = await shipForgeRun(SHIP_INPUT, deps);
     expect(result.ok).toBe(false);
     expect(result.reason).toContain("Repository changed since this repair was verified");
@@ -652,5 +664,230 @@ describe("PR body target verification uses the final assessment", () => {
     });
     expect(body.toLowerCase()).not.toContain("deleted");
     expect(body.toLowerCase()).not.toContain("previous pr");
+  });
+});
+
+
+// ---- source freshness vs PR base vs base compatibility ----
+//
+// Three separate questions:
+//   source freshness   did the EXACT ref Forge analyzed move?
+//   PR base            which branch will the pull request merge into?
+//   base compatibility was the repair validated against that base?
+// A repair analyzed on a non-default branch used to be blocked because the
+// default branch's SHA was compared with the analyzed commit.
+describe("source freshness, PR base, and base compatibility", () => {
+  const ANALYSIS_REF = "hubris/buggy-idempotency";
+  const MAIN_SHA = "4b".repeat(20);
+  const MOVED_SHA = "9f".repeat(20);
+
+  // Ref-aware fake remote: `git ls-remote origin refs/heads/<name>` answers
+  // from `heads`, `refs/tags/<name>` from `tags`.
+  function refDeps(heads: Record<string, string>, tags: Record<string, string> = {}) {
+    const deps = makeDeps();
+    const posts: Array<Record<string, unknown>> = [];
+    const baseExec = deps.exec;
+    deps.exec = async (args, opts) => {
+      if (args[0] === "ls-remote") {
+        const ref = args[args.length - 1];
+        deps.calls.push(args);
+        const name = ref.replace(/^refs\/(heads|tags)\//, "");
+        const table = ref.startsWith("refs/tags/") ? tags : heads;
+        return { stdout: table[name] ? `${table[name]}\t${ref}\n` : "", stderr: "" };
+      }
+      return baseExec(args, opts);
+    };
+    deps.fetchImpl = (async (_url: string, init?: RequestInit) => {
+      if ((init?.method ?? "GET") === "GET") return new Response(JSON.stringify([]), { status: 200 });
+      posts.push(JSON.parse(String(init?.body)));
+      return new Response(JSON.stringify({ number: 42, html_url: "https://github.com/o/r/pull/42" }), { status: 201 });
+    }) as unknown as typeof fetch;
+    return { deps, posts };
+  }
+  const input = (over: Record<string, unknown> = {}) => ({
+    ...SHIP_INPUT,
+    analysisRef: ANALYSIS_REF,
+    baseBranch: ANALYSIS_REF,
+    ...over,
+  });
+  const wrote = (deps: ShipDeps & Recorded) => ({
+    pushed: deps.calls.some((a) => a[0] === "push"),
+    pulled: deps.calls.some((a) => a[0] === "pull"),
+  });
+
+  it("an unchanged non-default analysis ref is NOT rejected because main has a different SHA", async () => {
+    const { deps, posts } = refDeps({ [ANALYSIS_REF]: COMMIT, main: MAIN_SHA });
+    const result = await shipForgeRun(input(), deps);
+    expect(result.ok, result.reason).toBe(true);
+    expect(posts).toHaveLength(1);
+    // The default branch was never consulted.
+    expect(deps.calls.filter((a) => a[0] === "ls-remote").map((a) => a[a.length - 1])).not.toContain("refs/heads/main");
+  });
+
+  it("the PR is created against the analyzed ref, never silently against main", async () => {
+    const { deps, posts } = refDeps({ [ANALYSIS_REF]: COMMIT, main: MAIN_SHA });
+    const result = await shipForgeRun(input(), deps);
+    expect(result.ok).toBe(true);
+    expect(posts[0].base).toBe(ANALYSIS_REF);
+    expect(posts[0].base).not.toBe("main");
+    expect(result.pullRequest?.baseBranch).toBe(ANALYSIS_REF);
+  });
+
+  it("a moved analysis ref is rejected before anything is written", async () => {
+    const { deps, posts } = refDeps({ [ANALYSIS_REF]: MOVED_SHA, main: COMMIT });
+    const result = await shipForgeRun(input(), deps);
+    expect(result.ok).toBe(false);
+    expect(result.reason).toContain("Repository changed since this repair was verified");
+    expect(result.reason).toContain(ANALYSIS_REF);
+    expect(wrote(deps)).toEqual({ pushed: false, pulled: false });
+    expect(posts).toHaveLength(0);
+  });
+
+  it("main equal to the analyzed commit does not rescue a moved analysis ref", async () => {
+    const { deps } = refDeps({ [ANALYSIS_REF]: MOVED_SHA, main: COMMIT });
+    const result = await shipForgeRun(input({ baseBranch: "main" }), deps);
+    expect(result.ok).toBe(false);
+    expect(result.reason).toContain("Repository changed since this repair was verified");
+    expect(deps.calls.some((a) => a[0] === "push")).toBe(false);
+  });
+
+  it("an analysis ref that no longer exists is a stale source", async () => {
+    const { deps } = refDeps({ main: COMMIT });
+    const result = await shipForgeRun(input(), deps);
+    expect(result.ok).toBe(false);
+    expect(result.reason).toContain("Repository changed since this repair was verified");
+    expect(deps.calls.some((a) => a[0] === "push")).toBe(false);
+  });
+
+  it("an analysis ref that is a tag cannot be a PR base and is not replaced by main", async () => {
+    const { deps, posts } = refDeps({ main: COMMIT }, { [ANALYSIS_REF]: COMMIT });
+    const result = await shipForgeRun(input(), deps);
+    expect(result.ok).toBe(false);
+    expect(result.kind).toBe("base");
+    expect(result.reason).toMatch(/tag/i);
+    expect(deps.calls.some((a) => a[0] === "push")).toBe(false);
+    expect(posts).toHaveLength(0);
+  });
+
+  it("an alternative base at a DIFFERENT commit is rejected: the repair was not validated against it", async () => {
+    const { deps, posts } = refDeps({ [ANALYSIS_REF]: COMMIT, main: MAIN_SHA });
+    const result = await shipForgeRun(input({ baseBranch: "main" }), deps);
+    expect(result.ok).toBe(false);
+    expect(result.kind).toBe("base");
+    expect(result.reason).toContain("main");
+    expect(result.reason).toMatch(/not been validated|not validated/i);
+    expect(wrote(deps)).toEqual({ pushed: false, pulled: false });
+    expect(posts).toHaveLength(0);
+  });
+
+  it("an alternative base at the SAME commit is the validated tree, so it is allowed and passed through", async () => {
+    const { deps, posts } = refDeps({ [ANALYSIS_REF]: COMMIT, main: COMMIT });
+    const result = await shipForgeRun(input({ baseBranch: "main" }), deps);
+    expect(result.ok, result.reason).toBe(true);
+    expect(posts[0].base).toBe("main");
+  });
+
+  it("an alternative base that does not exist is rejected", async () => {
+    const { deps } = refDeps({ [ANALYSIS_REF]: COMMIT });
+    const result = await shipForgeRun(input({ baseBranch: "release" }), deps);
+    expect(result.ok).toBe(false);
+    expect(result.kind).toBe("base");
+    expect(result.reason).toContain("release");
+  });
+
+  it("an existing open PR for the head branch that targets a different base is a conflict, not a success", async () => {
+    const { deps } = refDeps({ [ANALYSIS_REF]: COMMIT });
+    deps.fetchImpl = (async (_url: string, init?: RequestInit) =>
+      (init?.method ?? "GET") === "GET"
+        ? new Response(JSON.stringify([{ number: 7, html_url: "https://github.com/o/r/pull/7", base: { ref: "main" } }]), { status: 200 })
+        : new Response("{}", { status: 201 })) as unknown as typeof fetch;
+    const result = await shipForgeRun(input(), deps);
+    expect(result.ok).toBe(false);
+    expect(result.kind).toBe("conflict");
+    expect(result.reason).toContain("main");
+  });
+
+  it("an existing open PR against the SAME base is still returned idempotently", async () => {
+    const { deps } = refDeps({ [ANALYSIS_REF]: COMMIT });
+    deps.fetchImpl = (async (_url: string, init?: RequestInit) =>
+      (init?.method ?? "GET") === "GET"
+        ? new Response(JSON.stringify([{ number: 7, html_url: "https://github.com/o/r/pull/7", base: { ref: ANALYSIS_REF } }]), { status: 200 })
+        : new Response("{}", { status: 201 })) as unknown as typeof fetch;
+    const result = await shipForgeRun(input(), deps);
+    expect(result.ok).toBe(true);
+    expect(result.duplicate?.prNumber).toBe(7);
+  });
+
+  it("rejects an unsafe base or analysis ref before any git command", async () => {
+    for (const bad of ["--upload-pack=evil", "a..b", "-x", "", "a b"]) {
+      const { deps } = refDeps({ [ANALYSIS_REF]: COMMIT });
+      const result = await shipForgeRun(input({ baseBranch: bad }), deps);
+      expect(result.ok, bad).toBe(false);
+      expect(deps.calls, bad).toHaveLength(0);
+    }
+  });
+
+  it("legacy behavior: with no analysis ref, the base is the analysis ref and is checked against the commit", async () => {
+    const { deps, posts } = refDeps({ main: COMMIT });
+    const result = await shipForgeRun(input({ analysisRef: "main", baseBranch: "main" }), deps);
+    expect(result.ok).toBe(true);
+    expect(posts[0].base).toBe("main");
+    const moved = refDeps({ main: MOVED_SHA });
+    expect((await shipForgeRun(input({ analysisRef: "main", baseBranch: "main" }), moved.deps)).ok).toBe(false);
+  });
+});
+
+describe("resolveShipBase (PR base policy)", () => {
+  it("defaults the base to the analyzed ref, including a non-default branch", () => {
+    const r = resolveShipBase({ analysisRef: "hubris/buggy-idempotency", defaultBranch: "main", requestedBase: null });
+    expect(r).toMatchObject({ ok: true, analysisRef: "hubris/buggy-idempotency", baseBranch: "hubris/buggy-idempotency", alternative: false });
+  });
+
+  it("falls back to the repository default branch only when no ref was analyzed (legacy job)", () => {
+    const r = resolveShipBase({ analysisRef: null, defaultBranch: "main", requestedBase: null });
+    expect(r).toMatchObject({ ok: true, analysisRef: "main", baseBranch: "main", alternative: false });
+  });
+
+  it("flags an explicit different base as an alternative (to be validated), never silently main", () => {
+    const r = resolveShipBase({ analysisRef: "hubris/buggy-idempotency", defaultBranch: "main", requestedBase: "main" });
+    expect(r).toMatchObject({ ok: true, baseBranch: "main", analysisRef: "hubris/buggy-idempotency", alternative: true });
+  });
+
+  it("rejects unsafe refs", () => {
+    expect(resolveShipBase({ analysisRef: "-evil", defaultBranch: "main", requestedBase: null }).ok).toBe(false);
+    expect(resolveShipBase({ analysisRef: "ok", defaultBranch: "main", requestedBase: "a..b" }).ok).toBe(false);
+  });
+});
+
+describe("SHIP on a host without git", () => {
+  const enoent = () => Object.assign(new Error("spawn git ENOENT"), { code: "ENOENT" });
+
+  it("reports a runtime problem — never 'the repository changed' — and writes nothing", async () => {
+    const deps = makeDeps();
+    const exec = deps.exec;
+    deps.exec = async (args, opts) => {
+      if (args[0] === "init" || args[0] === "remote" || args[0] === "fetch") throw enoent();
+      return exec(args, opts);
+    };
+    const result = await shipForgeRun(SHIP_INPUT, deps);
+    expect(result.ok).toBe(false);
+    expect(result.kind).toBe("runtime");
+    expect(result.reason).toContain("no git binary");
+    expect(result.reason).not.toContain("Repository changed since this repair was verified");
+    expect(deps.calls.some((a) => a[0] === "push")).toBe(false);
+  });
+
+  it("other git failures at that stage are still treated as a stale source", async () => {
+    const deps = makeDeps({ fail: (args) => (args[0] === "fetch" ? "fatal: couldn't find remote ref" : null) });
+    const result = await shipForgeRun(SHIP_INPUT, deps);
+    expect(result.kind).toBeUndefined();
+    expect(result.reason).toContain("Repository changed since this repair was verified");
+  });
+
+  it("a failing push is redacted and never echoes the token", async () => {
+    const deps = makeDeps({ fail: (args) => (args[0] === "push" ? "fatal: unable to access https://x-access-token:secret-token@github.com/o/r.git" : null) });
+    const result = await shipForgeRun(SHIP_INPUT, deps);
+    expect(result.ok).toBe(false);
+    expect(result.reason).not.toContain("secret-token");
   });
 });

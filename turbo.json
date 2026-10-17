@@ -5,7 +5,7 @@
   "tasks": {
     "build": {
       "dependsOn": ["^build"],
-      "inputs": ["$Turbo/dependents^", "src/**/*", "turbo.json"]
+      "outputs": ["dist/**", ".next/**", "!.next/cache/**"]
     },
     "lint": {
       "dependsOn": ["^lint"],
@@ -17,7 +17,8 @@
     },
     "test": {
       "dependsOn": ["^build"],
-      "inputs": ["$Turbo/dependents^", "src/**/*", "turbo.json"]
+      "inputs": ["$Turbo/dependents^", "src/**/*", "turbo.json"],
+      "passThroughEnv": ["DATABASE_URL"]
     }
   }
 }

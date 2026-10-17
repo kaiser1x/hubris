@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { apiAuthHeaders } from "../../../../lib/api-auth";
 
 const HUBRIS_API_BASE =
   process.env.HUBRIS_API_BASE || "http://localhost:3001";
@@ -15,6 +16,7 @@ export async function GET(
       {
         headers: {
           "User-Agent": "HUBRIS/0.1.0",
+          ...apiAuthHeaders(),
         },
       }
     );

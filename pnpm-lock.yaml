@@ -45,6 +45,12 @@ importers:
       '@types/node':
         specifier: ^26.6.2
         version: 26.6.2
+      typescript:
+        specifier: ^5.9.2
+        version: 5.9.3
+      undici-types:
+        specifier: ~8.9.0
+        version: 8.9.0
       vitest:
         specifier: ^5.0.1
         version: 5.0.1(@types/node@26.6.2)(vite@8.3.1(@types/node@26.6.2)(esbuild@0.28.2)(jiti@2.7.0)(tsx@4.23.15))
@@ -98,9 +104,17 @@ importers:
         specifier: ^5.0.1
         version: 5.0.1(@types/node@20.19.43)(vite@8.3.1(@types/node@20.19.43)(esbuild@0.28.2)(jiti@2.7.0)(tsx@4.23.15))
 
-  packages/config: {}
+  packages/config:
+    devDependencies:
+      typescript:
+        specifier: ^5.9.2
+        version: 5.9.3
 
-  packages/types: {}
+  packages/types:
+    devDependencies:
+      typescript:
+        specifier: ^5.9.2
+        version: 5.9.3
 
   services/analyzer:
     dependencies:
@@ -133,12 +147,18 @@ importers:
       drizzle-kit:
         specifier: ^0.31.11
         version: 0.31.11
+      typescript:
+        specifier: ^5.9.2
+        version: 5.9.3
 
   services/llm:
     devDependencies:
       '@types/node':
         specifier: ^26.6.2
         version: 26.6.2
+      typescript:
+        specifier: ^5.9.2
+        version: 5.9.3
       vitest:
         specifier: ^5.0.1
         version: 5.0.1(@types/node@26.6.2)(vite@8.3.1(@types/node@26.6.2)(esbuild@0.28.2)(jiti@2.7.0)(tsx@4.23.15))
@@ -148,6 +168,9 @@ importers:
       '@types/node':
         specifier: ^26.6.2
         version: 26.6.2
+      typescript:
+        specifier: ^5.9.2
+        version: 5.9.3
       vitest:
         specifier: ^5.0.1
         version: 5.0.1(@types/node@26.6.2)(vite@8.3.1(@types/node@26.6.2)(esbuild@0.28.2)(jiti@2.7.0)(tsx@4.23.15))

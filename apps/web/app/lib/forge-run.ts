@@ -1257,6 +1257,20 @@ function slugPreview(value: string, maxWords: number): string {
     .slice(0, 48);
 }
 
+// The branch the pull request will merge into, for display. It is the ref
+// Forge analyzed and verified against (a non-default branch included) — never
+// assumed to be the repository default. Null/legacy runs analyzed the default
+// branch, which the API resolves when it creates the PR.
+export function shipBaseDescription(
+  run: ForgeRunView | null | undefined,
+  job: unknown
+): { branch: string | null; label: string } {
+  const branch = run?.source.ref ?? jobSourceRef(job);
+  return branch
+    ? { branch, label: branch }
+    : { branch: null, label: "default branch (the branch that was analyzed)" };
+}
+
 export function shipBranchPreview(
   targetFunction: string,
   report: string,

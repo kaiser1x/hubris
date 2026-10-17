@@ -33,6 +33,13 @@ describe("SHIP page binds the exact Forge run", () => {
     expect(source).toContain("Canonical patch SHA");
   });
 
+  it("shows the REAL pull request base, never a hard-coded default branch", () => {
+    expect(source).toContain("shipBaseDescription");
+    expect(source).toContain("Pull request base");
+    expect(source).toContain("Analyzed ref");
+    expect(source).not.toContain("<dd>default branch</dd>");
+  });
+
   it("gates PR creation on eligibility and requires confirmation", () => {
     expect(source).toContain("shipEligible");
     expect(source).toContain("disabled={!eligibility.eligible}");
