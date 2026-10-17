@@ -20,11 +20,11 @@ import {
   findRunView,
   findSavedInvestigation,
   investigationReviewHref,
+  readForgeResponse,
   resolveForgeRuns,
   shipEligible,
   shipRepairHref,
   STRUCTURED_VERIFY_PATH,
-  toVerifyError,
   type ForgeRunView,
   type InvestigationView,
 } from "../../lib/forge-run";
@@ -154,17 +154,13 @@ function ForgePageContent() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(prepared.body),
       });
-      const data = await res.json();
-      const runId =
-        res.ok && data && typeof data.forgeRun === "object" && data.forgeRun !== null
-          ? (data.forgeRun as { id?: unknown }).id
-          : null;
-      if (typeof runId !== "string" || runId.length === 0) {
-        setActionError(toVerifyError(res.status, data));
+      const outcome = readForgeResponse(res.status, await res.text());
+      if (!outcome.ok) {
+        setActionError(outcome.error);
         return;
       }
       await loadRuns();
-      setCurrentRunId(runId);
+      setCurrentRunId(outcome.runId);
     } catch {
       setActionError("Analysis service unreachable. Is the API running?");
     } finally {

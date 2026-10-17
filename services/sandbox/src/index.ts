@@ -18,7 +18,9 @@ export {
 export {
   cancelOperation,
   getOperation,
+  isSandboxWaitTimeout,
   runCommand,
+  SANDBOX_WAIT_TIMEOUT_MESSAGE,
   spawnInstance,
   uploadFile,
   waitOperation,

@@ -46,6 +46,18 @@ export const EditPlanSchema = z
   .strict();
 
 export type EditPlan = z.infer<typeof EditPlanSchema>;
+
+// `{ "edits": [] }`: the model's explicit "nothing to change". Recognized
+// before schema validation so it is reported as such rather than as a
+// broken plan. It never passes the schema (min 1) and never reaches a sandbox.
+export function isEmptyEditPlan(raw: unknown): boolean {
+  return (
+    typeof raw === "object" &&
+    raw !== null &&
+    Array.isArray((raw as { edits?: unknown }).edits) &&
+    (raw as { edits: unknown[] }).edits.length === 0
+  );
+}
 export type StructuredEdit = EditPlan["edits"][number];
 
 const EDIT_PATH_EXTS = [".ts", ".tsx", ".js", ".jsx"];

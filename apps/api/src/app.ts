@@ -29,7 +29,7 @@ import {
   STRUCTURED_SYSTEM,
 } from "@hubris/llm";
 import { createHash } from "crypto";
-import { executionLimitsFromEnv, isSafeGitRef, REPO_WORKDIR, sandboxConfigFromEnv, uploadFile } from "@hubris/sandbox";
+import { executionLimitsFromEnv, isSafeGitRef, isSandboxWaitTimeout, REPO_WORKDIR, sandboxConfigFromEnv, uploadFile } from "@hubris/sandbox";
 import {
   buildCheckoutScript,
   CHECKOUT_UPLOAD_PATH,
@@ -69,6 +69,7 @@ import {
   buildSourceExcerpts,
   buildStructuredScript,
   EditPlanSchema,
+  isEmptyEditPlan,
   isSupportedEditPath,
   parseCanonicalPatchContent,
   parseSourceMarkers,
@@ -112,7 +113,9 @@ import {
   apiKeyGuard,
   budgetSignal,
   coldStartGitCheck,
+  MIN_SANDBOX_BUDGET_MS,
   readiness,
+  remainingBudgetMs,
   requestBudget,
   runCommandWithinBudget as runCommand,
 } from "./runtime";
@@ -3062,6 +3065,22 @@ const image = parsed.data.image ?? "tag:node:20-slim";
         );
         return c.json({ error: "Malformed edit plan", status: 400 }, 400);
       }
+      // An empty plan is the model saying "nothing to change", not a broken
+      // plan: typically the analyzed revision already satisfies the contract
+      // (e.g. analyzing a branch without the defect). Still a failure with no
+      // sandbox use — but reported as what it is, with the revision.
+      if (isEmptyEditPlan(raw)) {
+        await persistRejection("no edit proposed", draft);
+        const revision = `${ref ?? "default branch"} @ ${(commitSha ?? "unknown").slice(0, 7)}`;
+        return c.json(
+          {
+            error: `The model proposed no change for ${revision}. The analyzed source may already satisfy the repair contract — confirm the defect reproduces on this revision (Reproduce) before forging.`,
+            code: "NO_EDIT_PROPOSED",
+            status: 422,
+          },
+          422
+        );
+      }
       const check = EditPlanSchema.safeParse(raw);
       if (!check.success) {
         await persistRejection("invalid edit plan", draft);
@@ -3080,6 +3099,16 @@ const image = parsed.data.image ?? "tag:node:20-slim";
     } catch (error: any) {
       if (error instanceof ModelError) {
         console.error("Forge-structured draft error:", error.kind, error.message);
+        if (error.kind === "timeout") {
+          return c.json(
+            {
+              error: "The model did not return an edit plan in time — no sandbox run started. Try again; the model provider may be slow.",
+              code: "MODEL_TIMEOUT",
+              status: 504,
+            },
+            504
+          );
+        }
         return c.json({ error: "Model request failed", status: 502 }, 502);
       }
       throw error;
@@ -3171,6 +3200,20 @@ const image = parsed.data.image ?? "tag:node:20-slim";
       }
     }
 
+    // A sandbox run that cannot finish inside the request's time budget would
+    // only be cut off mid-flight: stop before any upload instead.
+    const budgetLeft = remainingBudgetMs();
+    if (budgetLeft !== null && budgetLeft < MIN_SANDBOX_BUDGET_MS) {
+      return c.json(
+        {
+          error: `Not enough request time left to run the sandbox (${Math.floor(budgetLeft / 1000)}s remaining) — no sandbox run started.`,
+          code: "BUDGET_EXHAUSTED",
+          status: 504,
+        },
+        504
+      );
+    }
+
     // All edits validated locally: upload and run the full structured flow.
     let uploaded;
     let validatorUpload;
@@ -3189,7 +3232,7 @@ const image = parsed.data.image ?? "tag:node:20-slim";
       );
     } catch (error: any) {
       console.error("Forge-structured upload error:", error?.message);
-      return c.json({ error: "Sandbox upload failed", status: 502 }, 502);
+      return c.json({ error: "Sandbox upload failed", code: "SANDBOX_UPLOAD_FAILED", status: 502 }, 502);
     }
     if (uploaded.sha256 !== localSha) {
       return c.json({ error: "Transfer integrity mismatch", status: 502 }, 502);
@@ -3220,7 +3263,17 @@ const image = parsed.data.image ?? "tag:node:20-slim";
       });
     } catch (error: any) {
       console.error("Forge-structured run error:", error?.message);
-      return c.json({ error: "Sandbox run failed", status: 502 }, 502);
+      if (isSandboxWaitTimeout(error)) {
+        return c.json(
+          {
+            error: "The sandbox run did not finish in time; no verification result was recorded.",
+            code: "SANDBOX_TIMEOUT",
+            status: 504,
+          },
+          504
+        );
+      }
+      return c.json({ error: "Sandbox run failed", code: "SANDBOX_RUN_FAILED", status: 502 }, 502);
     }
     const durationMs = Date.now() - runStarted;
 

@@ -28,6 +28,12 @@ services:
     envVars:
       - key: NODE_ENV
         value: production
+      # Render has no request limit, but the web app's Vercel proxy gives up
+      # at 290s (maxDuration 300). Below that, model and sandbox waits are
+      # clamped so a slow Forge ends as a recorded TIMEOUT / explicit 504
+      # from the API rather than an abandoned request.
+      - key: HUBRIS_FUNCTION_MAX_DURATION_S
+        value: "285"
       - key: DATABASE_URL
         sync: false
       - key: HUBRIS_API_KEY

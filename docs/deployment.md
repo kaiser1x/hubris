@@ -54,7 +54,7 @@ else — in particular not `web`. Each of those packages now declares
 | `NEBIUS_PROJECT_ID` | yes | Sandbox project |
 | `GITHUB_TOKEN` | for SHIP | Fine-grained token, **contents + pull requests write on the target repository only** |
 | `HUBRIS_API_KEY` | **strongly recommended** | Shared secret. When set, every route except `/health` requires header `x-hubris-api-key`. Without it the public API is open: anyone could spend sandbox/model credits and open PRs with `GITHUB_TOKEN`. |
-| `HUBRIS_FUNCTION_MAX_DURATION_S` | recommended | Set to the same number as the project's Function Max Duration (`800` or `300`). Sandbox waits and model calls are clamped to what is left of it. Defaults to 300 on Vercel. |
+| `HUBRIS_FUNCTION_MAX_DURATION_S` | recommended | Set to the same number as the project's Function Max Duration (`800` or `300`). Sandbox waits and model calls are clamped to what is left of it. Defaults to 300 on Vercel. **On Render** (no platform limit) set it below the web proxy's 290s Forge wait — `render.yaml` sets `285` — so a slow Forge ends as an explicit timeout from the API instead of an abandoned request. |
 | `HUBRIS_DB_POOL_MAX` | optional | Per-instance connection cap (default: driver default, 10) |
 | `HUBRIS_GIT_PROBE_REPO` | optional | Public https repo for the diagnostics `ls-remote` step (default `https://github.com/octocat/Hello-World.git`) |
 | `NEBIUS_BASE_URL`, `NEBIUS_SANDBOX_URL`, `HUBRIS_*` limits | optional | See `.env.example` |
