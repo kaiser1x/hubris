@@ -808,9 +808,26 @@ export type InvestigationState =
   | "AMBIGUOUS"
   | "NO_MATCH";
 
+export interface InvestigationClarificationOptionView {
+  // Stable id issued by the API for this exact question. Legacy persisted
+  // runs carried bare strings; those use the label as the id.
+  id: string;
+  label: string;
+}
+
 export interface InvestigationClarificationView {
+  // Null for legacy runs that predate structured answers.
+  questionId: string | null;
   question: string;
-  options: string[];
+  options: InvestigationClarificationOptionView[];
+}
+
+// Why no repair contract could be established when asking more questions
+// cannot help (a specific, actionable reason).
+export interface InvestigationBlockedView {
+  code: string;
+  reason: string;
+  nextStep: string;
 }
 
 export interface InvestigationView {
@@ -826,6 +843,7 @@ export interface InvestigationView {
   observedBehavior?: string | null;
   expectedBehavior?: string | null;
   clarification?: InvestigationClarificationView | null;
+  blocked?: InvestigationBlockedView | null;
 }
 
 export type ReadyInvestigationView = InvestigationView & {
@@ -860,9 +878,29 @@ function asInvestigationState(v: unknown): InvestigationState | null {
 function asClarification(v: unknown): InvestigationClarificationView | null {
   if (!isRecord(v)) return null;
   const question = asString(v.question);
-  const options = asStringArray(v.options);
+  const options: InvestigationClarificationOptionView[] = [];
+  if (Array.isArray(v.options)) {
+    for (const raw of v.options) {
+      if (typeof raw === "string" && raw.length > 0) {
+        options.push({ id: raw, label: raw });
+      } else if (isRecord(raw)) {
+        const id = asString(raw.id);
+        const label = asString(raw.label);
+        if (id && label) options.push({ id, label });
+      }
+    }
+  }
   if (!question || options.length === 0) return null;
-  return { question, options };
+  return { questionId: asString(v.questionId), question, options };
+}
+
+function asBlocked(v: unknown): InvestigationBlockedView | null {
+  if (!isRecord(v)) return null;
+  const code = asString(v.code);
+  const reason = asString(v.reason);
+  const nextStep = asString(v.nextStep);
+  if (!code || !reason || !nextStep) return null;
+  return { code, reason, nextStep };
 }
 
 // Parse the structured investigate response. Returns null when the payload
@@ -955,6 +993,7 @@ export function toInvestigation(data: unknown): InvestigationView | null {
     observedBehavior: asString(data.observedBehavior),
     expectedBehavior: asString(data.expectedBehavior),
     clarification: asClarification(data.clarification),
+    blocked: asBlocked(data.blocked),
   };
 }
 
@@ -1037,18 +1076,31 @@ function isGroundedPlan(plan: InvestigationPlanView): boolean {
 export type InvestigateBodyResult =
   | {
       ok: true;
-      body: { jobId: string; focus: string; priorQuestion?: string; clarification?: string };
+      body: {
+        jobId: string;
+        focus: string;
+        priorQuestion?: string;
+        clarification?: string;
+        priorInvestigationId?: string;
+        answer?: { questionId: string; optionId: string };
+      };
     }
   | { ok: false; error: string };
 
+// A clarification answer: the structured form (preferred) names the question
+// and option by their stable ids; the legacy form is free text.
+export type InvestigateClarification =
+  | { priorQuestion: string; answer: string }
+  | { priorInvestigationId: string; questionId: string; optionId: string };
+
 // Build the investigate request body. The description is required and
 // bounded like the Forge focus contract. An optional clarification carries the
-// focused question plus the user's answer so the agent resumes instead of
-// asking the user to restate the whole bug. Never throws.
+// answer so the agent resumes instead of asking the user to restate the whole
+// bug. Never throws.
 export function buildInvestigateBody(
   jobId: string,
   description: string,
-  clarification?: { priorQuestion: string; answer: string }
+  clarification?: InvestigateClarification
 ): InvestigateBodyResult {
   if (!jobId || jobId.trim().length === 0) {
     return { ok: false, error: "No analysis job selected." };
@@ -1059,6 +1111,18 @@ export function buildInvestigateBody(
   }
   if (trimmed.length > 500) {
     return { ok: false, error: "Description must be 500 characters or fewer." };
+  }
+  if (clarification && "optionId" in clarification) {
+    const priorInvestigationId = clarification.priorInvestigationId?.trim() ?? "";
+    const questionId = clarification.questionId?.trim() ?? "";
+    const optionId = clarification.optionId?.trim() ?? "";
+    if (!priorInvestigationId || !questionId || !optionId) {
+      return { ok: false, error: "That answer can no longer be matched to its question. Investigate again." };
+    }
+    return {
+      ok: true,
+      body: { jobId, focus: trimmed, priorInvestigationId, answer: { questionId, optionId } },
+    };
   }
   const answer = clarification?.answer?.trim() ?? "";
   return {
@@ -1078,11 +1142,27 @@ export function buildInvestigateBody(
 // the user approved is exactly what the Forge endpoint receives. Never
 // invents content beyond the plan fields. Never throws.
 export function composeForgeFocus(plan: InvestigationPlanView): string {
+  const c = plan.repairContract;
+  // The evidence chain repeats facts the contract already states, so it comes
+  // AFTER the unique content (constraints) and lists only non-empty sections:
+  // when the 2000-character budget runs out, only the repetition is cut.
+  const chain: Array<[string, string[]]> = [
+    ["Setup", c.setupFacts],
+    ["Action", c.actionFacts],
+    ["Observed", c.observedFacts],
+    ["Expected", c.expectedFacts],
+    ["Source", c.sourceEvidence],
+    ["Assertions", c.relevantAssertions.join(" ") === c.expectedFacts.join(" ") ? [] : c.relevantAssertions],
+  ];
+  const evidenceChain = chain
+    .filter(([, facts]) => facts.length > 0)
+    .map(([label, facts]) => `${label}: ${facts.join(" ")}`)
+    .join(" ");
   const text = [
     `Target: ${plan.target.function} (${plan.target.file}). Current: ${plan.currentBehavior} Expected: ${plan.expectedBehavior}`,
-    `Repair contract: Required outcome: ${plan.repairContract.requiredOutcome} Preserve: ${plan.repairContract.preserveBehavior.join(" ")} Condition: ${plan.repairContract.relevantCondition} Operation: ${plan.repairContract.relevantOperation} Error: ${plan.repairContract.existingErrorContract} Minimal repair: ${plan.repairContract.minimalRepairDescription}`,
-    `Evidence chain: Setup: ${plan.repairContract.setupFacts.join(" ")} Action: ${plan.repairContract.actionFacts.join(" ")} Observed: ${plan.repairContract.observedFacts.join(" ")} Expected: ${plan.repairContract.expectedFacts.join(" ")} Source: ${plan.repairContract.sourceEvidence.join(" ")} Assertions: ${plan.repairContract.relevantAssertions.join(" ")}`,
+    `Repair contract: Required outcome: ${c.requiredOutcome} Preserve: ${c.preserveBehavior.join(" ")} Condition: ${c.relevantCondition} Operation: ${c.relevantOperation} Error: ${c.existingErrorContract} Minimal repair: ${c.minimalRepairDescription}`,
     `Constraints: ${plan.constraints.join(" ")}`,
+    `Evidence chain: ${evidenceChain}`,
     `Evidence: ${plan.evidence.join(" ")}`,
   ].join(" ");
   return text.length > 2000 ? text.slice(0, 2000) : text;
@@ -1124,12 +1204,25 @@ export function shipEligible(
     return { eligible: false, reason: `The repair is not verified (${a.state}).` };
   }
   if (a.targetVerificationPassed === false) {
-    return { eligible: false, reason: "The investigated behavior did not pass verification." };
+    return { eligible: false, reason: "Target verification must pass before shipping; the investigated behavior did not pass verification." };
+  }
+  // Mirrors the API: REPAIR_VERIFIED needs an explicit confirmed target pass.
+  // FULL_SUITE_PASSED is proven by the whole suite and may have no targeted run.
+  if (a.state === "REPAIR_VERIFIED" && a.targetVerificationPassed !== true) {
+    return {
+      eligible: false,
+      reason: "Target verification must pass before shipping; no confirmed target pass was recorded.",
+    };
   }
   if (!run.applyApplied) {
     return { eligible: false, reason: "The patch was not applied." };
   }
   return { eligible: true, reason: "" };
+}
+
+// Tri-state target-verification mark: a missing result is never shown as a pass.
+export function targetVerificationMark(passed: boolean | null | undefined): string {
+  return passed === true ? "✓" : passed === false ? "✗" : "—";
 }
 
 export type ShipBodyResult =

@@ -13,6 +13,7 @@ import {
   shipEligible,
   shipTitlePreview,
   SHIP_PATH,
+  targetVerificationMark,
   type ForgeRunView,
   type PullRequestView,
 } from "../../lib/forge-run";
@@ -220,7 +221,7 @@ function ShipPageContent() {
         <>
           <section className="mt-8 max-w-2xl border border-[#dedada] bg-white/60 px-5 py-5">
             <p className="font-display text-[26px] leading-none">
-              {assessment?.state === "REPAIR_VERIFIED" || assessment?.state === "FULL_SUITE_PASSED"
+              {eligibility.eligible
                 ? "VERIFIED REPAIR READY TO SHIP"
                 : "REPAIR NOT READY TO SHIP"}
             </p>
@@ -237,7 +238,7 @@ function ShipPageContent() {
                   <dt className="text-[#7A7171] shrink-0">Target verification</dt>
                   <dd className="text-right">
                     <span>
-                      {assessment.targetVerificationPassed === false ? "✗" : "✓"}{" "}
+                      {targetVerificationMark(assessment.targetVerificationPassed)}{" "}
                       {assessment.targetScenario}
                     </span>
                     {assessment.targetTestFile && (
@@ -328,7 +329,13 @@ function ShipPageContent() {
                 </div>
                 <div className="flex justify-between py-1.5 border-b border-[#dedada]">
                   <dt className="text-[#7A7171]">Target verification</dt>
-                  <dd>{assessment?.targetVerificationPassed === false ? "✗ Failed" : "✓ Passed"}</dd>
+                  <dd>
+                    {assessment?.targetVerificationPassed === true
+                      ? "✓ Passed"
+                      : assessment?.targetVerificationPassed === false
+                        ? "✗ Failed"
+                        : "— Not confirmed"}
+                  </dd>
                 </div>
                 <div className="flex justify-between py-1.5">
                   <dt className="text-[#7A7171]">Regression suite</dt>

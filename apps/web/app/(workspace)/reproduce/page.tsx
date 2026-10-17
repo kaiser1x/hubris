@@ -21,7 +21,7 @@ interface Evidence {
   requestedCommand?: string;
   command: string;
   executedCommand?: string | null;
-  outcome: "REPRODUCED" | "NOT_REPRODUCED" | "SETUP_FAILED" | "EXECUTION_FAILED" | "TIMEOUT";
+  outcome: "REPRODUCED" | "NOT_REPRODUCED" | "SETUP_FAILED" | "EXECUTION_FAILED" | "UNRELATED_FAILURE" | "TIMEOUT";
   reason: string;
   exitCode: number | null;
   stdout: string;
@@ -45,6 +45,7 @@ const OUTCOME_COPY: Record<Evidence["outcome"], { title: string; detail: string 
   NOT_REPRODUCED: { title: "NOT REPRODUCED", detail: "Script completed, but the reported failure was not observed." },
   SETUP_FAILED: { title: "SETUP FAILED", detail: "Sandbox could not be prepared." },
   EXECUTION_FAILED: { title: "EXECUTION FAILED", detail: "Reproduction command failed to execute." },
+  UNRELATED_FAILURE: { title: "NOT CONFIRMED", detail: "The command failed, but not in the investigated scenario, so it does not demonstrate the reported behavior." },
   TIMEOUT: { title: "TIMEOUT", detail: "Reproduction exceeded the configured timeout." },
 };
 

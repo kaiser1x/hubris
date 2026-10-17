@@ -18,6 +18,7 @@
 // model is configured, the agent degrades to the deterministic path exactly
 // as before.
 
+import { createHash } from "node:crypto";
 import {
   buildInvestigationSynthesisPrompt,
   buildInvestigationUnderstandingPrompt,
@@ -64,9 +65,44 @@ export interface InvestigationProvenance {
   commitSha: string | null;
 }
 
+// One viable interpretation of the report: an existing test scenario and the
+// repository function it exercises. Options come ONLY from retrieved
+// repository evidence, and carry a stable id derived from that evidence, so a
+// selection can be validated against the exact question that offered it.
+export interface ClarificationOption {
+  id: string;
+  label: string;
+  file: string;
+  scenario: string;
+  function: string;
+  functionFile: string;
+}
+
 export interface InvestigationClarification {
+  // Stable for (option set, report): identifies exactly which question a
+  // selection answers.
+  questionId: string;
+  // Stable for the option set alone: used to detect an equivalent question
+  // being asked again without progress.
+  optionSetKey: string;
   question: string;
-  options: string[];
+  options: ClarificationOption[];
+}
+
+// The user's validated answer to a prior clarification. The option is resolved
+// server-side from the persisted prior question — never trusted from the client.
+export interface ClarificationSelection {
+  questionId: string;
+  optionId: string;
+  option: ClarificationOption;
+}
+
+// A specific, actionable reason no repair contract could be established and
+// no answer from the user can fix it by choosing among options.
+export interface BlockedInfo {
+  code: string;
+  reason: string;
+  nextStep: string;
 }
 
 export interface AgentInvestigation {
@@ -77,6 +113,12 @@ export interface AgentInvestigation {
   expectedBehavior: string;
   modelSummary: string;
   clarification: InvestigationClarification | null;
+  // Set instead of a clarification when more questions cannot help.
+  blocked: BlockedInfo | null;
+  // Answers applied to this run, oldest first (carried across retries).
+  selections: ClarificationSelection[];
+  // Option-set keys already asked in this conversation (loop guard).
+  askedOptionSets: string[];
   // Evidence actually retrieved for this run (the cluster), in the evidence
   // contract shape. Model-cited ids that did not resolve are dropped.
   retrievedEvidence: Evidence[];
@@ -101,7 +143,14 @@ export interface RunInvestigationAgentInput {
   tests: InvestigateInput["tests"];
   relationships: InvestigateInput["relationships"];
   sourceFacts?: InvestigateInput["sourceFacts"];
+  // Free-text hint (legacy): feeds the model prompts and retrieval queries only.
   clarification?: { priorQuestion: string; answer: string };
+  // Validated, structured answers to earlier clarification questions. Unlike
+  // the free-text hint these are authoritative: the selected scenario/target
+  // is pinned into the evidence the contract is built from.
+  selections?: ClarificationSelection[];
+  // Option-set keys already asked in this conversation.
+  askedOptionSets?: string[];
   signal?: AbortSignal;
 }
 
@@ -206,28 +255,117 @@ function resolveSelectedEvidence(
     const unit = byId.get(id);
     if (!unit) continue;
     selectedIds.push(id);
-    units.push({ unit, score: 0, signals: { lexical: 0, semantic: 0, name: 0, path: 0, scenario: 0, assertion: 0, graph: 0, location: 0, subject: 0 } });
+    units.push({ unit, score: 0, signals: ZERO_SIGNALS });
   }
   return { units, selectedIds };
 }
 
-function derivedClarificationOptions(index: RetrievalIndex, retrieved: ScoredEvidence[]): string[] {
-  const options: string[] = [];
+const ZERO_SIGNALS = {
+  lexical: 0,
+  semantic: 0,
+  name: 0,
+  path: 0,
+  scenario: 0,
+  assertion: 0,
+  graph: 0,
+  location: 0,
+  subject: 0,
+};
+
+const MAX_CLARIFICATION_OPTIONS = 4;
+
+function shortHash(...parts: string[]): string {
+  return createHash("sha1").update(parts.join("\u0000")).digest("hex").slice(0, 12);
+}
+
+export function normalizeReport(report: string): string {
+  return report.replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+export function optionSetKeyOf(options: ClarificationOption[]): string {
+  return shortHash(...options.map((o) => o.id).sort());
+}
+
+export function questionIdFor(optionSetKey: string, report: string): string {
+  return `q_${shortHash(optionSetKey, normalizeReport(report))}`;
+}
+
+// The repository function a test scenario is about: what it asserts on first,
+// otherwise what it calls. Only functions that exist in the twin count.
+function scenarioFunction(scenario: TestScenario, known: Set<string>): string | null {
+  for (const name of scenario.asserted) if (known.has(name)) return name;
+  for (const name of scenario.called) if (known.has(name)) return name;
+  return null;
+}
+
+// Clarification choices are existing test scenarios from the retrieved
+// evidence — facts the user can recognise ("which of these tests describes the
+// behavior you mean?") instead of questions about implementation details.
+// Stable ids derive from (file, scenario, function), so the same repository
+// evidence always yields the same ids.
+function buildClarificationOptions(
+  index: RetrievalIndex,
+  retrieved: ScoredEvidence[],
+  functions: TwinFunctionInput[],
+  known: Set<string>
+): ClarificationOption[] {
+  const options: ClarificationOption[] = [];
+  const seen = new Set<string>();
   for (const s of retrieved) {
-    const label =
-      s.unit.sourceType === "source" && s.unit.function
-        ? `${s.unit.function}() in ${s.unit.file}`
-        : s.unit.sourceType === "test" && s.unit.testScenario
-          ? `the "${s.unit.testScenario}" behavior`
-          : null;
-    if (label && !options.includes(label)) options.push(label);
-    if (options.length >= 5) break;
+    if (s.unit.sourceType !== "test" || !s.unit.testScenario) continue;
+    const scenario = index.scenarios.find(
+      (sc) => sc.file === s.unit.file && sc.description === s.unit.testScenario
+    );
+    if (!scenario || seen.has(scenario.id)) continue;
+    const fnName = scenarioFunction(scenario, known);
+    if (!fnName) continue;
+    seen.add(scenario.id);
+    const fn = functions.find((f) => f.name === fnName);
+    options.push({
+      id: `opt_${shortHash(scenario.file, scenario.description, fnName)}`,
+      label: `"${scenario.description}" (${scenario.file}) — exercises ${fnName}()`,
+      file: scenario.file,
+      scenario: scenario.description,
+      function: fnName,
+      functionFile: fn?.path ?? "",
+    });
+    if (options.length >= MAX_CLARIFICATION_OPTIONS) break;
   }
   return options;
 }
 
-function fallbackClarificationQuestion(report: string): string {
-  return `Which behavior is wrong in "${report.slice(0, 120)}"?`;
+const CLARIFICATION_QUESTION =
+  "Several existing tests could describe this report. Which one matches the behavior you mean?";
+
+// Turn a deterministic evidence gap into a specific, actionable blocked state.
+function describeBlock(code: string, message: string, afterSelection: boolean): BlockedInfo {
+  const nextStepByCode: Record<string, string> = {
+    CONTRADICTORY_REPORT:
+      "State the expected behavior once, without requiring and rejecting the same outcome.",
+    NO_TEST_SCENARIO:
+      "No existing test exercises the target. Name the function and the test file that covers it, or add a failing test that reproduces the report.",
+    SCENARIO_DOES_NOT_EXERCISE_TARGET:
+      "Name the function and the test that exercises it, or add a test that does.",
+    SCENARIO_ASSERTS_NOTHING:
+      "The matching test does not assert the expected outcome. Name a test that does, or state the expected result (for example the exact error text).",
+    CONTRACT_NOT_GROUNDED:
+      "The repository source does not show a condition and an operation to change for this test. Name the function whose behavior is wrong.",
+    TARGET_UNRESOLVED:
+      "No repository function matches the report. Name the function or file involved.",
+    EVIDENCE_UNRESOLVED:
+      "The selected evidence could not be resolved against the repository. Refine the report and investigate again.",
+    REPEATED_QUESTION:
+      "This question was already asked and the answer did not establish a repair contract. Add the missing detail (the function or test involved) to the description and investigate again.",
+    STALE_SELECTION:
+      "The earlier selection no longer matches the repository evidence. Investigate again.",
+  };
+  const nextStep =
+    nextStepByCode[code] ?? "Add the function or test involved to the description and investigate again.";
+  return {
+    code,
+    reason: afterSelection ? `Your selection was applied, but ${message.charAt(0).toLowerCase()}${message.slice(1)}` : message,
+    nextStep,
+  };
 }
 
 // Run the agent. Deterministic and safe: a null/absent model, a model error,
@@ -272,6 +410,33 @@ export async function runInvestigationAgent(
       0,
       RETRIEVAL_LIMIT
     );
+  }
+
+  // A validated answer to an earlier clarification is authoritative: the
+  // selected scenario and the function it exercises are pinned to the front of
+  // the evidence the contract is built from. The answer is never merely a hint
+  // that a later model call may ignore or a retry may drop.
+  const selections = input.selections ?? [];
+  const pinnedOption = selections.length > 0 ? selections[selections.length - 1].option : null;
+  const pinnedScenario = pinnedOption
+    ? index.scenarios.find((sc) => sc.file === pinnedOption.file && sc.description === pinnedOption.scenario)
+    : undefined;
+  const staleSelection = pinnedOption !== null && !pinnedScenario;
+  if (pinnedOption && pinnedScenario) {
+    const pinnedTest = index.units.find(
+      (u) => u.sourceType === "test" && u.file === pinnedScenario.file && u.testScenario === pinnedScenario.description
+    );
+    const pinnedSource = index.units.find(
+      (u) =>
+        u.sourceType === "source" &&
+        u.function === pinnedOption.function &&
+        (pinnedOption.functionFile ? u.file === pinnedOption.functionFile : true)
+    );
+    const pinnedUnits: ScoredEvidence[] = [pinnedSource, pinnedTest]
+      .filter((u): u is NonNullable<typeof u> => Boolean(u))
+      .map((unit) => ({ unit, score: 0, signals: ZERO_SIGNALS }));
+    const pinnedIds = new Set(pinnedUnits.map((u) => u.unit.id));
+    retrieved = [...pinnedUnits, ...retrieved.filter((s) => !pinnedIds.has(s.unit.id))];
   }
 
   // Phase 4 — authoritative selection → deterministic validation/extraction.
@@ -386,24 +551,34 @@ export async function runInvestigationAgent(
       plan: null,
       message: `No repository evidence connects to "${input.report.slice(0, 160)}".`,
     };
+  } else if (staleSelection) {
+    deterministic = {
+      status: "AMBIGUOUS",
+      plan: null,
+      message: "The scenario you selected is no longer present in the repository evidence.",
+      code: "EVIDENCE_UNRESOLVED",
+    };
   } else if (resolutionFailure) {
     deterministic = {
       status: "AMBIGUOUS",
       plan: null,
       message:
         "The selected evidence could not be resolved to repository evidence. Refine the report or run a new investigation.",
+      code: "EVIDENCE_UNRESOLVED",
     };
   } else if (!target) {
     deterministic = {
       status: "AMBIGUOUS",
       plan: null,
       message: "The selected repository evidence does not identify a target function for this report.",
+      code: "TARGET_UNRESOLVED",
     };
   } else if (selectedScenarios.length === 0) {
     deterministic = {
       status: "AMBIGUOUS",
       plan: null,
       message: `The selected evidence does not include a test scenario exercising "${targetName}".`,
+      code: "NO_TEST_SCENARIO",
     };
   } else {
     deterministic = buildPlanFromEvidence({
@@ -442,26 +617,36 @@ export async function runInvestigationAgent(
   // Phase 5 — map to the state model.
   let state: InvestigationState;
   let clarification: InvestigationClarification | null = null;
+  let blocked: BlockedInfo | null = null;
+  const askedOptionSets = input.askedOptionSets ?? [];
   if (deterministic.status === "NO_MATCH") {
     state = "NO_MATCH";
   } else if (deterministic.status === "READY") {
     state = "READY_FOR_REVIEW";
   } else {
-    // Deterministic ambiguity. A grounded clarification beats a dead end.
-    const question = synthesis?.clarificationQuestion?.trim();
-    const modelOptions = (synthesis?.clarificationOptions ?? []).filter(Boolean);
-    const options = modelOptions.length > 0 ? modelOptions : derivedClarificationOptions(index, retrieved);
-    if (question && options.length > 0) {
-      clarification = { question, options: options.slice(0, 5) };
-      state = "CLARIFICATION_NEEDED";
-    } else if (options.length > 0) {
+    // Deterministic ambiguity. Ask only when materially different, evidence-
+    // grounded interpretations remain — and never twice for the same question.
+    // Everything else is a specific blocked state: more questions cannot add
+    // repository evidence that is not there.
+    const code = deterministic.status === "AMBIGUOUS" ? (deterministic.code ?? "CONTRACT_NOT_GROUNDED") : "CONTRACT_NOT_GROUNDED";
+    const answered = selections.length > 0;
+    const askable = !answered && code !== "CONTRADICTORY_REPORT" && code !== "EVIDENCE_UNRESOLVED";
+    const options = askable
+      ? buildClarificationOptions(index, retrieved, input.functions, knownFunctions)
+      : [];
+    const optionSetKey = options.length >= 2 ? optionSetKeyOf(options) : null;
+    const repeated = optionSetKey !== null && askedOptionSets.includes(optionSetKey);
+    if (optionSetKey !== null && !repeated) {
       clarification = {
-        question: fallbackClarificationQuestion(input.report),
-        options: options.slice(0, 5),
+        questionId: questionIdFor(optionSetKey, input.report),
+        optionSetKey,
+        question: CLARIFICATION_QUESTION,
+        options,
       };
       state = "CLARIFICATION_NEEDED";
     } else {
       state = "AMBIGUOUS";
+      blocked = describeBlock(repeated ? "REPEATED_QUESTION" : code, deterministic.message, answered);
     }
   }
 
@@ -472,6 +657,9 @@ export async function runInvestigationAgent(
     expectedBehavior,
     modelSummary,
     clarification,
+    blocked,
+    selections,
+    askedOptionSets,
     retrievedEvidence: usedUnits.map((s) => toEvidence(s.unit)),
     selectedEvidenceIds: resolved.selectedIds,
     relevantScenarios,
@@ -489,4 +677,123 @@ export function evidenceFromIndex(index: RetrievalIndex, ids: string[]): Evidenc
     .map((id) => byId.get(id))
     .filter((u): u is NonNullable<typeof u> => Boolean(u))
     .map(toEvidence);
+}
+
+// ---- clarification answer resolution (server-side validation) ----
+
+export interface ClarificationAnswerRequest {
+  priorInvestigationId?: string;
+  answer: { questionId: string; optionId: string };
+}
+
+export type ClarificationAnswerResolution =
+  | {
+      ok: true;
+      selections: ClarificationSelection[];
+      askedOptionSets: string[];
+      // What the new run persists about the answer it was built from.
+      answer: { priorInvestigationId: string; questionId: string; optionId: string; label: string };
+    }
+  | { ok: false; code: string; error: string; status: 400 | 409 };
+
+function isRecord(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null;
+}
+
+function asOption(v: unknown): ClarificationOption | null {
+  if (!isRecord(v)) return null;
+  const { id, label, file, scenario } = v;
+  if (typeof id !== "string" || typeof label !== "string" || typeof file !== "string" || typeof scenario !== "string") {
+    return null;
+  }
+  if (typeof v.function !== "string" || v.function.length === 0) return null;
+  return {
+    id,
+    label,
+    file,
+    scenario,
+    function: v.function,
+    functionFile: typeof v.functionFile === "string" ? v.functionFile : "",
+  };
+}
+
+function asSelection(v: unknown): ClarificationSelection | null {
+  if (!isRecord(v)) return null;
+  const option = asOption(v.option);
+  if (!option || typeof v.questionId !== "string" || typeof v.optionId !== "string") return null;
+  return { questionId: v.questionId, optionId: v.optionId, option };
+}
+
+// Validate a structured answer against the persisted prior run of THIS job.
+// The option is resolved from the persisted question — a client can neither
+// invent an option nor answer a question that is no longer current. Stale,
+// already-answered, unknown, and report-changed answers are rejected.
+export function resolveClarificationAnswer(
+  priorRuns: unknown[],
+  request: ClarificationAnswerRequest,
+  report: string,
+  jobId: string
+): ClarificationAnswerResolution {
+  const fail = (code: string, error: string, status: 400 | 409): ClarificationAnswerResolution => ({
+    ok: false,
+    code,
+    error,
+    status,
+  });
+  const priorId = request.priorInvestigationId?.trim();
+  if (!priorId) {
+    return fail("MISSING_PRIOR", "An answer must reference the investigation that asked the question.", 400);
+  }
+  const prior = priorRuns.find(
+    (r): r is Record<string, unknown> =>
+      isRecord(r) && r.investigationId === priorId && r.jobId === jobId
+  );
+  if (!prior) {
+    return fail("PRIOR_NOT_FOUND", "The question this answer belongs to could not be found for this repository.", 409);
+  }
+  const clarification = isRecord(prior.clarification) ? prior.clarification : null;
+  const options = clarification && Array.isArray(clarification.options)
+    ? clarification.options.map(asOption).filter((o): o is ClarificationOption => o !== null)
+    : [];
+  if (!clarification || typeof clarification.questionId !== "string" || options.length === 0) {
+    return fail("NO_OPEN_QUESTION", "That investigation did not ask a question.", 409);
+  }
+  if (clarification.questionId !== request.answer.questionId) {
+    return fail("STALE_QUESTION", "This question is no longer current. Investigate again to get the current question.", 409);
+  }
+  if (normalizeReport(typeof prior.focus === "string" ? prior.focus : "") !== normalizeReport(report)) {
+    return fail("REPORT_CHANGED", "The description changed after the question was asked. Investigate again with the new description.", 409);
+  }
+  const alreadyAnswered = priorRuns.some(
+    (r) =>
+      isRecord(r) &&
+      isRecord(r.answer) &&
+      r.answer.priorInvestigationId === priorId &&
+      r.jobId === jobId
+  );
+  if (alreadyAnswered) {
+    return fail("ALREADY_ANSWERED", "This question was already answered.", 409);
+  }
+  const option = options.find((o) => o.id === request.answer.optionId);
+  if (!option) {
+    return fail("INVALID_OPTION", "The selected option is not one of the choices offered for this question.", 400);
+  }
+  const priorSelections = Array.isArray(prior.selections)
+    ? prior.selections.map(asSelection).filter((s): s is ClarificationSelection => s !== null)
+    : [];
+  const priorAsked = Array.isArray(prior.askedOptionSets)
+    ? prior.askedOptionSets.filter((k): k is string => typeof k === "string")
+    : [];
+  const askedKey = typeof clarification.optionSetKey === "string" ? clarification.optionSetKey : optionSetKeyOf(options);
+  return {
+    ok: true,
+    selections: [...priorSelections, { questionId: clarification.questionId, optionId: option.id, option }],
+    askedOptionSets: priorAsked.includes(askedKey) ? priorAsked : [...priorAsked, askedKey],
+    answer: {
+      priorInvestigationId: priorId,
+      questionId: clarification.questionId,
+      optionId: option.id,
+      label: option.label,
+    },
+  };
 }

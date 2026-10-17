@@ -1,5 +1,5 @@
 import type { ForgeRunView, VerifyResult } from "../lib/forge-run";
-import { shortCommit, shortRunStatus } from "../lib/forge-run";
+import { shortCommit, shortRunStatus, targetVerificationMark } from "../lib/forge-run";
 
 function CheckRow({ label, ok }: { label: string; ok: boolean }) {
   return (
@@ -106,7 +106,7 @@ function OutcomeBanner({ run }: { run: ForgeRunView }) {
           </div>
           <div className="flex justify-between py-1.5 border-b border-[#dedada]">
             <dt className="text-[#7A7171]">Target behavior</dt>
-            <dd>{assessment?.targetVerificationPassed === false ? "✗" : "✓"}</dd>
+            <dd>{targetVerificationMark(assessment?.targetVerificationPassed)}</dd>
           </div>
           <div className="flex justify-between py-1.5 border-b border-[#dedada]">
             <dt className="text-[#7A7171]">Full suite</dt>
@@ -379,7 +379,7 @@ export default function ForgeRunPanel({ run }: { run: ForgeRunView }) {
               <div className="pb-3 border-b border-[#dedada]">
                 <p className="text-[#7A7171]">Target verification</p>
                 <p className="mt-1">
-                  {run.verification.assessment.targetVerificationPassed === false ? "✗" : "✓"}{" "}
+                  {targetVerificationMark(run.verification.assessment.targetVerificationPassed)}{" "}
                   {run.verification.assessment.targetScenario}
                 </p>
                 {run.verification.assessment.targetTestFile && (

@@ -9,7 +9,8 @@
 // before the repro command could run.
 //
 // Outcome model:
-//   REPRODUCED        repro ran and exited non-zero (the reported failure)
+//   REPRODUCED        repro ran and the investigated scenario failed
+//   UNRELATED_FAILURE repro exited non-zero, but not in the investigated scenario
 //   NOT_REPRODUCED    repro ran and exited 0
 //   SETUP_FAILED      staging/install failed before the repro ran
 //   EXECUTION_FAILED  repro could not execute (command not found)
@@ -27,11 +28,15 @@ export type ReproOutcome =
   | "NOT_REPRODUCED"
   | "SETUP_FAILED"
   | "EXECUTION_FAILED"
+  | "UNRELATED_FAILURE"
   | "TIMEOUT";
 
 export interface ReproClassification {
   outcome: ReproOutcome;
   reason: string;
+  // Did the failure demonstrate the investigated behavior? null when the run
+  // was not tied to an investigated scenario.
+  demonstrated?: boolean | null;
 }
 
 export type VerificationResult =
@@ -118,14 +123,60 @@ export function buildVerifyScript(
   );
 }
 
+// What the investigation says the reported behavior is, as observable in a
+// test run: the scenario it named and the file that holds it.
+export interface ReproExpectation {
+  scenario?: string | null;
+  testFile?: string | null;
+}
+
+// Failures of the RUNNER or the module graph, not of a scenario's assertions.
+const RUNNER_ERROR_PATTERN =
+  /no test files? found|no tests? found|cannot find module|err_module_not_found|syntaxerror|failed to load|transform failed|unexpected token|command not found/i;
+
+// A line that reports a failing test (vitest/jest): FAIL header, a failure
+// glyph, or a numbered jest failure entry.
+const FAILING_LINE_PATTERN = /^\s*(?:FAIL\b|[×✗✕❌❯]|\d+\)\s)/;
+
+function normalizeForMatch(text: string): string {
+  return text.replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+// Does the output show the investigated scenario (or, absent a scenario, its
+// test file) FAILING? A scenario that merely appears in a passing line, or a
+// failure in some other test, does not count.
+function outputShowsFailure(output: string, expected: ReproExpectation): boolean {
+  const scenario = expected.scenario ? normalizeForMatch(expected.scenario) : "";
+  const file = expected.testFile ? normalizeForMatch(expected.testFile) : "";
+  for (const line of output.split("\n")) {
+    if (!FAILING_LINE_PATTERN.test(line)) continue;
+    const text = normalizeForMatch(line);
+    if (scenario) {
+      if (text.includes(scenario)) return true;
+    } else if (file && text.includes(file)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 // Classify a finished sandbox run. Never throws; malformed shapes degrade
 // to SETUP_FAILED rather than claiming a reproduction.
-export function classifyReproduction(input: {
-  exitCode: number | null;
-  timedOut: boolean;
-  stdout: string;
-  stderr: string;
-}): ReproClassification {
+//
+// With an investigation context (`expected`), a non-zero exit is REPRODUCED
+// only when the investigated scenario is the thing that failed. Any other
+// failure — a different test, a runner error, "no test files found" — proves
+// nothing about the reported behavior. Without a context the failure cannot
+// be tied to the report and is flagged as such (`demonstrated: null`).
+export function classifyReproduction(
+  input: {
+    exitCode: number | null;
+    timedOut: boolean;
+    stdout: string;
+    stderr: string;
+  },
+  expected?: ReproExpectation | null
+): ReproClassification {
   if (input.timedOut) {
     return { outcome: "TIMEOUT", reason: "Reproduction exceeded the configured timeout." };
   }
@@ -144,5 +195,28 @@ export function classifyReproduction(input: {
   if (input.exitCode === 0) {
     return { outcome: "NOT_REPRODUCED", reason: "Script completed, but the reported failure was not observed." };
   }
-  return { outcome: "REPRODUCED", reason: "Failure reproduced in isolated sandbox." };
+  const hasContext = Boolean(expected && (expected.scenario || expected.testFile));
+  if (!hasContext) {
+    return {
+      outcome: "REPRODUCED",
+      reason: "The command failed in the isolated sandbox, but it is not tied to an investigated scenario.",
+      demonstrated: null,
+    };
+  }
+  const output = `${input.stdout}\n${input.stderr}`;
+  if (outputShowsFailure(output, expected as ReproExpectation)) {
+    return { outcome: "REPRODUCED", reason: "The investigated scenario failed in the isolated sandbox.", demonstrated: true };
+  }
+  if (RUNNER_ERROR_PATTERN.test(output)) {
+    return {
+      outcome: "EXECUTION_FAILED",
+      reason: "The test runner could not run the investigated scenario (no test ran or a module failed to load).",
+      demonstrated: false,
+    };
+  }
+  return {
+    outcome: "UNRELATED_FAILURE",
+    reason: "The command failed, but the failure is not the investigated scenario, so it does not demonstrate the reported behavior.",
+    demonstrated: false,
+  };
 }

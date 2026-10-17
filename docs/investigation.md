@@ -63,6 +63,53 @@ Assertions that invoke a different known twin function (and do not reference
 the target, a report subject, or a report behavior concept) are excluded, so
 leftover checks in the same `it` block cannot leak in.
 
+## Clarification
+
+A clarification is asked **only** when materially different, evidence-grounded
+interpretations remain, and never about implementation details.
+
+- **A current-vs-expected difference is the bug, not a contradiction.** The
+  report is parsed sentence by sentence: the expectation is the `should / must /
+  expected` clause (or the text after `instead of`) of a non-directive sentence.
+  Investigation instructions ("Investigate why…", "Do not guess…", "Preserve the
+  existing error messages") are never read as expectations. A report is
+  contradictory only when one expectation clause both demands and rejects the
+  same outcome with nothing sequencing it ("accept the *first* request and
+  reject the *second*" is not a contradiction).
+- **Choices are existing test scenarios** from the retrieved evidence, with
+  stable ids (`opt_…`, derived from file + scenario + function) and a stable
+  question id (`q_…`). Model-written questions and options are ignored: the
+  model selects evidence; it does not author what the user is asked.
+- **At least two viable scenarios are required.** With fewer, or when the
+  report is contradictory, the run returns `state: AMBIGUOUS` with a specific
+  `blocked: { code, reason, nextStep }` instead of a question no answer can fix.
+- **Answers are authoritative.** `POST /api/investigate` accepts
+  `{ focus, priorInvestigationId, answer: { questionId, optionId } }`. The API
+  resolves the option from the *persisted* prior question of the same job and
+  rejects (without calling the model or persisting anything) an unknown option
+  (400), a stale question, a changed description, an unknown or other-job prior
+  run, or an already-answered question (409, `state: STALE_CLARIFICATION`).
+  The selected scenario and the function it exercises are pinned to the front
+  of the evidence the contract is built from, and the answer (`answer`,
+  `selections`, `askedOptionSets`) is persisted on the new run so retries carry
+  it. The legacy free-text `priorQuestion`/`clarification` fields remain a hint
+  for the model prompts and retrieval only.
+- **No equivalent question twice.** The option-set key of every asked question
+  is carried through the conversation; asking the same set again — or any
+  question after an answer was applied — yields a blocked state
+  (`REPEATED_QUESTION` / the specific evidence gap).
+
+Blocked codes: `CONTRADICTORY_REPORT`, `NO_TEST_SCENARIO`,
+`SCENARIO_DOES_NOT_EXERCISE_TARGET`, `SCENARIO_ASSERTS_NOTHING`,
+`CONTRACT_NOT_GROUNDED`, `TARGET_UNRESOLVED`, `EVIDENCE_UNRESOLVED`,
+`REPEATED_QUESTION`.
+
+## Causal evidence ordering
+
+The repair contract's operation/condition come from the **target function's own
+facts first**; callee facts follow. Line numbers only order facts within a file
+(comparing line numbers across files let an unrelated helper's early line win).
+
 ## Persistence
 
 Each run is a job `investigationRuns[]` record with `investigationId`, `jobId`,
@@ -90,3 +137,10 @@ runner-aware command built from actual repository metadata (package manager +
 test script + test file), e.g. `pnpm exec vitest run tests/orders.test.ts
 --reporter=verbose`. Reproduction evidence persists `jobId`,
 `investigationId`, and `commitSha`.
+
+A failing command is `REPRODUCED` only when the **investigated scenario** is
+what failed (its name on a failing line, or its test file when no scenario was
+named). A different failing test is `UNRELATED_FAILURE`; a runner that found no
+tests or failed to load a module is `EXECUTION_FAILED`. A run not bound to an
+investigation is still reported but flagged `demonstrated: null` ("not tied to
+an investigated scenario").
