@@ -27,13 +27,19 @@ function MismatchEvidence({ run }: { run: ForgeRunView }) {
         {m.sourceLength} chars · only {m.matchingPrefixChars} chars matched
         {m.sourceOffset >= 0 ? ` at source offset ${m.sourceOffset}` : ""}.
       </p>
+      {/* Shown as JSON strings so whitespace is exact: spaces are kept, and a
+          real line break reads differently from a literal backslash-n. */}
       <p className="font-mono text-[11px] leading-5 text-[#7A7171] mt-1.5">
         Model oldText begins:{" "}
-        <span className="text-[#0A0A0A]">{m.oldTextSnippet.slice(0, 120) || "—"}</span>
+        <code className="text-[#0A0A0A] whitespace-pre-wrap break-all" data-exact-snippet>
+          {m.oldTextSnippet ? JSON.stringify(m.oldTextSnippet.slice(0, 120)) : "—"}
+        </code>
       </p>
       <p className="font-mono text-[11px] leading-5 text-[#7A7171] mt-1">
         Source at match offset:{" "}
-        <span className="text-[#0A0A0A]">{m.sourceSnippet.slice(0, 160) || "—"}</span>
+        <code className="text-[#0A0A0A] whitespace-pre-wrap break-all" data-exact-snippet>
+          {m.sourceSnippet ? JSON.stringify(m.sourceSnippet.slice(0, 160)) : "—"}
+        </code>
       </p>
       <p className="font-mono text-[11px] leading-5 text-[#7A7171] mt-1.5">
         Byte-exact matching is enforced; the edit was not applied.

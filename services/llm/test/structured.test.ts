@@ -28,6 +28,17 @@ describe("buildStructuredPrompt", () => {
     expect(prompt).toContain("EXACTLY (character for character)");
   });
 
+  it("says how to encode line breaks in oldText/newText (production double-escape failure)", () => {
+    const prompt = buildStructuredPrompt(CTX);
+    const rule = prompt.split("\n").find((l) => l.startsWith("oldText and newText are JSON strings"));
+    expect(rule).toBeDefined();
+    const one = String.fromCharCode(92) + "n";
+    const two = String.fromCharCode(92, 92) + "n";
+    expect(rule).toContain(`encode each line break ONCE as ${one} (one backslash)`);
+    expect(rule).toContain(`Never write ${two}`);
+    expect(rule).toContain("real line breaks and the original indentation");
+  });
+
   it("demands machine-readable output and exposes no secrets", () => {
     const prompt = buildStructuredPrompt(CTX);
     expect(prompt).toContain("no markdown, no prose, no fences");
