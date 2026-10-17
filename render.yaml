@@ -1,0 +1,42 @@
+# Render Blueprint for the HUBRIS API. The web app stays on Vercel; point its
+# HUBRIS_API_BASE at this service's URL. Secrets are `sync: false`: Render asks
+# for their values when the Blueprint is first applied and never stores them here.
+services:
+  - type: web
+    name: hubris-api
+    runtime: docker
+    plan: free
+    # Same region as the Neon database (iad1).
+    region: virginia
+    branch: main
+    dockerfilePath: ./apps/api/Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    autoDeploy: true
+    # Redeploy only when the API or what it builds from changes.
+    buildFilter:
+      paths:
+        - apps/api/**
+        - services/**
+        - packages/**
+        - package.json
+        - pnpm-lock.yaml
+        - pnpm-workspace.yaml
+        - turbo.json
+        - tsconfig.base.json
+        - .dockerignore
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        sync: false
+      - key: HUBRIS_API_KEY
+        sync: false
+      - key: GITHUB_TOKEN
+        sync: false
+      - key: NEBIUS_API_KEY
+        sync: false
+      - key: NEBIUS_PROJECT_ID
+        sync: false
+      - key: NEBIUS_MODEL
+        sync: false
