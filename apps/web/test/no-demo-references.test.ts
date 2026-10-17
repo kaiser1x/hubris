@@ -5,8 +5,11 @@ import { fileURLToPath } from "node:url";
 
 // Regression guard: production web source must never contain the original
 // demo repository's identifiers. Test fixtures may keep them, so only
-// apps/web/app production code is scanned.
+// apps/web/app production code is scanned. The ONE exception is the public
+// evaluator demo's case definition (app/lib/demo-case.ts): every page reads
+// the demo case from there, never from inline literals.
 const APP_ROOT = fileURLToPath(new URL("../app", import.meta.url));
+const DEMO_CASE_FILE = join(APP_ROOT, "lib", "demo-case.ts");
 
 const FORBIDDEN = [
   "ts-js-dummy",
@@ -32,7 +35,7 @@ function walk(dir: string): string[] {
 }
 
 describe("no demo repository references in production web source", () => {
-  const files = walk(APP_ROOT);
+  const files = walk(APP_ROOT).filter((f) => f !== DEMO_CASE_FILE);
 
   it("scanned at least the workspace pages", () => {
     expect(files.length).toBeGreaterThan(20);
@@ -45,5 +48,9 @@ describe("no demo repository references in production web source", () => {
       return found.map((token) => `${file.replace(APP_ROOT, "app")}: ${token}`);
     });
     expect(hits).toEqual([]);
+  });
+
+  it("the demo case lives in exactly one module", () => {
+    expect(readFileSync(DEMO_CASE_FILE, "utf8")).toContain("ts-js-dummy");
   });
 });

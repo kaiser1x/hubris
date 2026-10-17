@@ -211,3 +211,24 @@ If git is missing, the real endpoints say so instead of blaming the repository:
 4. **Update `hubris-web`**: set `HUBRIS_API_BASE` and `HUBRIS_API_KEY`, redeploy.
 5. Smoke test in the UI: Codebase → analyze → Investigate → Reproduce → Forge →
    Ship (create a PR only if you want a real one).
+
+## Public evaluator demo
+
+The public site runs in **demo mode** (`HUBRIS_DEMO_MODE`, default on when
+`VERCEL` is set). Visitors start at `/demo`. The web server gives each browser
+a private session (httpOnly cookie, `proxy.ts`) and marks every API call with
+it; the API (`apps/api/src/demo.ts`) then enforces, server-side:
+
+| Rule | Behavior |
+|---|---|
+| Repository | only `kaiser1x/ts-js-dummy` @ `hubris/buggy-idempotency` (403 `DEMO_RESTRICTED`) |
+| Routes | analyze, jobs, investigate, reproduce, verify, forge-structured only (403 `DEMO_ROUTE_DISABLED`) |
+| SHIP | always refused for demo sessions (403 `DEMO_SHIP_DISABLED`); shipping needs a direct API call with `HUBRIS_API_KEY` |
+| Commands | Reproduce/Verify run only the fixed demo commands; no image/ref/command overrides |
+| Isolation | jobs are tagged with the creating session (`result.demoSession`); other sessions get 404 and see only their own jobs |
+| Limits | per session and per client: 5 analyses/h, 20 runs/h (client ×2); 2 concurrent steps overall, 1 per session; 150 runs/day (`HUBRIS_DEMO_*`) |
+
+Limits are in-memory on the single Render instance and reset when it
+restarts. Operators who need the full product (any repo, SHIP) call the API
+directly with `HUBRIS_API_KEY`, or run the web app with `HUBRIS_DEMO_MODE=off`
+somewhere private — never on the public site.

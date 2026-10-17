@@ -7,7 +7,7 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import { z } from "zod";
-import { desc, eq, sql } from "drizzle-orm";
+import { and, desc, eq, sql } from "drizzle-orm";
 import { analyzeRepository } from "@hubris/analyzer";
 import { getDb, schema } from "@hubris/db";
 import {
@@ -109,6 +109,7 @@ import {
 import { describeSourceMismatch } from "./mismatch";
 import { GIT_UNAVAILABLE_MESSAGE, isMissingBinary } from "./gitenv";
 import { DEFAULT_PROBE_REPO, isSafeProbeUrl, runGitDiagnostics, type GitDiagReport } from "./gitdiag";
+import { demoGuard, demoSessionOf } from "./demo";
 import {
   apiKeyGuard,
   budgetSignal,
@@ -403,6 +404,19 @@ app.use("*", requestBudget());
 app.use("*", apiKeyGuard());
 // Logs ONE line per function instance saying whether git works in this runtime.
 app.use("*", coldStartGitCheck());
+// Anonymous public-demo traffic (marked by the web app) is held to the demo
+// policy: one repo/branch, owned jobs only, fixed commands, no SHIP, limits.
+app.use(
+  "*",
+  demoGuard({
+    loadJobResult: async (id) => {
+      const db = getDb();
+      if (!db) return undefined;
+      const rows = await db.select({ result: schema.jobs.result }).from(schema.jobs).where(eq(schema.jobs.id, id));
+      return rows[0] ? rows[0].result : undefined;
+    },
+  })
+);
 
 // Maps a cloneAndArchive failure to a response. A host without git is a runtime
 // problem (503, actionable), not a repository problem.
@@ -584,6 +598,8 @@ const started = Date.now();
           endpoints: twin.endpoints.slice(0, 10),
         },
       };
+      // A demo job is owned by the session that created it (see demo.ts).
+      const demoSession = demoSessionOf(c);
       if (db) {
         await db
           .update(schema.jobs)
@@ -591,6 +607,7 @@ const started = Date.now();
             status: "complete",
             result: {
               ...payload,
+              ...(typeof demoSession === "string" && demoSession !== "invalid" ? { demoSession } : {}),
               full: {
                 functions: twin.functions,
                 classes: twin.classes,
@@ -642,10 +659,16 @@ app.get("/api/jobs", async (c: Context) => {
   const rawLimit = Number(c.req.query("limit"));
   const limit = Math.min(Math.max(Number.isFinite(rawLimit) ? Math.floor(rawLimit) : 20, 1), 100);
   const repoUrl = c.req.query("repoUrl");
+  // A demo session lists only the jobs it created (demoGuard validated it).
+  const session = demoSessionOf(c);
+  const owned = typeof session === "string" ? sql`${schema.jobs.result}->>'demoSession' = ${session}` : undefined;
+  const filters = [repoUrl ? eq(schema.jobs.repoUrl, repoUrl) : undefined, owned].filter(
+    (f): f is NonNullable<typeof f> => f !== undefined
+  );
   const base = db.select().from(schema.jobs).$dynamic();
-  const rows = repoUrl
-    ? await base.where(eq(schema.jobs.repoUrl, repoUrl)).orderBy(desc(schema.jobs.createdAt)).limit(limit)
-    : await base.orderBy(desc(schema.jobs.createdAt)).limit(limit);
+  const rows = await (filters.length > 0 ? base.where(and(...filters)) : base)
+    .orderBy(desc(schema.jobs.createdAt))
+    .limit(limit);
   return c.json({ jobs: rows });
 });
 

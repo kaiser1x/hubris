@@ -6,6 +6,7 @@ import { useSearchParams } from "next/navigation";
 import PromptEditor from "../../components/PromptEditor";
 import { useWorkspace } from "../../components/WorkspaceProvider";
 import { fetchJobById } from "../../lib/live-twin";
+import { DEMO_CASE } from "../../lib/demo-case";
 import { workspaceHref } from "../../lib/workspace";
 import {
   buildInvestigateBody,
@@ -32,18 +33,20 @@ function InvestigatePageContent() {
   const jobId = job?.id ?? null;
   const requestedJobId = searchParams.get("jobId");
   const requestedInvestigationId = searchParams.get("investigationId");
-  const [focus, setFocus] = useState("");
+  // Guided demo: prefill the known bug report (editable).
+  const demoFocus = searchParams.get("demo") === "1" ? DEMO_CASE.focus : "";
+  const [focus, setFocus] = useState(demoFocus);
   const [result, setResult] = useState<InvestigationView | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [reviewing, setReviewing] = useState(false);
 
   useEffect(() => {
-    setFocus("");
+    setFocus(demoFocus);
     setResult(null);
     setError(null);
     setReviewing(false);
-  }, [jobId]);
+  }, [jobId, demoFocus]);
 
   // When navigated with ?jobId&investigationId (e.g. VIEW INVESTIGATION from
   // Forge), load the exact saved investigation for review. Investigation
