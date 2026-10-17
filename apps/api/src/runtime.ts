@@ -198,3 +198,51 @@ export async function readiness(deps: {
     runtime: { platform: env.VERCEL ? "vercel" : "node", functionMaxDurationS: maxMs === null ? null : maxMs / 1000 },
   };
 }
+
+// ---- event-loop stall diagnostics (long-lived server) ----
+//
+// /health does no I/O, so a health check that times out means the event loop
+// was blocked (CPU-bound work in a request) or the process was gone. This
+// watchdog makes a stall visible in the service log together with the
+// requests in flight at the time: method and path only — never query
+// strings, headers, bodies or environment values.
+
+const inFlight = new Map<number, string>();
+let inFlightSeq = 0;
+
+export function trackInFlight(): MiddlewareHandler {
+  return async (c, next) => {
+    const id = ++inFlightSeq;
+    inFlight.set(id, `${c.req.method} ${c.req.path}`);
+    try {
+      await next();
+    } finally {
+      inFlight.delete(id);
+    }
+  };
+}
+
+export function inFlightRequests(): string[] {
+  return [...inFlight.values()];
+}
+
+export function watchEventLoop(
+  options: { intervalMs?: number; thresholdMs?: number; log?: (message: string) => void; now?: () => number } = {}
+): () => void {
+  const intervalMs = options.intervalMs ?? 500;
+  const thresholdMs = options.thresholdMs ?? 1000;
+  const log = options.log ?? ((m: string) => console.warn(m));
+  const now = options.now ?? Date.now;
+  let last = now();
+  const timer = setInterval(() => {
+    const t = now();
+    const lag = t - last - intervalMs;
+    last = t;
+    if (lag >= thresholdMs) {
+      const active = inFlightRequests();
+      log(`[hubris] event loop blocked ~${lag}ms; in flight: ${active.length > 0 ? active.join(", ") : "none"}`);
+    }
+  }, intervalMs);
+  timer.unref();
+  return () => clearInterval(timer);
+}
