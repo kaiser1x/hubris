@@ -28,7 +28,7 @@ export async function POST(request: Request) {
       headers: {
         "Content-Type": "application/json",
         "User-Agent": "HUBRIS/0.1.0",
-        ...apiAuthHeaders(),
+        ...apiAuthHeaders(request),
       },
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),

@@ -12,6 +12,7 @@ import {
   type ReadyInvestigationView,
 } from "../../lib/forge-run";
 import { suggestReproduction, type ReproductionSuggestion } from "../../lib/reproduction";
+import { DEMO_CASE } from "../../lib/demo-case";
 import { workspaceHref } from "../../lib/workspace";
 
 type RunState = "idle" | "running" | "done";
@@ -63,6 +64,8 @@ function ReproducePageContent() {
   const jobId = job?.id ?? null;
   const requestedJobId = searchParams.get("jobId");
   const requestedInvestigationId = searchParams.get("investigationId");
+  // Guided demo: start from the fixed command the demo allows.
+  const demoScript = searchParams.get("demo") === "1" ? DEMO_CASE.reproduceCommand : "";
   const jobRepo = repo.hasContext ? repo.repoName : null;
   const [run, setRun] = useState<RunState>("idle");
   const [script, setScript] = useState("");
@@ -75,7 +78,7 @@ function ReproducePageContent() {
   useEffect(() => {
     let cancelled = false;
     setRun("idle");
-    setScript("");
+    setScript(demoScript);
     setEvidence(null);
     setRunError(null);
     setInvestigation(null);
@@ -97,7 +100,7 @@ function ReproducePageContent() {
     return () => {
       cancelled = true;
     };
-  }, [jobId, requestedJobId, requestedInvestigationId]);
+  }, [jobId, requestedJobId, requestedInvestigationId, demoScript]);
 
   const runRepro = useCallback(async () => {
     if (!jobId || run === "running" || !script.trim()) return;

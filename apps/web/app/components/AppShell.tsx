@@ -9,6 +9,7 @@ import WorkspaceSwitcher from "./WorkspaceSwitcher";
 import { workspaceHref } from "../lib/workspace";
 
 const WORKSPACE_LINKS = [
+  { href: "/demo", label: "Try Demo" },
   { href: "/overview", label: "Overview" },
   { href: "/codebase", label: "Codebase" },
   { href: "/trace", label: "Trace" },

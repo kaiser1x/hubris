@@ -5,7 +5,7 @@ const HUBRIS_API_BASE =
   process.env.HUBRIS_API_BASE || "http://localhost:3001";
 
 export async function GET(
-  _request: Request,
+  request: Request,
   { params }: { params: Promise<{ id: string }> }
 ) {
   const { id } = await params;
@@ -16,7 +16,7 @@ export async function GET(
       {
         headers: {
           "User-Agent": "HUBRIS/0.1.0",
-          ...apiAuthHeaders(),
+          ...apiAuthHeaders(request),
         },
       }
     );

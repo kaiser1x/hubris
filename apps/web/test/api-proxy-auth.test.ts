@@ -37,16 +37,21 @@ describe("apiAuthHeaders", () => {
 });
 
 describe("proxy routes", () => {
-  const routes = walk(join(WEB, "app", "api")).filter((f) => f.endsWith("route.ts"));
+  // Every route that calls the API (the /api/demo session route makes no
+  // upstream call and is excluded).
+  const routes = walk(join(WEB, "app", "api")).filter(
+    (f) => f.endsWith("route.ts") && readFileSync(f, "utf8").includes("HUBRIS_API_BASE")
+  );
 
   it("finds the proxies", () => {
     expect(routes.length).toBeGreaterThanOrEqual(15);
   });
 
-  it.each(routes.map((f) => [f.slice(WEB.length), f] as const))("%s forwards the API key on every upstream call", (_name, file) => {
+  it.each(routes.map((f) => [f.slice(WEB.length), f] as const))("%s forwards the API key and the visitor's demo session on every upstream call", (_name, file) => {
     const source = readFileSync(file, "utf8");
     const upstreamCalls = (source.match(/fetch\(/g) ?? []).length;
-    const authSpreads = (source.match(/\.\.\.apiAuthHeaders\(\)/g) ?? []).length;
+    // apiAuthHeaders(request): the incoming request carries the demo session.
+    const authSpreads = (source.match(/\.\.\.apiAuthHeaders\(request\)/g) ?? []).length;
     expect(upstreamCalls).toBeGreaterThan(0);
     expect(authSpreads).toBe(upstreamCalls);
     expect(source).toContain('from "');

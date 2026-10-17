@@ -77,6 +77,22 @@ function ShipPageContent() {
     };
   }, [jobId]);
 
+  // Public demo: PR creation is refused server-side for anonymous sessions;
+  // say so up front instead of offering a button that cannot work.
+  const [demoMode, setDemoMode] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    void fetch("/api/demo")
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d: unknown) => {
+        if (!cancelled) setDemoMode(typeof d === "object" && d !== null && (d as { demo?: unknown }).demo === true);
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   // Bind to the EXACT Forge run by id. No latest/first-eligible fallback.
   const runs = job ? resolveForgeRuns(job) : [];
   const run: ForgeRunView | null = requestedRunId
@@ -380,7 +396,13 @@ function ShipPageContent() {
                   {shipError}
                 </p>
               )}
-              {confirming ? (
+              {demoMode && (
+                <p className="font-mono text-[12px] leading-6 text-[#7A7171] mt-3" data-demo-ship-disabled>
+                  Public demo: opening pull requests is disabled. The verified patch and its
+                  provenance above are the result; shipping requires an authenticated operator.
+                </p>
+              )}
+              {confirming && !demoMode ? (
                 <div className="mt-4 border border-[#dedada] px-4 py-4">
                   <p className="font-mono text-[12px]">CREATE PULL REQUEST?</p>
                   <p className="font-mono text-[11px] leading-6 text-[#7A7171] mt-2">
@@ -416,7 +438,7 @@ function ShipPageContent() {
                 <button
                   type="button"
                   onClick={() => setConfirming(true)}
-                  disabled={!eligibility.eligible}
+                  disabled={!eligibility.eligible || demoMode}
                   className="inline-flex mt-4 bg-[#0A0A0A] text-white font-mono text-[11px] tracking-[0.08em] px-4 py-3 hover:bg-black active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-40 transition-all"
                 >
                   CREATE PULL REQUEST

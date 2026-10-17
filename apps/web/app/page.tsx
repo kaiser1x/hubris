@@ -51,6 +51,19 @@ export default function Home() {
             HUBRIS maps your codebase, replays failures in a sandbox, and
             verifies fixes before you merge. It proves before it patches.
           </p>
+          <div className="mt-7 max-w-xl border border-[#0A0A0A] bg-white/70 px-4 py-4" data-try-demo>
+            <p className="font-mono text-[11px] tracking-[0.08em]">EVALUATING HUBRIS?</p>
+            <p className="text-[14px] text-[#3b3636] mt-2 leading-6">
+              Run the guided demo: HUBRIS investigates a real duplicate-payment bug, reproduces it in a
+              sandbox, forges a fix and verifies it with the test suite. No sign-in or keys needed.
+            </p>
+            <Link
+              href="/demo"
+              className="inline-flex mt-3 h-10 items-center bg-[#0A0A0A] px-4 text-[11px] font-mono tracking-[0.08em] text-white hover:bg-black active:scale-[0.98] transition-all"
+            >
+              TRY DEMO →
+            </Link>
+          </div>
           <div className="flex items-center gap-5 mt-7">
             <Link
               href="/codebase"

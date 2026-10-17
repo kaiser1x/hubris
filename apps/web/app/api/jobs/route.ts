@@ -18,7 +18,7 @@ export async function GET(request: Request) {
       {
         headers: {
           "User-Agent": "HUBRIS/0.1.0",
-          ...apiAuthHeaders(),
+          ...apiAuthHeaders(request),
         },
       }
     );

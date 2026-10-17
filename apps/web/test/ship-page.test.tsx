@@ -42,7 +42,8 @@ describe("SHIP page binds the exact Forge run", () => {
 
   it("gates PR creation on eligibility and requires confirmation", () => {
     expect(source).toContain("shipEligible");
-    expect(source).toContain("disabled={!eligibility.eligible}");
+    // Also disabled in the public demo, where SHIP is refused server-side.
+    expect(source).toContain("disabled={!eligibility.eligible || demoMode}");
     expect(source).toContain("CREATE PULL REQUEST?");
     expect(source).toContain("CANCEL");
     expect(source).toContain("SHIP_PATH");
