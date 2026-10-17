@@ -106,7 +106,7 @@ import {
   classifyVerification,
   REPRO_BEGIN_MARKER,
 } from "./reproduce";
-import { describeSourceMismatch } from "./mismatch";
+import { buildMismatchFeedback, describeSourceMismatch } from "./mismatch";
 import { GIT_UNAVAILABLE_MESSAGE, isMissingBinary } from "./gitenv";
 import { DEFAULT_PROBE_REPO, isSafeProbeUrl, runGitDiagnostics, type GitDiagReport } from "./gitdiag";
 import { demoGuard, demoSessionOf } from "./demo";
@@ -116,6 +116,7 @@ import {
   coldStartGitCheck,
   MIN_SANDBOX_BUDGET_MS,
   readiness,
+  REDRAFT_MODEL_MS,
   remainingBudgetMs,
   requestBudget,
   runCommandWithinBudget as runCommand,
@@ -3038,53 +3039,76 @@ const image = parsed.data.image ?? "tag:node:20-slim";
     if (!llm) {
       return c.json({ error: "Model not configured", status: 503 }, 503);
     }
-    let plan: ReturnType<typeof EditPlanSchema.parse>;
-    try {
-      const draft = await chatComplete(
-        llm,
-        [
-          { role: "system", content: STRUCTURED_SYSTEM },
-          {
-            role: "user",
-            content: buildStructuredPrompt({
-              repoName:
-                (twin?.repository as { name?: string } | undefined)?.name ?? job.repoUrl,
-              excerpts: blocks,
-              focus: effectiveFocus,
-              instruction: parsed.data.instruction,
-            }),
-          },
-        ],
-        {
-          maxTokens: forgeMaxTokens(),
-          signal: budgetSignal(90000),
-          // Verified contract: json_object constrains the model to valid
-          // JSON. Parsing + zod + exact-match validation stay in place.
-          responseFormat: "json_object",
-        }
-      );
-      let raw: unknown;
-      async function persistRejection(reason: string, draftText: string) {
-        try {
-          const prior =
-            (job.result as { draftRejections?: unknown[] } | null)?.draftRejections ?? [];
-          await db!
-            .update(schema.jobs)
-            .set({
-              result: {
-                ...(job.result as object),
-                draftRejections: [
-                  ...prior,
-                  { ...buildRejectedDraftPreview(draftText, reason), at: new Date().toISOString() },
-                ],
-              },
-              updatedAt: new Date(),
-            })
-            .where(eq(schema.jobs.id, job.id));
-        } catch {
-          // best-effort; rejection stands regardless
-        }
+    type EditPlan = ReturnType<typeof EditPlanSchema.parse>;
+    const basePrompt = buildStructuredPrompt({
+      repoName: (twin?.repository as { name?: string } | undefined)?.name ?? job.repoUrl,
+      excerpts: blocks,
+      focus: effectiveFocus,
+      instruction: parsed.data.instruction,
+    });
+    async function persistRejection(reason: string, draftText: string) {
+      try {
+        const prior =
+          (job.result as { draftRejections?: unknown[] } | null)?.draftRejections ?? [];
+        await db!
+          .update(schema.jobs)
+          .set({
+            result: {
+              ...(job.result as object),
+              draftRejections: [
+                ...prior,
+                { ...buildRejectedDraftPreview(draftText, reason), at: new Date().toISOString() },
+              ],
+            },
+            updatedAt: new Date(),
+          })
+          .where(eq(schema.jobs.id, job.id));
+      } catch {
+        // best-effort; rejection stands regardless
       }
+    }
+    // One model draft → a parsed, schema-valid plan, or the failure together
+    // with the response the endpoint gives for it.
+    type DraftFailure = "malformed" | "invalid" | "empty" | "timeout" | "model";
+    async function draftPlan(
+      prompt: string
+    ): Promise<{ ok: true; plan: EditPlan } | { ok: false; kind: DraftFailure; response: Response }> {
+      let draft: string;
+      try {
+        draft = await chatComplete(
+          llm!,
+          [
+            { role: "system", content: STRUCTURED_SYSTEM },
+            { role: "user", content: prompt },
+          ],
+          {
+            maxTokens: forgeMaxTokens(),
+            signal: budgetSignal(90000),
+            // Verified contract: json_object constrains the model to valid
+            // JSON. Parsing + zod + exact-match validation stay in place.
+            responseFormat: "json_object",
+          }
+        );
+      } catch (error: any) {
+        if (!(error instanceof ModelError)) throw error;
+        console.error("Forge-structured draft error:", error.kind, error.message);
+        if (error.kind === "timeout") {
+          return {
+            ok: false,
+            kind: "timeout",
+            response: c.json(
+              {
+                error: "The model did not return an edit plan in time — no sandbox run started. Try again; the model provider may be slow.",
+                code: "MODEL_TIMEOUT",
+                status: 504,
+              },
+              504
+            ),
+          };
+        }
+        return { ok: false, kind: "model", response: c.json({ error: "Model request failed", status: 502 }, 502) };
+      }
+      let raw: unknown;
       try {
         raw = JSON.parse(stripCodeFences(draft));
       } catch {
@@ -3094,7 +3118,7 @@ const image = parsed.data.image ?? "tag:node:20-slim";
           "Forge-structured parse failure:",
           JSON.stringify({ reason: "malformed edit plan", draftChars: draft.length })
         );
-        return c.json({ error: "Malformed edit plan", status: 400 }, 400);
+        return { ok: false, kind: "malformed", response: c.json({ error: "Malformed edit plan", status: 400 }, 400) };
       }
       // An empty plan is the model saying "nothing to change", not a broken
       // plan: typically the analyzed revision already satisfies the contract
@@ -3103,14 +3127,18 @@ const image = parsed.data.image ?? "tag:node:20-slim";
       if (isEmptyEditPlan(raw)) {
         await persistRejection("no edit proposed", draft);
         const revision = `${ref ?? "default branch"} @ ${(commitSha ?? "unknown").slice(0, 7)}`;
-        return c.json(
-          {
-            error: `The model proposed no change for ${revision}. The analyzed source may already satisfy the repair contract — confirm the defect reproduces on this revision (Reproduce) before forging.`,
-            code: "NO_EDIT_PROPOSED",
-            status: 422,
-          },
-          422
-        );
+        return {
+          ok: false,
+          kind: "empty",
+          response: c.json(
+            {
+              error: `The model proposed no change for ${revision}. The analyzed source may already satisfy the repair contract — confirm the defect reproduces on this revision (Reproduce) before forging.`,
+              code: "NO_EDIT_PROPOSED",
+              status: 422,
+            },
+            422
+          ),
+        };
       }
       const check = EditPlanSchema.safeParse(raw);
       if (!check.success) {
@@ -3124,41 +3152,38 @@ const image = parsed.data.image ?? "tag:node:20-slim";
             issues: check.error.issues.map((i) => `${i.code}:${i.path.join(".")}`),
           })
         );
-        return c.json({ error: "Invalid edit plan", status: 400 }, 400);
+        return { ok: false, kind: "invalid", response: c.json({ error: "Invalid edit plan", status: 400 }, 400) };
       }
-      plan = check.data;
-    } catch (error: any) {
-      if (error instanceof ModelError) {
-        console.error("Forge-structured draft error:", error.kind, error.message);
-        if (error.kind === "timeout") {
-          return c.json(
-            {
-              error: "The model did not return an edit plan in time — no sandbox run started. Try again; the model provider may be slow.",
-              code: "MODEL_TIMEOUT",
-              status: 504,
-            },
-            504
-          );
-        }
-        return c.json({ error: "Model request failed", status: 502 }, 502);
-      }
-      throw error;
+      return { ok: true, plan: check.data };
     }
+
+    const first = await draftPlan(basePrompt);
+    if (!first.ok) return first.response;
+    let plan: EditPlan = first.plan;
 
     // Local gates: supported + tracked paths, exact-one-match on blob
     // bytes. Failures persist terminal entries with zero sandbox use.
     const trackedSet = new Set(tracked);
-    const generation = {
-      source: "forge" as const,
-      format: "structured-edit" as const,
-      focus: effectiveFocus,
-      excerpts: excerptMetadata,
-      edits: plan.edits.map((e) => ({
+    const editsEvidence = (p: EditPlan) =>
+      p.edits.map((e) => ({
         path: e.path,
         function: e.function ?? null,
         oldTextHash: editHash(e.oldText),
         newTextHash: editHash(e.newText),
-      })),
+      }));
+    const generation: {
+      source: "forge";
+      format: "structured-edit";
+      focus: string;
+      excerpts: typeof excerptMetadata;
+      edits: ReturnType<typeof editsEvidence>;
+      retry?: Record<string, unknown>;
+    } = {
+      source: "forge",
+      format: "structured-edit",
+      focus: effectiveFocus,
+      excerpts: excerptMetadata,
+      edits: editsEvidence(plan),
     };
     async function terminal(
       status: string,
@@ -3208,28 +3233,79 @@ const image = parsed.data.image ?? "tag:node:20-slim";
       }
       return blobCache.get(filePath) ?? null;
     }
-    for (const e of plan.edits) {
-      if (!isSupportedEditPath(e.path) || !trackedSet.has(e.path)) {
-        return terminal("PATH_REJECTED", { rejectedPath: e.path });
+    type LocalRejection = {
+      status: "PATH_REJECTED" | "EDIT_CONTEXT_MISMATCH" | "AMBIGUOUS_EDIT";
+      extra: Record<string, unknown>;
+      // For a mismatch: the edit's oldText and the authoritative file bytes.
+      oldText?: string;
+      blob?: string;
+    };
+    async function validateLocally(p: EditPlan): Promise<LocalRejection | null> {
+      for (const e of p.edits) {
+        if (!isSupportedEditPath(e.path) || !trackedSet.has(e.path)) {
+          return { status: "PATH_REJECTED", extra: { rejectedPath: e.path } };
+        }
+        const blob = await blobOf(e.path);
+        if (blob === null) {
+          return { status: "PATH_REJECTED", extra: { rejectedPath: e.path } };
+        }
+        const count = blob.split(e.oldText).length - 1;
+        if (count === 0) {
+          // Byte-exact mismatch against the authoritative analyzed revision.
+          // Fail closed; persist a bounded diagnostic (never the model's full
+          // text, never the file) so the cause is auditable.
+          return {
+            status: "EDIT_CONTEXT_MISMATCH",
+            extra: { rejectedPath: e.path, mismatch: describeSourceMismatch(blob, e.oldText) },
+            oldText: e.oldText,
+            blob,
+          };
+        }
+        if (count > 1) {
+          return { status: "AMBIGUOUS_EDIT", extra: { rejectedPath: e.path } };
+        }
       }
-      const blob = await blobOf(e.path);
-      if (blob === null) {
-        return terminal("PATH_REJECTED", { rejectedPath: e.path });
-      }
-      const count = blob.split(e.oldText).length - 1;
-      if (count === 0) {
-        // Byte-exact mismatch against the authoritative analyzed revision.
-        // Fail closed; persist a bounded diagnostic (never the model's full
-        // text, never the file) so the cause is auditable.
-        return terminal("EDIT_CONTEXT_MISMATCH", {
-          rejectedPath: e.path,
-          mismatch: describeSourceMismatch(blob, e.oldText),
-        });
-      }
-      if (count > 1) {
-        return terminal("AMBIGUOUS_EDIT", { rejectedPath: e.path });
-      }
+      return null;
     }
+
+    let rejection = await validateLocally(plan);
+    // One informed redraft for a byte-exact mismatch only (the model retyped
+    // the code, typically its indentation, instead of copying it). The model
+    // is shown the exact source lines; the corrected plan must pass the SAME
+    // byte-exact gate. Never more than one retry, never for other failures,
+    // and only while the request still has time for a model call + sandbox.
+    const retryBudget = remainingBudgetMs();
+    if (
+      rejection?.status === "EDIT_CONTEXT_MISMATCH" &&
+      (retryBudget === null || retryBudget >= MIN_SANDBOX_BUDGET_MS + REDRAFT_MODEL_MS)
+    ) {
+      const firstRejection = rejection;
+      const firstAttempt = {
+        edits: generation.edits,
+        rejectedPath: firstRejection.extra.rejectedPath,
+        mismatch: firstRejection.extra.mismatch,
+      };
+      const retry = await draftPlan(
+        `${basePrompt}\n\n${buildMismatchFeedback(
+          String(firstRejection.extra.rejectedPath),
+          firstRejection.oldText ?? "",
+          firstRejection.blob ?? ""
+        )}`
+      );
+      if (!retry.ok) {
+        generation.retry = { reason: "EDIT_CONTEXT_MISMATCH", outcome: retry.kind, firstAttempt };
+        return terminal(firstRejection.status, firstRejection.extra);
+      }
+      plan = retry.plan;
+      generation.edits = editsEvidence(plan);
+      rejection = await validateLocally(plan);
+      generation.retry = {
+        reason: "EDIT_CONTEXT_MISMATCH",
+        outcome: rejection === null ? "accepted" : rejection.status,
+        firstAttempt,
+      };
+    }
+    if (rejection) return terminal(rejection.status, rejection.extra);
 
     // A sandbox run that cannot finish inside the request's time budget would
     // only be cut off mid-flight: stop before any upload instead.

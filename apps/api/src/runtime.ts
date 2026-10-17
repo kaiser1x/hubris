@@ -36,6 +36,8 @@ const MIN_WAIT_MS = 1_000;
 // Starting a sandbox run (upload, install, verify) with less time than this
 // left cannot produce evidence; the request fails before any side effect.
 export const MIN_SANDBOX_BUDGET_MS = 60_000;
+// Time a Forge redraft (one extra model call) needs on top of that.
+export const REDRAFT_MODEL_MS = 30_000;
 const SANDBOX_DEFAULT_WAIT_MS = 120_000;
 
 // The function's maximum duration in ms, or null when there is no platform

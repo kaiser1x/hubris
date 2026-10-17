@@ -54,3 +54,38 @@ export function describeSourceMismatch(source: string, oldText: string): SourceM
       offset >= 0 ? cleanSnippet(src, offset, SNIPPET_CHARS + 40) : cleanSnippet(src, 0, SNIPPET_CHARS),
   };
 }
+// Feedback for the single informed redraft after a byte-exact mismatch: the
+// exact source lines where the model's oldText starts to match, as a JSON
+// string so every space, tab and newline is visible. Bounded to 40 lines of
+// the file the model was already shown; matching itself is never relaxed.
+export function buildMismatchFeedback(path: string, oldText: string, source: string): string {
+  const m = describeSourceMismatch(source, oldText);
+  let region = "";
+  if (m.sourceOffset >= 0) {
+    const startLine = source.slice(0, m.sourceOffset).split("\n").length - 1;
+    // Count literal backslash-n as a line break too: a double-escaped oldText
+    // has none of the real ones, but spans the same lines.
+    const count = Math.min(40, oldText.split(/\n|\\n/).length + 2);
+    region = source.split("\n").slice(startLine, startLine + count).join("\n");
+  }
+  // The model double-escaped line breaks: its decoded oldText holds the two
+  // characters "\" "n" exactly where the source has a real newline.
+  const doubleEscaped =
+    m.matchingPrefixChars < oldText.length &&
+    oldText.startsWith("\\n", m.matchingPrefixChars) &&
+    source.charAt(m.sourceOffset + m.matchingPrefixChars) === "\n";
+  return [
+    "Your previous edit plan was rejected before anything was applied:",
+    `the oldText for ${path} does not occur in the source byte-for-byte (only its first ${m.matchingPrefixChars} characters match).`,
+    doubleEscaped
+      ? "Cause: your oldText contains a literal backslash followed by n where the source has a line break. In the JSON, write each line break once as \\n — never \\\\n."
+      : "",
+    "Whitespace and indentation count. Copy oldText verbatim from the source; do not retype or re-indent it.",
+    region
+      ? `The exact source lines at that location, as a JSON string (every space and \n is significant):\n${JSON.stringify(region)}`
+      : "Copy oldText verbatim from the source excerpts above.",
+    "Return the corrected edit plan in the same JSON shape.",
+  ]
+    .filter((line) => line !== "")
+    .join("\n");
+}

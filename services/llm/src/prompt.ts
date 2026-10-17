@@ -206,6 +206,9 @@ export function buildStructuredPrompt(ctx: StructuredContext): string {
     "Reuse existing constants, strings, and behavior whenever possible.",
     "Do not invent replacement wording when an existing error message already expresses the required behavior.",
     "Rules: paths are repo-relative; oldText must match the source above EXACTLY (character for character); copy it verbatim rather than retyping; keep newText minimal and consistent with surrounding style.",
+    // Observed failure: line breaks double-escaped in the JSON, so the decoded
+    // oldText held a literal backslash-n instead of a newline.
+    "oldText and newText are JSON strings: encode each line break ONCE as \\n (one backslash). Never write \\\\n — after JSON decoding, oldText must be the exact source text with real line breaks and the original indentation.",
   ];
   return lines.filter((l) => l !== "").join("\n");
 }

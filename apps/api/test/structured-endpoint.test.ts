@@ -742,3 +742,114 @@ describe("POST /api/forge-structured failure taxonomy (no-edit, timeouts, sandbo
     expect(runCommand).not.toHaveBeenCalled();
   });
 });
+
+describe("POST /api/forge-structured single informed redraft on a byte-exact mismatch", () => {
+  // Fixture src/a.ts is "foo();\nfoo();\n". A mis-indented oldText is the
+  // production failure shape (the model retyped the code instead of copying).
+  const MISINDENTED = plan([{ path: "src/a.ts", oldText: "foo();\n foo();", newText: "bar();\nbar();" }]);
+  const EXACT = plan([{ path: "src/a.ts", oldText: "foo();\nfoo();", newText: "bar();\nbar();" }]);
+  const COMMIT = "2".repeat(40);
+
+  beforeEach(async () => {
+    store.jobRef = undefined;
+    store.updates = [];
+    vi.mocked(chatComplete).mockReset();
+    vi.mocked(runCommand).mockReset();
+    vi.mocked(uploadFile).mockReset();
+    const { createHash } = await import("crypto");
+    const sha = createHash("sha256").update("dummy-tarball-bytes").digest("hex");
+    vi.mocked(uploadFile).mockImplementation(async () => ({ uuid: "u", sha256: sha }));
+    vi.mocked(runCommand).mockResolvedValue({
+      exitCode: 0,
+      stdout: ["EDIT_OK 1", `CANONICAL_SHA ${"a".repeat(64)} 10`, "SOURCE_REF ", `SOURCE_SHA ${COMMIT}`, "PATCH_OK", "VERIFY_BEGIN"].join("\n"),
+      stderr: "",
+      timedOut: false,
+    });
+  });
+
+  const prompts = () => vi.mocked(chatComplete).mock.calls.map((call) => (call[1] as Array<{ content: string }>)[1].content);
+
+  it("redrafts once with the exact source lines; a corrected plan passes the same byte-exact gate and reaches the sandbox", async () => {
+    stubCreds();
+    vi.mocked(chatComplete).mockResolvedValueOnce(MISINDENTED).mockResolvedValueOnce(EXACT);
+    const res = await postStructured({ focus: "do things" });
+    expect(res.status).toBe(200);
+    expect(chatComplete).toHaveBeenCalledTimes(2);
+    const retryPrompt = prompts()[1];
+    expect(retryPrompt.startsWith(prompts()[0])).toBe(true);
+    expect(retryPrompt).toContain("only its first 7 characters match");
+    expect(retryPrompt).toContain(JSON.stringify("foo();\nfoo();\n"));
+    expect(uploadFile).toHaveBeenCalled();
+    expect(runCommand).toHaveBeenCalledTimes(1);
+    const run = lastRun();
+    expect(run.status).toBe("VERIFIED");
+    const generation = run.generation as { retry: Record<string, unknown>; edits: Array<{ oldTextHash: string }> };
+    expect(generation.retry.outcome).toBe("accepted");
+    expect((generation.retry.firstAttempt as { mismatch: { matchingPrefixChars: number } }).mismatch.matchingPrefixChars).toBe(7);
+    const { createHash } = await import("crypto");
+    expect(generation.edits[0].oldTextHash).toBe(createHash("sha256").update("foo();\nfoo();").digest("hex"));
+  });
+
+  it("a second mismatch fails closed: EDIT_CONTEXT_MISMATCH, exactly two model calls, no sandbox", async () => {
+    stubCreds();
+    vi.mocked(chatComplete).mockResolvedValue(MISINDENTED);
+    const res = await postStructured({ focus: "do things" });
+    expect(res.status).toBe(200);
+    expect(chatComplete).toHaveBeenCalledTimes(2);
+    const run = lastRun();
+    expect(run.status).toBe("EDIT_CONTEXT_MISMATCH");
+    expect(run.verified).toBe(false);
+    expect((run.generation as { retry: { outcome: string } }).retry.outcome).toBe("EDIT_CONTEXT_MISMATCH");
+    expect(uploadFile).not.toHaveBeenCalled();
+    expect(runCommand).not.toHaveBeenCalled();
+  });
+
+  it("other local rejections are not retried (ambiguous, path)", async () => {
+    stubCreds();
+    vi.mocked(chatComplete).mockResolvedValue(plan([{ path: "src/a.ts", oldText: "foo();", newText: "bar();" }]));
+    await postStructured({ focus: "do things" });
+    expect(lastRun().status).toBe("AMBIGUOUS_EDIT");
+    expect(chatComplete).toHaveBeenCalledTimes(1);
+
+    vi.mocked(chatComplete).mockReset();
+    vi.mocked(chatComplete).mockResolvedValue(plan([{ path: "src/untracked.ts", oldText: "x", newText: "y" }]));
+    await postStructured({ focus: "do things" });
+    expect(lastRun().status).toBe("PATH_REJECTED");
+    expect(chatComplete).toHaveBeenCalledTimes(1);
+  });
+
+  it("a redraft that fails to parse keeps the first rejection (no sandbox) and records why", async () => {
+    stubCreds();
+    vi.mocked(chatComplete).mockResolvedValueOnce(MISINDENTED).mockResolvedValueOnce("not json");
+    await postStructured({ focus: "do things" });
+    const run = lastRun();
+    expect(run.status).toBe("EDIT_CONTEXT_MISMATCH");
+    expect((run.mismatch as { matchingPrefixChars: number }).matchingPrefixChars).toBe(7);
+    expect((run.generation as { retry: { outcome: string } }).retry.outcome).toBe("malformed");
+    expect(uploadFile).not.toHaveBeenCalled();
+  });
+
+  it("a redraft that times out keeps the first rejection, not a misleading timeout success", async () => {
+    stubCreds();
+    const { ModelError } = await import("@hubris/llm");
+    vi.mocked(chatComplete).mockResolvedValueOnce(MISINDENTED).mockRejectedValueOnce(new ModelError("timeout", "Model request timed out"));
+    const res = await postStructured({ focus: "do things" });
+    expect(res.status).toBe(200);
+    const run = lastRun();
+    expect(run.status).toBe("EDIT_CONTEXT_MISMATCH");
+    expect((run.generation as { retry: { outcome: string } }).retry.outcome).toBe("timeout");
+    expect(runCommand).not.toHaveBeenCalled();
+  });
+
+  it("no redraft when the request budget cannot fit another model call plus the sandbox", async () => {
+    stubCreds();
+    // 100s budget − 15s reserve = 85s left: enough for the sandbox (60s), not
+    // for a redraft (60s + 30s).
+    vi.stubEnv("HUBRIS_FUNCTION_MAX_DURATION_S", "100");
+    vi.mocked(chatComplete).mockResolvedValue(MISINDENTED);
+    await postStructured({ focus: "do things" });
+    expect(chatComplete).toHaveBeenCalledTimes(1);
+    expect(lastRun().status).toBe("EDIT_CONTEXT_MISMATCH");
+    expect((lastRun().generation as { retry?: unknown }).retry).toBeUndefined();
+  });
+});

@@ -569,6 +569,30 @@ describe("source revision evidence (no live backend)", () => {
     expect(html).toContain("not applied");
   });
 
+  it("shows mismatch snippets exactly: a literal backslash-n is distinguishable from a line break", () => {
+    // The production failure: the model's oldText held a literal backslash-n
+    // where the source has a real line break (plus 4-space indentation).
+    const literalBackslashN = String.fromCharCode(92) + "n";
+    const oldTextSnippet = `  if (idempotencyKey !== undefined) {${literalBackslashN}    seenIdempotencyKeys.add(idempotencyKey);`;
+    const sourceSnippet = "  if (idempotencyKey !== undefined) {\n    seenIdempotencyKeys.add(idempotencyKey);";
+    const mismatch = {
+      oldTextLength: 88,
+      sourceLength: 1605,
+      matchingPrefixChars: 37,
+      sourceOffset: 1308,
+      oldTextSnippet,
+      sourceSnippet,
+    };
+    const v = toForgeRunView(structuredRun({ status: "EDIT_CONTEXT_MISMATCH", mismatch }), 1)!;
+    const html = renderToStaticMarkup(ForgeRunPanel({ run: v }));
+    // Each is shown JSON-escaped, so the two read differently and keep spaces.
+    const shown = (s: string) => JSON.stringify(s).slice(1, -1);
+    expect(shown(oldTextSnippet)).not.toBe(shown(sourceSnippet));
+    expect(html).toContain(shown(oldTextSnippet));
+    expect(html).toContain(shown(sourceSnippet));
+    expect(html).toContain("whitespace-pre-wrap");
+  });
+
   it("malformed mismatch evidence degrades to null, never fabricated", () => {
     const v = toForgeRunView(
       structuredRun({ status: "EDIT_CONTEXT_MISMATCH", mismatch: { nope: true } }),
