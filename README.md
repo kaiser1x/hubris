@@ -71,8 +71,8 @@ docker compose up -d postgres
 pnpm --filter @hubris/db migrate
 ```
 
-`apps/web/.env.local` is created for Next.js (`HUBRIS_API_BASE` /
-`NEXT_PUBLIC_API_BASE`, defaulting to the API below).
+`apps/web/.env.local` is created for Next.js (`HUBRIS_API_BASE`, server-side
+only, defaulting to the API below).
 
 ## Run
 
