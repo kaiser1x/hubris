@@ -138,6 +138,15 @@ export async function cancelOperation(
   if (!response.ok) throw new Error(await readError(response));
 }
 
+// Our poll deadline passed before the operation finished (the operation is
+// cancelled). Distinct from a command that ran and hit its own timeout, which
+// comes back as a RunResult with timedOut: true.
+export const SANDBOX_WAIT_TIMEOUT_MESSAGE = "Timed out waiting for sandbox operation";
+
+export function isSandboxWaitTimeout(error: unknown): boolean {
+  return error instanceof Error && error.message === SANDBOX_WAIT_TIMEOUT_MESSAGE;
+}
+
 export async function waitOperation(
   config: SandboxConfig,
   operationId: string,
@@ -154,7 +163,7 @@ export async function waitOperation(
     }
     if (Date.now() >= deadline) {
       await cancelOperation(config, operationId).catch(() => undefined);
-      throw new Error("Timed out waiting for sandbox operation");
+      throw new Error(SANDBOX_WAIT_TIMEOUT_MESSAGE);
     }
     await new Promise((resolve) => setTimeout(resolve, pollMs));
   }

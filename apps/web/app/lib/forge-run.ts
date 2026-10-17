@@ -730,7 +730,29 @@ export function toVerifyError(status: number, data: unknown): string {
     return "Model request failed (empty or invalid model response) — no sandbox run started.";
   }
   if (err) return err;
+  if (status === 504) {
+    return "Forge timed out before the server answered. The run may still complete — reload this page to check before retrying.";
+  }
   return "Verification request failed.";
+}
+
+// Interpret the Forge response body. Never throws: a platform error page
+// (e.g. a bare 504 when a function is killed) is not JSON and must surface as
+// the matching error, not as "service unreachable".
+export function readForgeResponse(
+  status: number,
+  text: string
+): { ok: true; runId: string } | { ok: false; error: string } {
+  let data: unknown = null;
+  try {
+    data = text ? (JSON.parse(text) as unknown) : null;
+  } catch {
+    data = null;
+  }
+  const forgeRun = isRecord(data) && isRecord(data.forgeRun) ? data.forgeRun : null;
+  const runId = status >= 200 && status < 300 && forgeRun ? asString(forgeRun.id) : null;
+  if (runId) return { ok: true, runId };
+  return { ok: false, error: toVerifyError(status, data) };
 }
 
 // ---- INVESTIGATE → FORGE flow ----

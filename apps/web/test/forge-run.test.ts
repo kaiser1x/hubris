@@ -35,7 +35,10 @@ import {
   shipBaseDescription,
   shipBranchPreview,
   shipTitlePreview,
+  readForgeResponse,
 } from "../app/lib/forge-run";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import ForgeRunPanel from "../app/components/ForgeRunPanel";
 
 const HEX64 = "9eba9713e30293ec9f5225613725c07435c6e438c27bc0d60fb5964dc453647c";
@@ -1181,5 +1184,55 @@ describe("shipRepairHref", () => {
 
   it("never emits a bare /ship link when ids are present", () => {
     expect(shipRepairHref("job-1", "run-2")).not.toBe("/ship");
+  });
+});
+
+describe("readForgeResponse (Forge button outcome)", () => {
+  it("returns the run id only for a 2xx response carrying a forgeRun", () => {
+    expect(readForgeResponse(200, JSON.stringify({ jobId: "j", forgeRun: { id: "r1" } }))).toEqual({
+      ok: true,
+      runId: "r1",
+    });
+  });
+
+  it("shows the API's actionable message for a model that proposed no change", () => {
+    const msg = "The model proposed no change for main @ 4bf458c. …confirm the defect reproduces (Reproduce)…";
+    const out = readForgeResponse(422, JSON.stringify({ error: msg, code: "NO_EDIT_PROPOSED", status: 422 }));
+    expect(out).toEqual({ ok: false, error: msg });
+  });
+
+  it("shows a model timeout as a timeout, not as a validation error", () => {
+    const out = readForgeResponse(
+      504,
+      JSON.stringify({ error: "The model did not return an edit plan in time — no sandbox run started.", code: "MODEL_TIMEOUT" })
+    );
+    expect(out.ok).toBe(false);
+    if (!out.ok) {
+      expect(out.error).toMatch(/in time/);
+      expect(out.error).not.toMatch(/Invalid edit plan/);
+    }
+  });
+
+  it("a platform 504 page (non-JSON) is a timeout, never 'service unreachable'", () => {
+    const out = readForgeResponse(504, "<html>An error occurred with your deployment FUNCTION_INVOCATION_TIMEOUT</html>");
+    expect(out.ok).toBe(false);
+    if (!out.ok) {
+      expect(out.error).toMatch(/timed out/);
+      expect(out.error).not.toMatch(/unreachable/);
+    }
+  });
+
+  it("never treats an error status as success even if a forgeRun is present", () => {
+    expect(readForgeResponse(500, JSON.stringify({ forgeRun: { id: "r1" } })).ok).toBe(false);
+  });
+
+  it("the Forge page reads the body as text and always clears the loading state", () => {
+    const src = readFileSync(
+      fileURLToPath(new URL("../app/(workspace)/forge/page.tsx", import.meta.url)),
+      "utf8"
+    );
+    expect(src).toContain("readForgeResponse(res.status, await res.text())");
+    expect(src).not.toMatch(/await res\.json\(\)/);
+    expect(src).toMatch(/finally\s*\{\s*setForging\(false\);/);
   });
 });

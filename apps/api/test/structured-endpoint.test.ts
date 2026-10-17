@@ -604,3 +604,141 @@ describe("POST /api/forge-structured model failure classes (mocked model)", () =
     expect(runCommand).not.toHaveBeenCalled();
   });
 });
+
+describe("POST /api/forge-structured failure taxonomy (no-edit, timeouts, sandbox, budget)", () => {
+  // Each failure class gets its own status + code so the UI can say what
+  // actually happened. None of them becomes a success, and none before the
+  // sandbox stage touches the sandbox.
+  const COMMIT = "2".repeat(40);
+  const MATCHING_PLAN = plan([
+    { path: "src/a.ts", oldText: "foo();\nfoo();", newText: "bar();\nbar();" },
+  ]);
+
+  beforeEach(async () => {
+    store.jobRef = undefined;
+    store.cloneCalls = [];
+    store.updates = [];
+    vi.mocked(chatComplete).mockClear();
+    vi.mocked(runCommand).mockReset();
+    vi.mocked(uploadFile).mockReset();
+    const { createHash } = await import("crypto");
+    const sha = createHash("sha256").update("dummy-tarball-bytes").digest("hex");
+    vi.mocked(uploadFile).mockImplementation(async () => ({ uuid: "u", sha256: sha }));
+  });
+
+  it("empty edit plan (model proposes no change) → 422 NO_EDIT_PROPOSED with the revision, no sandbox", async () => {
+    // Reproduces the production failure: job analyzed on main (defect absent),
+    // the model answered {"edits": []}, and the endpoint said "Invalid edit plan".
+    stubCreds();
+    store.draftPlan = JSON.stringify({ edits: [] });
+    const res = await postStructured({ focus: "do things" });
+    expect(res.status).toBe(422);
+    const data = (await res.json()) as { error: string; code: string };
+    expect(data.code).toBe("NO_EDIT_PROPOSED");
+    expect(data.error).not.toBe("Invalid edit plan");
+    expect(data.error).toContain(`default branch @ ${COMMIT.slice(0, 7)}`);
+    expect(data.error).toMatch(/Reproduce/);
+    expect(uploadFile).not.toHaveBeenCalled();
+    expect(runCommand).not.toHaveBeenCalled();
+    const update = store.updates[store.updates.length - 1];
+    expect(update.result?.draftRejections?.[0].reason).toBe("no edit proposed");
+    expect(update.result?.forgeRuns ?? []).toHaveLength(0);
+  });
+
+  it("an edit plan with edits that are invalid is still 400 Invalid edit plan (validation not loosened)", async () => {
+    stubCreds();
+    store.draftPlan = JSON.stringify({ edits: [{ path: "src/a.ts" }] });
+    const res = await postStructured({ focus: "do things" });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ error: "Invalid edit plan", status: 400 });
+    expect(uploadFile).not.toHaveBeenCalled();
+  });
+
+  it("model timeout → 504 MODEL_TIMEOUT, not a validation error, no sandbox, nothing persisted", async () => {
+    stubCreds();
+    const { ModelError } = await import("@hubris/llm");
+    vi.mocked(chatComplete).mockRejectedValueOnce(new ModelError("timeout", "Model request timed out"));
+    const res = await postStructured({ focus: "do things" });
+    expect(res.status).toBe(504);
+    const data = (await res.json()) as { error: string; code: string };
+    expect(data.code).toBe("MODEL_TIMEOUT");
+    expect(data.error).not.toMatch(/edit plan$/);
+    expect(data.error).toMatch(/no sandbox run started/);
+    expect(uploadFile).not.toHaveBeenCalled();
+    expect(runCommand).not.toHaveBeenCalled();
+    expect(store.updates).toHaveLength(0);
+  });
+
+  it("the model call is always given an abort signal", async () => {
+    stubCreds();
+    store.draftPlan = JSON.stringify({ edits: [] });
+    await postStructured({ focus: "do things" });
+    const options = vi.mocked(chatComplete).mock.calls[0][2] as { signal?: AbortSignal };
+    expect(options.signal).toBeInstanceOf(AbortSignal);
+  });
+
+  it("sandbox upload failure → 502 SANDBOX_UPLOAD_FAILED (distinct from model/validation)", async () => {
+    stubCreds();
+    store.draftPlan = MATCHING_PLAN;
+    vi.mocked(uploadFile).mockReset();
+    vi.mocked(uploadFile).mockRejectedValue(new Error("upload 500"));
+    const res = await postStructured({ focus: "do things" });
+    expect(res.status).toBe(502);
+    expect(((await res.json()) as { code: string }).code).toBe("SANDBOX_UPLOAD_FAILED");
+    expect(runCommand).not.toHaveBeenCalled();
+  });
+
+  it("sandbox poll deadline → 504 SANDBOX_TIMEOUT; other run errors → 502 SANDBOX_RUN_FAILED", async () => {
+    stubCreds();
+    store.draftPlan = MATCHING_PLAN;
+    const { SANDBOX_WAIT_TIMEOUT_MESSAGE } = await import("@hubris/sandbox");
+    vi.mocked(runCommand).mockRejectedValueOnce(new Error(SANDBOX_WAIT_TIMEOUT_MESSAGE));
+    const timedOut = await postStructured({ focus: "do things" });
+    expect(timedOut.status).toBe(504);
+    expect(((await timedOut.json()) as { code: string }).code).toBe("SANDBOX_TIMEOUT");
+
+    vi.mocked(runCommand).mockRejectedValueOnce(new Error("instance crashed"));
+    const failed = await postStructured({ focus: "do things" });
+    expect(failed.status).toBe(502);
+    expect(((await failed.json()) as { code: string }).code).toBe("SANDBOX_RUN_FAILED");
+  });
+
+  it("a valid plan still reaches the sandbox stage and verifies", async () => {
+    stubCreds();
+    store.draftPlan = MATCHING_PLAN;
+    vi.mocked(runCommand).mockResolvedValueOnce({
+      exitCode: 0,
+      stdout: ["EDIT_OK 1", `CANONICAL_SHA ${"a".repeat(64)} 10`, "SOURCE_REF ", `SOURCE_SHA ${COMMIT}`, "PATCH_OK", "VERIFY_BEGIN"].join("\n"),
+      stderr: "",
+      timedOut: false,
+    });
+    const res = await postStructured({ focus: "do things" });
+    expect(res.status).toBe(200);
+    expect(uploadFile).toHaveBeenCalledTimes(3);
+    expect(runCommand).toHaveBeenCalledTimes(1);
+  });
+
+  it("with a configured function budget, the sandbox run is clamped to it", async () => {
+    stubCreds();
+    vi.stubEnv("HUBRIS_FUNCTION_MAX_DURATION_S", "285");
+    store.draftPlan = MATCHING_PLAN;
+    vi.mocked(runCommand).mockResolvedValueOnce({ exitCode: 1, stdout: "", stderr: "", timedOut: true });
+    await postStructured({ focus: "do things" });
+    const req = vi.mocked(runCommand).mock.calls[0][1] as { waitMs: number; timeout: number };
+    // 285s budget − 15s reserve: the poll never outlives the request, and the
+    // command is killed server-side before the poll gives up.
+    expect(req.waitMs).toBeLessThanOrEqual(270_000);
+    expect(req.timeout * 1000).toBeLessThan(req.waitMs);
+  });
+
+  it("too little budget left → 504 BUDGET_EXHAUSTED before any upload", async () => {
+    stubCreds();
+    vi.stubEnv("HUBRIS_FUNCTION_MAX_DURATION_S", "60");
+    store.draftPlan = MATCHING_PLAN;
+    const res = await postStructured({ focus: "do things" });
+    expect(res.status).toBe(504);
+    expect(((await res.json()) as { code: string }).code).toBe("BUDGET_EXHAUSTED");
+    expect(uploadFile).not.toHaveBeenCalled();
+    expect(runCommand).not.toHaveBeenCalled();
+  });
+});
