@@ -1,3 +1,11 @@
+// Local / long-lived Node server entrypoint (`pnpm --filter @hubris/api dev|start`).
+//
+// This is NOT what Vercel runs: Vercel executes the default export of
+// src/app.ts as a function and never starts a listener. Everything that only
+// makes sense for a process we start ourselves lives here: loading the
+// repo-root .env for local development, and binding a port. In production on
+// Vercel, configuration comes from the project's environment variables.
+
 import * as fs from "fs";
 import * as path from "path";
 import { config } from "dotenv";

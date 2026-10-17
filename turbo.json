@@ -17,7 +17,8 @@
     },
     "test": {
       "dependsOn": ["^build"],
-      "inputs": ["$Turbo/dependents^", "src/**/*", "turbo.json"]
+      "inputs": ["$Turbo/dependents^", "src/**/*", "turbo.json"],
+      "passThroughEnv": ["DATABASE_URL"]
     }
   }
 }
