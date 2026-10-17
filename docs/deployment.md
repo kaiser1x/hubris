@@ -232,3 +232,21 @@ Limits are in-memory on the single Render instance and reset when it
 restarts. Operators who need the full product (any repo, SHIP) call the API
 directly with `HUBRIS_API_KEY`, or run the web app with `HUBRIS_DEMO_MODE=off`
 somewhere private — never on the public site.
+
+## Liveness, readiness and event-loop stalls (Render)
+
+- `GET /health` is pure liveness: no database, git, model or network work,
+  and no API key. Render's health check uses it.
+- `GET /ready` checks dependencies (database with a 3s bound, git, configured
+  integrations) and answers 503 when one is missing. It requires the API key.
+- `POST /api/analyze` runs the analyzer **inside the API process**. The
+  analyzer yields to the event loop between files, so `/health` keeps
+  answering during an analysis, and it refuses repositories with more than
+  `HUBRIS_MAX_REPO_FILES` source files (default 5000) with
+  `413 REPO_TOO_LARGE` before parsing. Before this, analysis was one long
+  synchronous block: on Render Free (~0.1 CPU) a few hundred files kept the
+  event loop busy for well over 5s, which Render reports as
+  "HTTP health check failed (timed out after 5 seconds)".
+- Any event-loop stall over 1s is logged as
+  `[hubris] event loop blocked ~Nms; in flight: METHOD /path` (method and path
+  only). Search the Render log for it when a health check times out.

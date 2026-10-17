@@ -8,7 +8,7 @@ import * as os from "os";
 import * as path from "path";
 import { z } from "zod";
 import { and, desc, eq, sql } from "drizzle-orm";
-import { analyzeRepository } from "@hubris/analyzer";
+import { AnalysisLimitError, analyzeRepository } from "@hubris/analyzer";
 import { getDb, schema } from "@hubris/db";
 import {
   FORGE_SYSTEM,
@@ -119,6 +119,7 @@ import {
   remainingBudgetMs,
   requestBudget,
   runCommandWithinBudget as runCommand,
+  trackInFlight,
 } from "./runtime";
 import {
   buildPullRequestBodyFromRun,
@@ -400,6 +401,8 @@ export const app = new Hono();
 
 // Platform concerns (see runtime.ts): the request's time budget starts here,
 // and HUBRIS_API_KEY — when configured — gates everything except /health.
+// Method + path of requests in flight, for the event-loop stall log.
+app.use("*", trackInFlight());
 app.use("*", requestBudget());
 app.use("*", apiKeyGuard());
 // Logs ONE line per function instance saying whether git works in this runtime.
@@ -545,7 +548,9 @@ app.post("/api/analyze", async (c: Context) => {
         timeout: 90000,
       });
 const started = Date.now();
-      const twin = await analyzeRepository(tmp);
+      // Same file ceiling as checkout: analysis shares the server's event loop
+      // and memory, so an oversized repository is refused before parsing.
+      const twin = await analyzeRepository(tmp, { maxFiles: limitsFromEnv().maxFiles });
       const sourceFacts = buildSourceFacts(tmp, twin);
       twin.name = cloneUrl.split("/").slice(-2).join("/").replace(/\.git$/, "");
       for (const fn of twin.functions) fn.path = toRepoRelative(tmp, fn.path);
@@ -627,10 +632,13 @@ const started = Date.now();
     }
   } catch (error: any) {
     const gitMissing = isMissingBinary(error);
+    const tooLarge = error instanceof AnalysisLimitError;
     console.error("Analyze error:", gitMissing ? "git binary not found" : error?.message);
     const msg = gitMissing
       ? GIT_UNAVAILABLE_MESSAGE
-      : error?.killed
+      : tooLarge
+        ? error.message
+        : error?.killed
         ? "Clone timed out. Repo may be too large for local analysis."
         : error?.message || "Failed to analyze repository";
     if (db) {
@@ -643,9 +651,9 @@ const started = Date.now();
         // store unreachable; fall through to error response
       }
     }
-    return gitMissing
-      ? c.json({ error: msg, code: "GIT_UNAVAILABLE", status: 503 }, 503)
-      : c.json({ error: msg, status: 500 }, 500);
+    if (gitMissing) return c.json({ error: msg, code: "GIT_UNAVAILABLE", status: 503 }, 503);
+    if (tooLarge) return c.json({ error: msg, code: "REPO_TOO_LARGE", status: 413 }, 413);
+    return c.json({ error: msg, status: 500 }, 500);
   }
 });
 

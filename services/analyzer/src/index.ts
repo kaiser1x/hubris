@@ -1,5 +1,6 @@
 import * as ts from "typescript";
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import { readdir } from "node:fs/promises";
 import { basename, extname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 
@@ -57,26 +58,49 @@ export interface ParsedRepository {
 // floods the twin with thousands of third-party files.
 const SKIPPED_DIRS = new Set(["node_modules", "dist", "build", "coverage", ".git", ".next", ".turbo"]);
 
-function getAllSourceFiles(repoPath: string): string[] {
+// Analysis runs inside the API server process. Parsing is CPU-bound and
+// synchronous per file, so the analyzer hands control back to the event loop
+// between files and directories: health checks and other requests are served
+// while a repository is analyzed instead of waiting for all of it.
+const yieldToEventLoop = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+export interface AnalyzeOptions {
+  // Refuse repositories with more source files than this, before parsing
+  // (bounds both time and memory). Unset = no limit.
+  maxFiles?: number;
+}
+
+export class AnalysisLimitError extends Error {
+  constructor(readonly maxFiles: number) {
+    super(`Repository has more than ${maxFiles} source files; analysis is limited to ${maxFiles}.`);
+    this.name = "AnalysisLimitError";
+  }
+}
+
+// Same order as a depth-first readdir walk. Stops as soon as the file limit
+// is exceeded, so an oversized tree is never fully walked.
+async function getAllSourceFiles(repoPath: string, maxFiles: number): Promise<string[]> {
   const files: string[] = [];
 
-  function walk(dir: string) {
+  async function walk(dir: string) {
+    let entries;
     try {
-      const entries = readdirSync(dir, { withFileTypes: true });
-      for (const entry of entries) {
-        const fullPath = join(dir, entry.name);
-        if (entry.isDirectory()) {
-          if (!SKIPPED_DIRS.has(entry.name)) walk(fullPath);
-        } else if (entry.name.endsWith(".ts") || entry.name.endsWith(".js")) {
-          files.push(fullPath);
-        }
-      }
+      entries = await readdir(dir, { withFileTypes: true });
     } catch (e) {
-      // skip unreadable dirs
+      return; // skip unreadable dirs
+    }
+    for (const entry of entries) {
+      const fullPath = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (!SKIPPED_DIRS.has(entry.name)) await walk(fullPath);
+      } else if (entry.name.endsWith(".ts") || entry.name.endsWith(".js")) {
+        files.push(fullPath);
+        if (files.length > maxFiles) throw new AnalysisLimitError(maxFiles);
+      }
     }
   }
 
-  walk(repoPath);
+  await walk(repoPath);
   return files;
 }
 
@@ -459,7 +483,10 @@ function parseTestsFromFile(filePath: string): ParsedTest[] {
   return tests;
 }
 
-export async function analyzeRepository(repoPath: string): Promise<ParsedRepository> {
+export async function analyzeRepository(
+  repoPath: string,
+  options: AnalyzeOptions = {}
+): Promise<ParsedRepository> {
   const repoName = basename(repoPath);
   const packageJsonPath = join(repoPath, "package.json");
 
@@ -478,23 +505,21 @@ export async function analyzeRepository(repoPath: string): Promise<ParsedReposit
     },
   ];
 
-  const allFiles = getAllSourceFiles(repoPath);
+  const allFiles = await getAllSourceFiles(repoPath, options.maxFiles ?? Number.POSITIVE_INFINITY);
 
-  // Parse functions, classes, endpoints, and tests from each file in parallel
-  const functionPromises = allFiles.map(parseFunctionsFromFile);
-  const classPromises = allFiles.map(parseClassesFromFile);
-  const endpointPromises = allFiles.map(parseEndpointsFromFile);
-  const testPromises = allFiles.map(parseTestsFromFile);
-
-  const functionResults = (await Promise.all(functionPromises)) as ParsedFunction[][];
-  const classResults = (await Promise.all(classPromises)) as ParsedClass[][];
-  const endpointResults = (await Promise.all(endpointPromises)) as ParsedEndpoint[][];
-  const testResults = (await Promise.all(testPromises)) as ParsedTest[][];
-
-  const functions: ParsedFunction[] = functionResults.flat() as ParsedFunction[];
-  const classes: ParsedClass[] = classResults.flat() as ParsedClass[];
-  const endpoints: ParsedEndpoint[] = endpointResults.flat() as ParsedEndpoint[];
-  const tests: ParsedTest[] = testResults.flat() as ParsedTest[];
+  // Parse functions, classes, endpoints, and tests file by file (results stay
+  // in file order), yielding to the event loop between files.
+  const functions: ParsedFunction[] = [];
+  const classes: ParsedClass[] = [];
+  const endpoints: ParsedEndpoint[] = [];
+  const tests: ParsedTest[] = [];
+  for (const file of allFiles) {
+    functions.push(...parseFunctionsFromFile(file));
+    classes.push(...parseClassesFromFile(file));
+    endpoints.push(...parseEndpointsFromFile(file));
+    tests.push(...parseTestsFromFile(file));
+    await yieldToEventLoop();
+  }
 
   const relationships: Relationship[] = [];
 
@@ -502,12 +527,14 @@ export async function analyzeRepository(repoPath: string): Promise<ParsedReposit
   for (const file of allFiles) {
     const fileRelations = extractImports(file);
     relationships.push(...fileRelations);
+    await yieldToEventLoop();
   }
 
   // Extract function calls from all files
   for (const file of allFiles) {
     const fileRelations = extractFunctionCallsFromFile(file);
     relationships.push(...fileRelations);
+    await yieldToEventLoop();
   }
 
   return {
