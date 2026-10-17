@@ -16,6 +16,7 @@
 // they live in server env, never in the clone, never in the spawn payload.
 
 import { execFile } from "child_process";
+import { isMissingBinary } from "./gitenv";
 import { promisify } from "util";
 import * as path from "path";
 import { REPO_WORKDIR } from "@hubris/sandbox";
@@ -127,8 +128,10 @@ export async function cloneAndArchive(
       ["clone", "--depth", "1", ...(ref ? ["--branch", ref] : []), cloneUrl, src],
       { timeout: 90000 }
     );
-  } catch {
-    throw new Error("clone");
+  } catch (error) {
+    // A host without git is not a failed clone: say so, so callers can report
+    // the runtime problem instead of blaming the repository.
+    throw new Error(isMissingBinary(error) ? "git-missing" : "clone");
   }
   if (expectedCommitSha) {
     if (!/^[a-f0-9]{40}$/.test(expectedCommitSha)) throw new Error("revision-mismatch");

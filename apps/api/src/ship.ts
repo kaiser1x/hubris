@@ -7,6 +7,7 @@
 // appear in logs, errors, PR bodies, or persisted records.
 
 import { createHash } from "node:crypto";
+import { GIT_UNAVAILABLE_MESSAGE, isMissingBinary } from "./gitenv";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
@@ -149,6 +150,13 @@ export function verifyShipProvenance(
   }
   if (analyzed !== execution) {
     return { ok: false, reason: "Analyzed and execution commits differ." };
+  }
+  // The ref Forge staged must be the ref that was analyzed (when both were
+  // recorded): freshness and the PR base are bound to that one ref.
+  const analysisRef = typeof source?.analysisRef === "string" && source.analysisRef ? source.analysisRef : null;
+  const executionRef = typeof source?.ref === "string" && source.ref ? source.ref : null;
+  if (analysisRef && executionRef && analysisRef !== executionRef) {
+    return { ok: false, reason: "Analyzed and execution refs differ." };
   }
   return { ok: true, reason: "" };
 }
@@ -421,6 +429,8 @@ export function redactSecrets(text: string, token?: string | null): string {
 export interface GitHubPullRequest {
   number: number;
   html_url: string;
+  // The branch the pull request merges into, when GitHub reported it.
+  base_ref?: string;
 }
 
 async function githubRequest(
@@ -489,9 +499,19 @@ export async function findOpenPullRequestForBranch(
   if (!res.ok) return { ok: false, pr: null, error: res.error, status: res.status };
   const list = Array.isArray(res.data) ? res.data : [];
   const first = list.find((p) => isRecord(p) && typeof p.number === "number" && typeof p.html_url === "string");
+  const baseRef =
+    first && isRecord((first as { base?: unknown }).base) && typeof (first as { base: { ref?: unknown } }).base.ref === "string"
+      ? (first as { base: { ref: string } }).base.ref
+      : undefined;
   return {
     ok: true,
-    pr: first ? { number: (first as { number: number }).number, html_url: (first as { html_url: string }).html_url } : null,
+    pr: first
+      ? {
+          number: (first as { number: number }).number,
+          html_url: (first as { html_url: string }).html_url,
+          ...(baseRef ? { base_ref: baseRef } : {}),
+        }
+      : null,
     error: "",
     status: res.status,
   };
@@ -548,6 +568,10 @@ export interface ShipRunInput {
   repository: string;
   owner: string;
   commitSha: string;
+  // The exact ref Forge analyzed and verified against (source freshness).
+  analysisRef: string;
+  // The branch the pull request merges into (PR base). Equal to analysisRef
+  // unless an alternative was requested AND proven to be the validated tree.
   baseBranch: string;
   branch: string;
   patchContent: string;
@@ -558,7 +582,7 @@ export interface ShipRunInput {
 }
 
 export type ShipPushStatus = "PUSHED" | "ALREADY_PUSHED";
-export type ShipBlockKind = "conflict" | "auth" | "blocked";
+export type ShipBlockKind = "conflict" | "auth" | "blocked" | "base" | "runtime";
 
 export interface ShipRunResult {
   ok: boolean;
@@ -570,6 +594,54 @@ export interface ShipRunResult {
   pullRequest?: PullRequestRecord;
   duplicate?: PullRequestRecord;
 }
+
+// A branch/tag name that is safe to hand to git as a ref argument.
+export function isSafeRefName(name: unknown): name is string {
+  return (
+    typeof name === "string" &&
+    name.length > 0 &&
+    name.length <= 200 &&
+    !name.startsWith("-") &&
+    !name.startsWith("/") &&
+    !name.endsWith("/") &&
+    !name.endsWith(".lock") &&
+    !name.includes("..") &&
+    !name.includes("//") &&
+    !name.includes("@{") &&
+    /^[A-Za-z0-9._/-]+$/.test(name)
+  );
+}
+
+// PR base policy. The pull request targets the ref Forge analyzed — including
+// a non-default branch — and never silently the repository default. Only a
+// legacy job with no recorded ref falls back to the default branch (which is
+// what was analyzed then). An explicit different base is flagged so the caller
+// must validate it; it is never substituted implicitly.
+export type ShipBaseResolution =
+  | { ok: true; analysisRef: string; baseBranch: string; alternative: boolean }
+  | { ok: false; reason: string };
+
+export function resolveShipBase(input: {
+  analysisRef: string | null;
+  defaultBranch: string | null;
+  requestedBase?: string | null;
+}): ShipBaseResolution {
+  const analysisRef = input.analysisRef ?? input.defaultBranch;
+  if (!analysisRef) {
+    return { ok: false, reason: "The analyzed branch could not be determined, so no pull request base can be chosen." };
+  }
+  if (!isSafeRefName(analysisRef)) {
+    return { ok: false, reason: "The analyzed ref is not a safe branch name." };
+  }
+  const requested = input.requestedBase?.trim() ? input.requestedBase.trim() : null;
+  if (requested !== null && !isSafeRefName(requested)) {
+    return { ok: false, reason: "The requested pull request base is not a safe branch name." };
+  }
+  const baseBranch = requested ?? analysisRef;
+  return { ok: true, analysisRef, baseBranch, alternative: baseBranch !== analysisRef };
+}
+
+const short = (sha: string | null) => (sha ? sha.slice(0, 12) : "none");
 
 // Resolve the SHA of a specific remote branch from `git ls-remote origin
 // refs/heads/<branch>` output. Absent branch → null. Never throws.
@@ -599,6 +671,9 @@ export async function shipForgeRun(
   if (input.branch === input.baseBranch) {
     return { ok: false, reason: "Refusing to push: the branch equals the base branch." };
   }
+  if (!isSafeRefName(input.analysisRef) || !isSafeRefName(input.baseBranch)) {
+    return { ok: false, kind: "base", reason: "Refusing to continue: the analyzed ref or pull request base is not a safe branch name." };
+  }
   if (!/^[a-f0-9]{40}$/.test(input.commitSha)) {
     return { ok: false, reason: "Analyzed commit is not a valid SHA." };
   }
@@ -613,27 +688,84 @@ export async function shipForgeRun(
       await deps.exec(["remote", "add", "origin", url], { cwd: dir });
       await deps.exec(["fetch", "--depth", "1", "origin", input.commitSha], { cwd: dir });
       await deps.exec(["checkout", "--detach", input.commitSha], { cwd: dir });
-    } catch {
+    } catch (error) {
+      // No git binary is a runtime problem, never "the repository changed".
+      if (isMissingBinary(error)) return { ok: false, kind: "runtime", reason: GIT_UNAVAILABLE_MESSAGE };
       return {
         ok: false,
         reason: "Repository changed since this repair was verified. Re-run Forge before creating a pull request.",
       };
     }
-    // Base branch must not have advanced (fail closed — never silently rebase).
+    // Source freshness: the EXACT ref Forge analyzed must still point at the
+    // analyzed commit. Compared by ref, never against the default branch — a
+    // different default-branch SHA says nothing about the analyzed ref.
+    const staleReason =
+      `Repository changed since this repair was verified: "${input.analysisRef}" moved ` +
+      "(re-run the investigation and Forge). Re-run Forge before creating a pull request.";
+    let analysisSha: string | null;
     try {
-      await deps.exec(["fetch", "--depth", "1", "origin", input.baseBranch], { cwd: dir });
-      const base = await deps.exec(["rev-parse", "--verify", `origin/${input.baseBranch}`], { cwd: dir });
-      if (base.stdout.trim() !== input.commitSha) {
+      const ls = await deps.exec(["ls-remote", "origin", `refs/heads/${input.analysisRef}`], { cwd: dir });
+      analysisSha = parseRemoteBranchSha(ls.stdout, input.analysisRef);
+    } catch {
+      return { ok: false, reason: staleReason };
+    }
+    if (analysisSha === null) {
+      // A tag cannot be a PR base; say so instead of falling back to a default.
+      let isTag = false;
+      try {
+        const tags = await deps.exec(["ls-remote", "origin", `refs/tags/${input.analysisRef}`], { cwd: dir });
+        isTag = tags.stdout.includes(`refs/tags/${input.analysisRef}`);
+      } catch {
+        isTag = false;
+      }
+      if (isTag) {
         return {
           ok: false,
-          reason: "Repository changed since this repair was verified. Re-run Forge before creating a pull request.",
+          kind: "base",
+          reason: `The repair was analyzed on "${input.analysisRef}", which is a tag, not a branch. A pull request needs a branch base; re-run the investigation on a branch.`,
         };
       }
-    } catch {
+      return { ok: false, reason: staleReason };
+    }
+    if (analysisSha !== input.commitSha) {
       return {
         ok: false,
-        reason: "Repository changed since this repair was verified. Re-run Forge before creating a pull request.",
+        reason:
+          `Repository changed since this repair was verified: "${input.analysisRef}" moved ` +
+          `(analyzed ${short(input.commitSha)}, now ${short(analysisSha)}). Re-run Forge before creating a pull request.`,
       };
+    }
+
+    // Base compatibility: the repair was validated on exactly one tree. The
+    // analyzed ref is that tree. Any other base is allowed only if it points at
+    // the very same commit; otherwise the patch and its target behavior have
+    // not been validated against it and no pull request may target it.
+    if (input.baseBranch !== input.analysisRef) {
+      let baseSha: string | null;
+      try {
+        const ls = await deps.exec(["ls-remote", "origin", `refs/heads/${input.baseBranch}`], { cwd: dir });
+        baseSha = parseRemoteBranchSha(ls.stdout, input.baseBranch);
+      } catch {
+        baseSha = null;
+      }
+      if (baseSha === null) {
+        return {
+          ok: false,
+          kind: "base",
+          reason: `The requested pull request base "${input.baseBranch}" does not exist on the remote.`,
+        };
+      }
+      if (baseSha !== input.commitSha) {
+        return {
+          ok: false,
+          kind: "base",
+          reason:
+            `This repair was verified on "${input.analysisRef}" (${short(input.commitSha)}). ` +
+            `"${input.baseBranch}" is at ${short(baseSha)}, and the repair has not been validated against it, ` +
+            `so a pull request against "${input.baseBranch}" is not allowed. ` +
+            `Use "${input.analysisRef}" as the base, or re-run the investigation and Forge on "${input.baseBranch}".`,
+        };
+      }
     }
 
     await deps.exec(["checkout", "-b", input.branch], { cwd: dir });
@@ -695,6 +827,14 @@ export async function shipForgeRun(
         return { ok: false, kind: "auth", pushStatus, reason: "GitHub authorization required. HUBRIS could not read the pull request state." };
       }
       return { ok: false, kind: "blocked", pushStatus, reason: redactSecrets(`GitHub error: ${existing.error}`, input.token) };
+    }
+    if (existing.pr && existing.pr.base_ref && existing.pr.base_ref !== input.baseBranch) {
+      return {
+        ok: false,
+        kind: "conflict",
+        pushStatus,
+        reason: `An open pull request for this repair branch already targets "${existing.pr.base_ref}", not "${input.baseBranch}". HUBRIS will not reuse or retarget it.`,
+      };
     }
     if (existing.pr) {
       return {

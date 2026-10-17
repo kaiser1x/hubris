@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { runCommand } from "@hubris/sandbox";
 import type { ShipDeps } from "../src/ship";
 import { analyzeFixtureTwin, TS_JS_DUMMY_DIR, REPORT_CLEAN, type TwinInput } from "./helpers/ts-js-dummy";
 import { createSandboxEmulator, makeGitRepo, type SandboxOracle } from "./helpers/sandbox-emulator";
@@ -35,6 +36,7 @@ const ctx = vi.hoisted(() => ({
   repo: null as null | { dir: string; tracked: string[] },
   tarPath: "",
   stagedSha: "" as string,
+  cloneError: null as string | null,
   emulator: null as any,
   model: ((_text: string): string => "") as (text: string) => string,
   modelCalls: 0,
@@ -85,12 +87,15 @@ vi.mock("../src/checkout", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../src/checkout")>();
   return {
     ...actual,
-    cloneAndArchive: async () => ({
+    cloneAndArchive: async () => {
+      if (ctx.cloneError) throw new Error(ctx.cloneError);
+      return {
       src: ctx.repo!.dir,
       tarPath: ctx.tarPath,
       tracked: ctx.repo!.tracked,
       commitSha: ctx.stagedSha,
-    }),
+      };
+    },
   };
 });
 
@@ -102,7 +107,14 @@ vi.mock("../src/ship", async (importOriginal) => {
     exec: async (args) => {
       ctx.gitCalls.push(args);
       const [cmd] = args;
-      if (cmd === "rev-parse" && args.includes("--verify")) return { stdout: `${ANALYZED_SHA}\n`, stderr: "" };
+      if (cmd === "ls-remote") {
+        // The analyzed branch still points at the analyzed commit; main is
+        // somewhere else entirely (as in the real repository).
+        const ref = args[args.length - 1];
+        const heads: Record<string, string> = { "hubris/buggy-idempotency": ANALYZED_SHA, main: "4c".repeat(20) };
+        const sha = ref.startsWith("refs/heads/hubris/fix/") ? undefined : heads[ref.replace(/^refs\/heads\//, "")];
+        return { stdout: sha ? `${sha}\t${ref}\n` : "", stderr: "" };
+      }
       if (cmd === "rev-parse") return { stdout: `${LOCAL_HEAD}\n`, stderr: "" };
       // The staged diff is exactly what `git apply` was given.
       if (cmd === "diff" && args.length === 2 && args[1] === "--cached") {
@@ -256,6 +268,7 @@ afterAll(() => {
 
 beforeEach(() => {
   ctx.stagedSha = ANALYZED_SHA;
+  ctx.cloneError = null;
   ctx.modelCalls = 0;
   ctx.gitCalls = [];
   ctx.writtenPatch = null;
@@ -483,6 +496,99 @@ describe("REPRODUCE demonstrates the reported behavior against the analyzed revi
   });
 });
 
+describe("platform time budget (Vercel function duration)", () => {
+  const lastSandboxCall = () => {
+    const calls = vi.mocked(runCommand).mock.calls;
+    return calls[calls.length - 1][1] as { waitMs?: number; timeout?: number };
+  };
+
+  it("on Vercel, REPRODUCE's sandbox wait is clamped below the function budget and the command is killed first", async () => {
+    const { answered } = await investigateReady();
+    vi.stubEnv("VERCEL", "1");
+    vi.stubEnv("HUBRIS_FUNCTION_MAX_DURATION_S", "60"); // 45s usable after the reserve
+    const res = await reproduce({
+      investigationId: answered.investigationId,
+      script: `pnpm exec vitest run ${REGRESSION_FILE} --reporter=verbose`,
+    });
+    expect(res.status).toBe(200);
+    const call = lastSandboxCall();
+    expect(call.waitMs).toBeLessThanOrEqual(45_000);
+    expect(call.timeout! * 1000).toBeLessThan(call.waitMs!);
+    // The run still completes and its evidence is persisted normally.
+    expect(res.data.evidence.outcome).toBe("REPRODUCED");
+    expect(persisted().reproductions).toHaveLength(1);
+  });
+
+  it("on Vercel, FORGE's long suite budget is clamped too, and the verified result is unchanged", async () => {
+    const { answered } = await investigateReady();
+    vi.stubEnv("VERCEL", "1");
+    vi.stubEnv("HUBRIS_FUNCTION_MAX_DURATION_S", "120"); // 105s usable
+    const res = await forge({ focus: "unused", investigationId: answered.investigationId });
+    expect(res.status).toBe(200);
+    const call = lastSandboxCall();
+    expect(call.waitMs).toBeLessThanOrEqual(105_000);
+    expect(call.timeout! * 1000).toBeLessThan(call.waitMs!);
+    expect(res.data.forgeRun.verification.assessment.state).toBe("FULL_SUITE_PASSED");
+  });
+
+  it("locally nothing is clamped: the configured budget is passed through unchanged", async () => {
+    const { answered } = await investigateReady();
+    await reproduce({
+      investigationId: answered.investigationId,
+      script: `pnpm exec vitest run ${REGRESSION_FILE} --reporter=verbose`,
+    });
+    const call = lastSandboxCall();
+    expect(call.waitMs).toBeGreaterThan(105_000);
+  });
+
+  it("a run that hits the clamp is reported as a TIMEOUT with persisted evidence, not lost to a platform 504", async () => {
+    const { answered } = await investigateReady();
+    vi.stubEnv("VERCEL", "1");
+    vi.stubEnv("HUBRIS_FUNCTION_MAX_DURATION_S", "30");
+    // The sandbox honors the (clamped) command timeout and reports it.
+    vi.mocked(runCommand).mockImplementationOnce(async () => ({
+      exitCode: null,
+      stdout: "REPRO_BEGIN\n",
+      stderr: "",
+      timedOut: true,
+    }));
+    const res = await reproduce({
+      investigationId: answered.investigationId,
+      script: `pnpm exec vitest run ${REGRESSION_FILE}`,
+    });
+    expect(res.status).toBe(200);
+    expect(res.data.evidence.outcome).toBe("TIMEOUT");
+    expect(res.data.evidence.timedOut).toBe(true);
+    expect(persisted().reproductions).toHaveLength(1);
+  });
+});
+
+describe("a runtime without git is reported as a runtime problem", () => {
+  it("REPRODUCE and FORGE answer 503 GIT_UNAVAILABLE (not 'clone failed'), run nothing, persist nothing", async () => {
+    const { answered } = await investigateReady();
+    ctx.cloneError = "git-missing";
+    const repro = await reproduce({ investigationId: answered.investigationId, script: "pnpm test" });
+    expect(repro.status).toBe(503);
+    expect(repro.data.code).toBe("GIT_UNAVAILABLE");
+    expect(repro.data.error).toMatch(/no git binary/);
+    expect(repro.data.error).not.toMatch(/clone failed/i);
+    const forged = await forge({ focus: "x", investigationId: answered.investigationId });
+    expect(forged.status).toBe(503);
+    expect(forged.data.code).toBe("GIT_UNAVAILABLE");
+    expect(ctx.emulator.runs).toHaveLength(0);
+    expect(persisted().reproductions ?? []).toHaveLength(0);
+    expect(persisted().forgeRuns ?? []).toHaveLength(0);
+  });
+
+  it("an ordinary clone failure keeps its existing 500 'Repository clone failed'", async () => {
+    const { answered } = await investigateReady();
+    ctx.cloneError = "clone";
+    const repro = await reproduce({ investigationId: answered.investigationId, script: "pnpm test" });
+    expect(repro.status).toBe(500);
+    expect(repro.data).toEqual({ error: "Repository clone failed", status: 500 });
+  });
+});
+
 describe("FORGE → VERIFY → SHIP", () => {
   async function forgeFromInvestigation() {
     const { answered } = await investigateReady();
@@ -528,6 +634,9 @@ describe("FORGE → VERIFY → SHIP", () => {
     expect(ctx.writtenPatch).toBe(patch.content);
     const [pr] = prRequests();
     expect(pr.path).toBe("/repos/kaiser1x/ts-js-dummy/pulls");
+    // The analysis ran on a non-default branch: the PR is based on THAT branch
+    // (main sits at a different commit and must not be consulted or targeted).
+    expect(pr.body.base).toBe("hubris/buggy-idempotency");
     expect(pr.body.body).toContain(`Investigation ID: \`${investigation.investigationId}\``);
     expect(pr.body.body).toContain(`Forge run: \`${run.id}\``);
     expect(pr.body.body).toContain(`Analyzed commit: \`${ANALYZED_SHA}\``);

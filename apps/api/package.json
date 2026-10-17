@@ -4,9 +4,9 @@
   "private": true,
   "type": "commonjs",
   "scripts": {
-    "dev": "node dist/index.js",
+    "dev": "node dist/local.js",
     "build": "tsc",
-    "start": "node dist/index.js",
+    "start": "node dist/local.js",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },
@@ -23,6 +23,8 @@
   },
   "devDependencies": {
     "@types/node": "^26.6.2",
+    "typescript": "^5.9.2",
+    "undici-types": "~8.9.0",
     "vitest": "^5.0.1"
   }
 }

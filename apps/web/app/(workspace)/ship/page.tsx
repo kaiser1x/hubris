@@ -9,6 +9,7 @@ import { jobRepositoryContext, workspaceHref } from "../../lib/workspace";
 import {
   buildShipBody,
   resolveForgeRuns,
+  shipBaseDescription,
   shipBranchPreview,
   shipEligible,
   shipTitlePreview,
@@ -89,6 +90,7 @@ function ShipPageContent() {
   const targetFunction = run?.edits[0]?.function ?? "";
   const targetFile = run?.edits[0]?.path ?? "";
   const report = run?.focus ?? "";
+  const shipBase = shipBaseDescription(run, job);
   const branchPreview = run ? shipBranchPreview(targetFunction, report, run.investigationId) : "";
   const titlePreview = run ? shipTitlePreview(targetFunction, report) : "";
 
@@ -303,6 +305,7 @@ function ShipPageContent() {
             <dl className="font-mono text-[11px] mt-3">
               <div className="flex justify-between py-1"><dt className="text-[#7A7171]">Forge run ID</dt><dd className="break-all text-right">{run.id}</dd></div>
               <div className="flex justify-between py-1"><dt className="text-[#7A7171]">Investigation ID</dt><dd className="break-all text-right">{run.investigationId ?? "—"}</dd></div>
+              <div className="flex justify-between py-1"><dt className="text-[#7A7171]">Analyzed ref</dt><dd className="break-all text-right">{shipBase.label}</dd></div>
               <div className="flex justify-between py-1"><dt className="text-[#7A7171]">Analyzed commit</dt><dd className="break-all text-right">{run.source.analysisCommitSha ?? "—"}</dd></div>
               <div className="flex justify-between py-1"><dt className="text-[#7A7171]">Execution commit</dt><dd className="break-all text-right">{run.source.executionCommitSha ?? "—"}</dd></div>
               <div className="flex justify-between py-1"><dt className="text-[#7A7171]">Canonical patch SHA</dt><dd className="break-all text-right">{run.patchSha ?? "—"}</dd></div>
@@ -326,6 +329,10 @@ function ShipPageContent() {
                 <div className="flex justify-between py-1.5 border-b border-[#dedada]">
                   <dt className="text-[#7A7171]">Branch</dt>
                   <dd className="break-all text-right">{pr.branch}</dd>
+                </div>
+                <div className="flex justify-between py-1.5 border-b border-[#dedada]">
+                  <dt className="text-[#7A7171]">Pull request base</dt>
+                  <dd className="break-all text-right">{pr.baseBranch}</dd>
                 </div>
                 <div className="flex justify-between py-1.5 border-b border-[#dedada]">
                   <dt className="text-[#7A7171]">Target verification</dt>
@@ -382,7 +389,7 @@ function ShipPageContent() {
                   </p>
                   <dl className="font-mono text-[11px] mt-3">
                     <div className="flex justify-between py-1"><dt className="text-[#7A7171]">Repository</dt><dd>{exactRepo.repoName ?? "—"}</dd></div>
-                    <div className="flex justify-between py-1"><dt className="text-[#7A7171]">Base</dt><dd>default branch</dd></div>
+                    <div className="flex justify-between py-1 gap-4"><dt className="text-[#7A7171] shrink-0">Pull request base</dt><dd className="break-all text-right">{shipBase.label}</dd></div>
                     <div className="flex justify-between py-1 gap-4"><dt className="text-[#7A7171] shrink-0">Branch</dt><dd className="break-all text-right">{branchPreview}</dd></div>
                     <div className="flex justify-between py-1 gap-4"><dt className="text-[#7A7171] shrink-0">Commit</dt><dd className="break-all text-right">{titlePreview}</dd></div>
                   </dl>

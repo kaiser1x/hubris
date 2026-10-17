@@ -93,13 +93,23 @@ vi.mock("@hubris/db", async (importOriginal) => {
 // Inject fake git/fetch into the real orchestration. Production code and its
 // call site in app.ts are unchanged; only the default dependencies are swapped.
 const gitCalls: string[][] = [];
+// What the fake remote reports for `git ls-remote origin refs/heads/<name>`.
+let remoteHeads: Record<string, string> = {};
+// Simulates a runtime with no git executable at all.
+let gitMissing = false;
 vi.mock("../src/ship", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../src/ship")>();
   const fakeDeps: ShipDeps = {
     exec: async (args) => {
       gitCalls.push(args);
+      if (gitMissing) throw Object.assign(new Error("spawn git ENOENT"), { code: "ENOENT" });
       const [cmd] = args;
-      if (cmd === "rev-parse" && args.includes("--verify")) return { stdout: `${ANALYZED}\n`, stderr: "" };
+      if (cmd === "ls-remote") {
+        const ref = args[args.length - 1];
+        const name = ref.replace(/^refs\/heads\//, "");
+        const sha = ref.startsWith("refs/heads/hubris/fix/") ? undefined : remoteHeads[name];
+        return { stdout: sha ? `${sha}\t${ref}\n` : "", stderr: "" };
+      }
       if (cmd === "rev-parse") return { stdout: `${LOCAL_HEAD}\n`, stderr: "" };
       if (cmd === "diff" && args.length === 2 && args[1] === "--cached") return { stdout: PATCH, stderr: "" };
       return { stdout: "", stderr: ""  }; // init/remote/fetch/checkout/apply/commit/push/ls-remote/diff --check/--name-only
@@ -147,6 +157,8 @@ function installFakeGitHub() {
 
 beforeEach(() => {
   gitCalls.length = 0;
+  gitMissing = false;
+  remoteHeads = { main: ANALYZED };
   vi.stubEnv("GITHUB_TOKEN", "test-token-not-real");
   installFakeGitHub();
 });
@@ -337,5 +349,153 @@ describe("POST /api/ship → GitHub PR-creation request", () => {
       expect(gitCalls).toHaveLength(0);
       expect(githubCalls).toHaveLength(0);
     });
+  });
+});
+
+// Reproduction of the false block: a repair analyzed on a NON-default branch
+// (kaiser1x/ts-js-dummy @ hubris/buggy-idempotency) used to be rejected with
+// "Repository changed since this repair was verified" because SHIP compared the
+// repository DEFAULT branch's SHA with the commit analyzed on the other branch.
+describe("POST /api/ship — source freshness, PR base, base compatibility", () => {
+  const REF = "hubris/buggy-idempotency";
+  const MAIN_SHA = "4b".repeat(20);
+  const MOVED = "9f".repeat(20);
+
+  const onBranch = (over: Record<string, unknown> = {}) => {
+    const base = forgeRun();
+    return forgeRun({
+      source: { ...(base.source as object), ref: REF, analysisRef: REF },
+      ...over,
+    });
+  };
+  const useRun = (run: Record<string, unknown>) => {
+    RESULT = { forgeRuns: [run], investigationRuns: [INVESTIGATION], ref: REF };
+  };
+  const shipWith = async (extra: Record<string, unknown> = {}) => {
+    const { app } = await import("../src/app");
+    const res = await app.request("/api/ship", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ jobId: JOB_ID, forgeRunId: FORGE_RUN_ID, ...extra }),
+    });
+    return { status: res.status, data: (await res.json()) as any };
+  };
+  const pushes = () => gitCalls.filter((a) => a[0] === "push");
+  const prPosts = () => githubCalls.filter((c) => c.method === "POST");
+
+  it("unchanged non-default ref + a DIFFERENT main SHA ships, with the PR based on the analyzed ref", async () => {
+    remoteHeads = { [REF]: ANALYZED, main: MAIN_SHA };
+    useRun(onBranch());
+    const res = await shipWith();
+    expect(res.status, JSON.stringify(res.data)).toBe(200);
+    expect(res.data.state).toBe("PR_CREATED");
+    // The GitHub API received exactly the analyzed ref as the base, never main.
+    expect(prCreation().base).toBe(REF);
+    expect(res.data.baseBranch).toBe(REF);
+    expect(res.data.analysisRef).toBe(REF);
+    expect(res.data.pullRequest.baseBranch).toBe(REF);
+    expect(pushes()).toHaveLength(1);
+    // main was never used as proof of freshness.
+    expect(gitCalls.some((a) => a[0] === "ls-remote" && a[a.length - 1] === "refs/heads/main")).toBe(false);
+  });
+
+  it("a moved analysis ref is rejected (409) with no push and no PR, even if main equals the analyzed commit", async () => {
+    remoteHeads = { [REF]: MOVED, main: ANALYZED };
+    useRun(onBranch());
+    const res = await shipWith();
+    expect(res.status).toBe(409);
+    expect(res.data.state).toBe("NOT_READY");
+    expect(res.data.error).toContain("Repository changed since this repair was verified");
+    expect(res.data.error).toContain(REF);
+    expect(pushes()).toHaveLength(0);
+    expect(prPosts()).toHaveLength(0);
+  });
+
+  it("never substitutes the default branch: requesting main when it differs is rejected as not validated", async () => {
+    remoteHeads = { [REF]: ANALYZED, main: MAIN_SHA };
+    useRun(onBranch());
+    const res = await shipWith({ baseBranch: "main" });
+    expect(res.status).toBe(409);
+    expect(res.data.code).toBe("BASE_NOT_VALIDATED");
+    expect(res.data.error).toMatch(/not been validated/i);
+    expect(res.data.error).toContain(REF);
+    expect(pushes()).toHaveLength(0);
+    expect(prPosts()).toHaveLength(0);
+  });
+
+  it("an alternative base at the very commit that was validated is allowed and passed to GitHub", async () => {
+    remoteHeads = { [REF]: ANALYZED, main: ANALYZED };
+    useRun(onBranch());
+    const res = await shipWith({ baseBranch: "main" });
+    expect(res.status, JSON.stringify(res.data)).toBe(200);
+    expect(prCreation().base).toBe("main");
+    expect(res.data.baseBranch).toBe("main");
+    expect(res.data.analysisRef).toBe(REF);
+  });
+
+  it("an unsafe requested base is refused before any git or GitHub write", async () => {
+    remoteHeads = { [REF]: ANALYZED };
+    useRun(onBranch());
+    const res = await shipWith({ baseBranch: "--upload-pack=evil" });
+    expect(res.status).toBe(400);
+    expect(res.data.code).toBe("BASE_INVALID");
+    expect(gitCalls).toHaveLength(0);
+    expect(prPosts()).toHaveLength(0);
+  });
+
+  it("a legacy run with no recorded ref uses the repository default branch as both source and base", async () => {
+    remoteHeads = { main: ANALYZED };
+    RESULT = { forgeRuns: [forgeRun()], investigationRuns: [INVESTIGATION] };
+    const res = await shipWith();
+    expect(res.status, JSON.stringify(res.data)).toBe(200);
+    expect(prCreation().base).toBe("main");
+    remoteHeads = { main: MOVED };
+    githubCalls.length = 0;
+    gitCalls.length = 0;
+    expect((await shipWith()).status).toBe(409);
+    expect(pushes()).toHaveLength(0);
+  });
+
+  it("analyzed and execution refs that differ are a provenance failure", async () => {
+    remoteHeads = { [REF]: ANALYZED };
+    const base = forgeRun();
+    useRun(forgeRun({ source: { ...(base.source as object), ref: REF, analysisRef: "some-other-branch" } }));
+    const res = await shipWith();
+    expect(res.status).toBe(409);
+    expect(pushes()).toHaveLength(0);
+    expect(prPosts()).toHaveLength(0);
+  });
+
+  it("existing protections still hold on a non-default branch (unverified target, tampered patch)", async () => {
+    remoteHeads = { [REF]: ANALYZED, main: MAIN_SHA };
+    useRun(onBranch({}));
+    const unverified = JSON.parse(JSON.stringify(onBranch())) as any;
+    delete unverified.verification.assessment.targetVerificationPassed;
+    useRun(unverified);
+    const a = await shipWith();
+    expect(a.status).toBe(409);
+    expect(a.data.error).toMatch(/Target verification must pass/);
+    const tampered = JSON.parse(JSON.stringify(onBranch())) as any;
+    tampered.canonicalPatch.content += "\n+tampered\n";
+    useRun(tampered);
+    expect((await shipWith()).status).toBe(409);
+    expect(pushes()).toHaveLength(0);
+    expect(prPosts()).toHaveLength(0);
+  });
+});
+
+describe("POST /api/ship on a runtime without git", () => {
+  it("answers 503 GIT_UNAVAILABLE (a runtime problem, not 'repository changed') and creates nothing", async () => {
+    RESULT = { forgeRuns: [forgeRun()], investigationRuns: [INVESTIGATION] };
+    gitMissing = true;
+    const res = await ship();
+    expect(res.status).toBe(503);
+    const data = (await res.json()) as { error: string; code: string; state: string };
+    expect(data.code).toBe("GIT_UNAVAILABLE");
+    expect(data.state).toBe("NOT_READY");
+    expect(data.error).toMatch(/no git binary/);
+    expect(data.error).not.toContain("Repository changed");
+    expect(gitCalls.some((a) => a[0] === "push")).toBe(false);
+    expect(githubCalls.filter((c) => c.method === "POST")).toHaveLength(0);
   });
 });
